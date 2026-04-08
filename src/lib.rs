@@ -14,6 +14,8 @@ mod cabac_tables;
 mod cu_tree;
 pub mod error;
 #[allow(dead_code)]
+mod intra_pred;
+#[allow(dead_code)]
 mod inverse_transform;
 pub mod nal;
 #[allow(dead_code)]
