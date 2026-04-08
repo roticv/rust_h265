@@ -13,6 +13,7 @@ use crate::cabac::{CabacContexts, CabacReader};
 use crate::cabac_tables::ctx;
 use crate::error::DecodeError;
 use crate::pps::Pps;
+use crate::residual_coding::{decode_residual_coding, ResidualBlock, ResidualPlane, ScanOrder};
 use crate::sps::Sps;
 
 /// HEVC luma intra prediction mode constants (spec table 8-1).
@@ -72,6 +73,9 @@ pub struct PictureState {
     pub last_cu_qp_delta: i32,
     /// Effective QP after applying `last_cu_qp_delta` to `slice_qp_y`.
     pub last_qp_y: i32,
+
+    /// Phase 2c-3 sentinel — most recently decoded luma residual block.
+    pub last_luma_residual: Option<ResidualBlock>,
 }
 
 impl PictureState {
@@ -107,16 +111,15 @@ impl PictureState {
             last_cbf_cr: false,
             last_cu_qp_delta: 0,
             last_qp_y: 0,
+            last_luma_residual: None,
         }
     }
 }
 
 /// Recursive coding tree decode (HEVC spec 7.3.8.4).
 ///
-/// Phase 2c-1 stops after CU intra mode signaling — it does **not** decode
-/// transform_tree, so the CABAC stream position will not match the end of
-/// slice once this returns. Use `cu_count` and `last_luma_pred_mode` to
-/// observe what was decoded.
+/// `slice_qp_y` is needed to compute the per-CU effective QP for dequant
+/// (`qp_y = slice_qp_y + cu_qp_delta`).
 #[allow(clippy::too_many_arguments)]
 pub fn decode_coding_quadtree(
     cabac: &mut CabacReader,
@@ -124,6 +127,7 @@ pub fn decode_coding_quadtree(
     state: &mut PictureState,
     sps: &Sps,
     pps: &Pps,
+    slice_qp_y: i32,
     x0: u32,
     y0: u32,
     log2_cb_size: u8,
@@ -152,6 +156,7 @@ pub fn decode_coding_quadtree(
             state,
             sps,
             pps,
+            slice_qp_y,
             x0,
             y0,
             log2_cb_size - 1,
@@ -164,6 +169,7 @@ pub fn decode_coding_quadtree(
                 state,
                 sps,
                 pps,
+                slice_qp_y,
                 x1,
                 y0,
                 log2_cb_size - 1,
@@ -177,6 +183,7 @@ pub fn decode_coding_quadtree(
                 state,
                 sps,
                 pps,
+                slice_qp_y,
                 x0,
                 y1,
                 log2_cb_size - 1,
@@ -190,6 +197,7 @@ pub fn decode_coding_quadtree(
                 state,
                 sps,
                 pps,
+                slice_qp_y,
                 x1,
                 y1,
                 log2_cb_size - 1,
@@ -197,7 +205,17 @@ pub fn decode_coding_quadtree(
             )?;
         }
     } else {
-        decode_coding_unit(cabac, contexts, state, sps, pps, x0, y0, log2_cb_size)?;
+        decode_coding_unit(
+            cabac,
+            contexts,
+            state,
+            sps,
+            pps,
+            slice_qp_y,
+            x0,
+            y0,
+            log2_cb_size,
+        )?;
     }
 
     set_ct_depth(state, x0, y0, log2_cb_size, cb_depth);
@@ -256,8 +274,6 @@ fn set_ct_depth(state: &mut PictureState, x0: u32, y0: u32, log2_cb_size: u8, cb
 }
 
 /// `coding_unit` decode for the I-slice intra path (spec 7.3.8.5).
-///
-/// Stops after `intra_chroma_pred_mode` — does NOT decode `transform_tree`.
 #[allow(clippy::too_many_arguments)]
 fn decode_coding_unit(
     cabac: &mut CabacReader,
@@ -265,6 +281,7 @@ fn decode_coding_unit(
     state: &mut PictureState,
     sps: &Sps,
     pps: &Pps,
+    slice_qp_y: i32,
     x0: u32,
     y0: u32,
     log2_cb_size: u8,
@@ -314,6 +331,7 @@ fn decode_coding_unit(
         state,
         sps,
         pps,
+        slice_qp_y,
         x0,
         y0,
         log2_cb_size,
@@ -341,15 +359,6 @@ struct TransformTreeCbf {
 }
 
 /// Recursive transform tree decode (HEVC spec 7.3.8.10).
-///
-/// Phase 2c-2 implements the structural part — `split_transform_flag` with
-/// gating, chroma `cbf_cb`/`cbf_cr` decode, recursion, and the leaf
-/// `decode_transform_unit`. The leaf does NOT yet call `residual_coding`,
-/// so the test must select inputs where the CABAC stream stops at a usable
-/// point (i.e. just after `cu_qp_delta` for the first non-empty TU).
-///
-/// `log2_cb_size` is currently only forwarded into the recursion; it'll be
-/// consumed by Phase 2c-3 (residual_coding scan size).
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::only_used_in_recursion)]
 fn decode_transform_tree(
@@ -358,6 +367,7 @@ fn decode_transform_tree(
     state: &mut PictureState,
     sps: &Sps,
     pps: &Pps,
+    slice_qp_y: i32,
     x0: u32,
     y0: u32,
     log2_cb_size: u8,
@@ -416,6 +426,7 @@ fn decode_transform_tree(
             state,
             sps,
             pps,
+            slice_qp_y,
             x0,
             y0,
             log2_cb_size,
@@ -431,6 +442,7 @@ fn decode_transform_tree(
             state,
             sps,
             pps,
+            slice_qp_y,
             x1,
             y0,
             log2_cb_size,
@@ -446,6 +458,7 @@ fn decode_transform_tree(
             state,
             sps,
             pps,
+            slice_qp_y,
             x0,
             y1,
             log2_cb_size,
@@ -461,6 +474,7 @@ fn decode_transform_tree(
             state,
             sps,
             pps,
+            slice_qp_y,
             x1,
             y1,
             log2_cb_size,
@@ -478,6 +492,7 @@ fn decode_transform_tree(
             state,
             sps,
             pps,
+            slice_qp_y,
             x0,
             y0,
             log2_trafo_size,
@@ -544,18 +559,16 @@ fn decode_cu_qp_delta_sign_flag(cabac: &mut CabacReader) -> u32 {
     cabac.decode_bypass()
 }
 
-/// `transform_unit` decode (spec 7.3.8.11).
-///
-/// Phase 2c-2 stops just before residual_coding. We do decode `cu_qp_delta`
-/// when applicable so the CABAC stream is at the correct position for the
-/// first residual_coding call (Phase 2c-3).
+/// `transform_unit` decode (spec 7.3.8.11). Decodes the cbf flags,
+/// `cu_qp_delta`, and (if any cbf is set) the per-plane residual_coding.
 #[allow(clippy::too_many_arguments)]
 fn decode_transform_unit(
     cabac: &mut CabacReader,
     contexts: &mut CabacContexts,
     state: &mut PictureState,
-    _sps: &Sps,
+    sps: &Sps,
     pps: &Pps,
+    slice_qp_y: i32,
     _x0: u32,
     _y0: u32,
     log2_trafo_size: u8,
@@ -594,13 +607,61 @@ fn decode_transform_unit(
             new_cbf.cu_qp_delta_coded = true;
         }
 
-        // Phase 2c-2 stops here. residual_coding (luma + chroma) is the
-        // next thing to land in Phase 2c-3.
-        // The pre-residual CABAC bin sequence ends right after cu_qp_delta.
-        let _ = log2_trafo_size; // silence unused warning until 2c-3
+        // Effective QP for dequant: slice QP + per-CU delta. For chroma we
+        // would derive a separate qp via the spec 8.6.1 mapping, but our
+        // fixture doesn't have any non-zero chroma CBFs.
+        let qp_y = slice_qp_y + state.last_cu_qp_delta;
+        state.last_qp_y = qp_y;
+
+        // residual_coding for each non-zero plane.
+        if cbf_luma {
+            // For intra at log2_trafo_size < 4 the scan order depends on the
+            // intra mode. At log2_trafo_size == 4 (our fixture) the scan is
+            // always diagonal.
+            let scan_idx = pick_scan_order(log2_trafo_size, state.last_luma_pred_mode);
+            let block = decode_residual_coding(
+                cabac,
+                contexts,
+                sps,
+                pps,
+                log2_trafo_size,
+                ResidualPlane::Luma,
+                qp_y,
+                scan_idx,
+            )?;
+            state.last_luma_residual = Some(block);
+        }
+        if inherited.cbf_cb {
+            // chroma residual: 4:2:0 → log2_trafo_size_c = log2_trafo_size - 1
+            return Err(DecodeError::Unsupported(
+                "chroma residual_coding not yet wired",
+            ));
+        }
+        if inherited.cbf_cr {
+            return Err(DecodeError::Unsupported(
+                "chroma residual_coding not yet wired",
+            ));
+        }
     }
 
     Ok(new_cbf)
+}
+
+/// Pick `scan_idx` for residual_coding (spec 7.4.9.11). For intra TUs at
+/// 4×4 / 8×8, certain mode ranges select horizontal or vertical scans. All
+/// other cases use diagonal.
+fn pick_scan_order(log2_trafo_size: u8, intra_pred_mode: u8) -> ScanOrder {
+    if log2_trafo_size > 3 {
+        return ScanOrder::Diag;
+    }
+    // log2_trafo_size in {2, 3}: intra TU. Spec ranges per intra_pred_mode.
+    if (6..=14).contains(&intra_pred_mode) {
+        ScanOrder::Vert
+    } else if (22..=30).contains(&intra_pred_mode) {
+        ScanOrder::Horiz
+    } else {
+        ScanOrder::Diag
+    }
 }
 
 /// Decode all intra prediction modes for a CU's PUs and write them into
@@ -846,6 +907,7 @@ mod tests {
             &mut state,
             &sps,
             &pps,
+            sh.slice_qp_y,
             0,
             0,
             sps.ctb_log2_size_y,
@@ -923,6 +985,34 @@ mod tests {
         assert_eq!(
             state.last_cu_qp_delta, -5,
             "expected cu_qp_delta=-5 for x265 CRF AQ on flat fixture"
+        );
+
+        // Effective per-CU QP for dequant.
+        assert_eq!(state.last_qp_y, 20);
+
+        // Phase 2c-3: residual_coding decoded.
+        let resid = state
+            .last_luma_residual
+            .as_ref()
+            .expect("luma residual block must be present when cbf_luma=1");
+        assert_eq!(resid.log2_size, 4, "16x16 luma TU");
+
+        // For our flat fixture the residual is uniform -2 per pixel, which
+        // forward DCT concentrates entirely in the DC coefficient. We
+        // expect a single non-zero coefficient at (0, 0).
+        assert_eq!(resid.last_sig_x, 0, "last_sig_x");
+        assert_eq!(resid.last_sig_y, 0, "last_sig_y");
+        let nonzero = resid.coeffs.iter().filter(|&&c| c != 0).count();
+        assert_eq!(nonzero, 1, "expected single DC coefficient");
+        let dc = resid.coeffs[0];
+        assert!(dc < 0, "DC must be negative for residual = -2/pixel");
+
+        // The CABAC stream should now be at the end of slice. The terminate
+        // bin returns 1 when we're done.
+        assert_eq!(
+            cabac.decode_terminate(),
+            1,
+            "CABAC must be at end of slice after residual_coding"
         );
     }
 }

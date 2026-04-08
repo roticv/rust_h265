@@ -15,6 +15,8 @@ mod cu_tree;
 pub mod error;
 pub mod nal;
 #[allow(dead_code)]
+mod residual_coding;
+#[allow(dead_code)]
 mod pps;
 #[allow(dead_code)]
 mod profile_tier_level;
