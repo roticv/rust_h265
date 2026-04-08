@@ -51,7 +51,7 @@ When implementing a feature, read the HEVC spec section directly. Do not assume 
 - **Streaming API:** `Decoder::decode_nal(&[u8]) -> Result<Option<Frame>, DecodeError>` plus `flush()`. Callers feed NAL units incrementally; frames are emitted in **decode order** (not display order). Callers re-sort by POC for display, with the same IDR-count caveat documented in the rust_h264 README — increment the IDR counter *after* `decode_nal`, because the call returns the *previous* picture when it sees a new picture header.
 - **Performance:** Target is parity (or close) with FFmpeg's software HEVC decoder. Prefer efficient algorithms, minimize allocations, avoid copies. Benchmarks live in `BENCHMARK.md` once measurable.
 - **No `unsafe` unless justified.** rust_h264 stays safe outside hot SIMD paths; aim for the same here.
-- **`testdata/` is gitignored** in rust_h264 and should be here too — fixture `.h265` and reference `.yuv` files are large binary blobs, regenerate locally rather than commit.
+- **`testdata/` is committed in-tree** (matching rust_h264). Soft rule: commit fixtures under ~1MB so `cargo test` works on a fresh clone with no external tools. For anything larger, store a SHA-256 hash of the decoded output instead of the raw `.yuv` (rust_h264's 1080p tests use this pattern).
 
 ## Code Structure (target layout, modeled on rust_h264)
 
@@ -103,7 +103,7 @@ Build the test corpus incrementally, starting with the smallest possible cases a
 7. Tiles, then WPP, then dependent slice segments.
 8. 1080p hash-only smoke test.
 
-Keep `testdata/` gitignored. Document the ffmpeg/x265 commands used to generate each fixture in a comment at the top of the corresponding test, so they can be regenerated.
+Commit fixtures in-tree (matching rust_h264) so tests run on a fresh clone without ffmpeg/x265 installed. Document the regeneration command in a comment at the top of the corresponding test. For very large reference outputs (>1MB or so), prefer SHA-256 hashing the decoded planes over committing the raw `.yuv`.
 
 ## Examples Directory
 
