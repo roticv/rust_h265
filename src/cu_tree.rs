@@ -62,6 +62,16 @@ pub struct PictureState {
     pub last_chroma_pred_mode: u8,
     /// Number of CUs visited during decode (sentinel for tests).
     pub cu_count: u32,
+
+    /// Phase 2c-2 sentinels — most recent values from `transform_tree`.
+    pub last_split_transform_flag: bool,
+    pub last_cbf_luma: bool,
+    pub last_cbf_cb: bool,
+    pub last_cbf_cr: bool,
+    /// Signed CU QP delta as decoded for the most recent TU. 0 if not coded.
+    pub last_cu_qp_delta: i32,
+    /// Effective QP after applying `last_cu_qp_delta` to `slice_qp_y`.
+    pub last_qp_y: i32,
 }
 
 impl PictureState {
@@ -91,6 +101,12 @@ impl PictureState {
             last_luma_pred_mode: 0,
             last_chroma_pred_mode: 0,
             cu_count: 0,
+            last_split_transform_flag: false,
+            last_cbf_luma: false,
+            last_cbf_cb: false,
+            last_cbf_cr: false,
+            last_cu_qp_delta: 0,
+            last_qp_y: 0,
         }
     }
 }
@@ -284,9 +300,307 @@ fn decode_coding_unit(
 
     decode_intra_mode_signaling(cabac, contexts, state, x0, y0, log2_cb_size, part_mode)?;
 
+    // Phase 2c-2: descend into transform_tree (no residual_coding yet).
+    // For intra at PART_2Nx2N, intra_split is false → max_trafo_depth =
+    // sps.max_transform_hierarchy_depth_intra. The PART_NxN case adds 1 to
+    // max_trafo_depth and sets intra_split, but our fixture doesn't hit it.
+    let intra_split = part_mode == PartMode::PartNxN;
+    let max_trafo_depth =
+        sps.max_transform_hierarchy_depth_intra + if intra_split { 1 } else { 0 };
+
+    decode_transform_tree(
+        cabac,
+        contexts,
+        state,
+        sps,
+        pps,
+        x0,
+        y0,
+        log2_cb_size,
+        log2_cb_size,
+        0,
+        max_trafo_depth,
+        intra_split,
+        TransformTreeCbf::default(),
+    )?;
+
     state.cu_count += 1;
-    // Phase 2c-1 stop point: do NOT proceed into transform_tree.
     Ok(())
+}
+
+/// Inherited cbf state passed down through `decode_transform_tree` recursion.
+/// Once a parent has `cbf_cb = 0`, the child does not re-decode it (spec
+/// 7.3.8.10 / FFmpeg `cbf_cb[]` propagation).
+#[derive(Debug, Clone, Copy, Default)]
+struct TransformTreeCbf {
+    cbf_cb: bool,
+    cbf_cr: bool,
+    /// "is_cu_qp_delta_coded" sentinel — set to `true` once the first TU in
+    /// the CU has decoded `cu_qp_delta`. Subsequent TUs skip the read.
+    cu_qp_delta_coded: bool,
+}
+
+/// Recursive transform tree decode (HEVC spec 7.3.8.10).
+///
+/// Phase 2c-2 implements the structural part — `split_transform_flag` with
+/// gating, chroma `cbf_cb`/`cbf_cr` decode, recursion, and the leaf
+/// `decode_transform_unit`. The leaf does NOT yet call `residual_coding`,
+/// so the test must select inputs where the CABAC stream stops at a usable
+/// point (i.e. just after `cu_qp_delta` for the first non-empty TU).
+///
+/// `log2_cb_size` is currently only forwarded into the recursion; it'll be
+/// consumed by Phase 2c-3 (residual_coding scan size).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::only_used_in_recursion)]
+fn decode_transform_tree(
+    cabac: &mut CabacReader,
+    contexts: &mut CabacContexts,
+    state: &mut PictureState,
+    sps: &Sps,
+    pps: &Pps,
+    x0: u32,
+    y0: u32,
+    log2_cb_size: u8,
+    log2_trafo_size: u8,
+    trafo_depth: u8,
+    max_trafo_depth: u32,
+    intra_split: bool,
+    parent_cbf: TransformTreeCbf,
+) -> Result<TransformTreeCbf, DecodeError> {
+    // 1) Decide split_transform_flag (FFmpeg `hls_transform_tree` lines 1566-1580).
+    let split_transform_flag = if log2_trafo_size <= sps.max_tb_log2_size_y
+        && log2_trafo_size > sps.min_tb_log2_size_y
+        && (trafo_depth as u32) < max_trafo_depth
+        && !(intra_split && trafo_depth == 0)
+    {
+        decode_split_transform_flag(cabac, contexts, log2_trafo_size) != 0
+    } else {
+        // Implicit split: oversized TU, intra_split forcing depth-1, or inter
+        // split (which we don't hit for I-slices).
+        log2_trafo_size > sps.max_tb_log2_size_y || (intra_split && trafo_depth == 0)
+    };
+
+    state.last_split_transform_flag = split_transform_flag;
+
+    // 2) Chroma cbf decode. For 4:2:0 (chroma_format_idc==1) we only do this
+    //    when log2_trafo_size > 2 (chroma TUs would otherwise be 2×2, which is
+    //    illegal). The flag is decoded when either (a) we're at the root of
+    //    the transform tree, or (b) the parent already had a non-zero cbf.
+    let mut cbf_cb = parent_cbf.cbf_cb;
+    let mut cbf_cr = parent_cbf.cbf_cr;
+    if sps.chroma_format_idc == 1 && log2_trafo_size > 2 {
+        if trafo_depth == 0 || parent_cbf.cbf_cb {
+            cbf_cb = decode_cbf_cb_cr(cabac, contexts, trafo_depth) != 0;
+        }
+        if trafo_depth == 0 || parent_cbf.cbf_cr {
+            cbf_cr = decode_cbf_cb_cr(cabac, contexts, trafo_depth) != 0;
+        }
+    }
+    state.last_cbf_cb = cbf_cb;
+    state.last_cbf_cr = cbf_cr;
+
+    let inherited = TransformTreeCbf {
+        cbf_cb,
+        cbf_cr,
+        cu_qp_delta_coded: parent_cbf.cu_qp_delta_coded,
+    };
+
+    if split_transform_flag {
+        let trafo_size_split = 1u32 << (log2_trafo_size - 1);
+        let x1 = x0 + trafo_size_split;
+        let y1 = y0 + trafo_size_split;
+        let mut child_cbf = inherited;
+        child_cbf = decode_transform_tree(
+            cabac,
+            contexts,
+            state,
+            sps,
+            pps,
+            x0,
+            y0,
+            log2_cb_size,
+            log2_trafo_size - 1,
+            trafo_depth + 1,
+            max_trafo_depth,
+            intra_split,
+            child_cbf,
+        )?;
+        child_cbf = decode_transform_tree(
+            cabac,
+            contexts,
+            state,
+            sps,
+            pps,
+            x1,
+            y0,
+            log2_cb_size,
+            log2_trafo_size - 1,
+            trafo_depth + 1,
+            max_trafo_depth,
+            intra_split,
+            child_cbf,
+        )?;
+        child_cbf = decode_transform_tree(
+            cabac,
+            contexts,
+            state,
+            sps,
+            pps,
+            x0,
+            y1,
+            log2_cb_size,
+            log2_trafo_size - 1,
+            trafo_depth + 1,
+            max_trafo_depth,
+            intra_split,
+            child_cbf,
+        )?;
+        let final_cbf = decode_transform_tree(
+            cabac,
+            contexts,
+            state,
+            sps,
+            pps,
+            x1,
+            y1,
+            log2_cb_size,
+            log2_trafo_size - 1,
+            trafo_depth + 1,
+            max_trafo_depth,
+            intra_split,
+            child_cbf,
+        )?;
+        Ok(final_cbf)
+    } else {
+        decode_transform_unit(
+            cabac,
+            contexts,
+            state,
+            sps,
+            pps,
+            x0,
+            y0,
+            log2_trafo_size,
+            trafo_depth,
+            inherited,
+        )
+    }
+}
+
+/// Decode `split_transform_flag` (HEVC spec 9.3.4.2.5).
+/// Context offset: `SPLIT_TRANSFORM_FLAG + (5 - log2_trafo_size)`.
+fn decode_split_transform_flag(
+    cabac: &mut CabacReader,
+    contexts: &mut CabacContexts,
+    log2_trafo_size: u8,
+) -> u32 {
+    let inc = 5usize - log2_trafo_size as usize;
+    cabac.decode_bin(&mut contexts.state[ctx::SPLIT_TRANSFORM_FLAG + inc])
+}
+
+/// Decode `cbf_cb` or `cbf_cr` — same context structure (HEVC spec 9.3.4.2.6).
+/// Context offset: `CBF_CB_CR + trafo_depth`.
+fn decode_cbf_cb_cr(cabac: &mut CabacReader, contexts: &mut CabacContexts, trafo_depth: u8) -> u32 {
+    cabac.decode_bin(&mut contexts.state[ctx::CBF_CB_CR + trafo_depth as usize])
+}
+
+/// Decode `cbf_luma` (HEVC spec 9.3.4.2.6).
+/// Context offset: `CBF_LUMA + (trafo_depth == 0 ? 1 : 0)`.
+/// (FFmpeg expresses this as `CBF_LUMA + !trafo_depth`.)
+fn decode_cbf_luma(cabac: &mut CabacReader, contexts: &mut CabacContexts, trafo_depth: u8) -> u32 {
+    let inc = if trafo_depth == 0 { 1 } else { 0 };
+    cabac.decode_bin(&mut contexts.state[ctx::CBF_LUMA + inc])
+}
+
+/// Decode `cu_qp_delta_abs` (HEVC spec 9.3.4.2.7) — truncated unary prefix
+/// (max value 5) followed by an Exp-Golomb-0 suffix when the prefix is at
+/// its max.
+fn decode_cu_qp_delta_abs(cabac: &mut CabacReader, contexts: &mut CabacContexts) -> u32 {
+    let mut prefix = 0u32;
+    let mut inc = 0usize;
+    while prefix < 5 && cabac.decode_bin(&mut contexts.state[ctx::CU_QP_DELTA + inc]) != 0 {
+        prefix += 1;
+        inc = 1;
+    }
+    if prefix < 5 {
+        return prefix;
+    }
+    // EG-0 suffix: read bypass bits until a 0, then `k` more.
+    let mut suffix = 0u32;
+    let mut k = 0u32;
+    while k < 7 && cabac.decode_bypass() != 0 {
+        suffix += 1 << k;
+        k += 1;
+    }
+    while k > 0 {
+        k -= 1;
+        suffix += cabac.decode_bypass() << k;
+    }
+    prefix + suffix
+}
+
+/// Decode `cu_qp_delta_sign_flag` (bypass).
+fn decode_cu_qp_delta_sign_flag(cabac: &mut CabacReader) -> u32 {
+    cabac.decode_bypass()
+}
+
+/// `transform_unit` decode (spec 7.3.8.11).
+///
+/// Phase 2c-2 stops just before residual_coding. We do decode `cu_qp_delta`
+/// when applicable so the CABAC stream is at the correct position for the
+/// first residual_coding call (Phase 2c-3).
+#[allow(clippy::too_many_arguments)]
+fn decode_transform_unit(
+    cabac: &mut CabacReader,
+    contexts: &mut CabacContexts,
+    state: &mut PictureState,
+    _sps: &Sps,
+    pps: &Pps,
+    _x0: u32,
+    _y0: u32,
+    log2_trafo_size: u8,
+    trafo_depth: u8,
+    inherited: TransformTreeCbf,
+) -> Result<TransformTreeCbf, DecodeError> {
+    // FFmpeg gates cbf_luma decoding behind:
+    //   pred_mode == INTRA || trafo_depth != 0 || any chroma cbf set
+    // For our I-slice intra path, the first clause is always true.
+    let cbf_luma = decode_cbf_luma(cabac, contexts, trafo_depth) != 0;
+    state.last_cbf_luma = cbf_luma;
+
+    let mut new_cbf = inherited;
+
+    if cbf_luma || inherited.cbf_cb || inherited.cbf_cr {
+        // cu_qp_delta is decoded once per CU, the first time we see a TU
+        // with a non-zero CBF.
+        if pps.cu_qp_delta_enabled_flag && !inherited.cu_qp_delta_coded {
+            let abs = decode_cu_qp_delta_abs(cabac, contexts) as i32;
+            let signed = if abs != 0 {
+                let sign = decode_cu_qp_delta_sign_flag(cabac);
+                if sign != 0 {
+                    -abs
+                } else {
+                    abs
+                }
+            } else {
+                0
+            };
+            state.last_cu_qp_delta = signed;
+            // Spec 7.4.7.10: cu_qp_delta_val ∈ [-(26 + QpBdOffsetY/2),
+            // 25 + QpBdOffsetY/2]. For 8-bit, that's [-26, 25].
+            if !(-26..=25).contains(&signed) {
+                return Err(DecodeError::InvalidSyntax("cu_qp_delta out of range"));
+            }
+            new_cbf.cu_qp_delta_coded = true;
+        }
+
+        // Phase 2c-2 stops here. residual_coding (luma + chroma) is the
+        // next thing to land in Phase 2c-3.
+        // The pre-residual CABAC bin sequence ends right after cu_qp_delta.
+        let _ = log2_trafo_size; // silence unused warning until 2c-3
+    }
+
+    Ok(new_cbf)
 }
 
 /// Decode all intra prediction modes for a CU's PUs and write them into
@@ -479,16 +793,17 @@ mod tests {
     use crate::slice::{parse_slice_segment_header, SliceType};
     use crate::sps::parse_sps;
 
-    /// End-to-end Phase 2c-1 test: parse `testdata/tiny_intra.h265`, run the
-    /// CU tree decoder up to (but not including) `transform_tree`, and assert
-    /// the resulting intra prediction modes.
+    /// End-to-end Phase 2c-1/2c-2 test: parse `testdata/tiny_intra.h265`,
+    /// run the CU tree decoder up through `cu_qp_delta` (just before the
+    /// first residual_coding call), and assert the decoded intra modes,
+    /// `cbf_*` flags, and `cu_qp_delta`.
     ///
-    /// For the all-gray 16×16 fixture we **expect** x265 to pick the cheapest
-    /// possible mode (PLANAR via mpm_idx=0) for the only CU and DM (= same
-    /// as luma) for chroma. If x265 ever changes its mind, the assertion
-    /// values would need to be regenerated against an FFmpeg trace.
+    /// For the all-gray 16×16 fixture we **expect** x265 to pick PLANAR for
+    /// luma and DM for chroma. The cbf_* flags will reveal whether x265
+    /// produced any non-zero residual coefficients (the reference YUV being
+    /// 0x7E vs the prediction's 0x80 strongly suggests yes for luma).
     #[test]
-    fn test_decode_tiny_intra_cu_tree_phase2c1() {
+    fn test_decode_tiny_intra_cu_tree_phase2c2() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/tiny_intra.h265");
         let data = std::fs::read(path).expect("read fixture");
         let nals = parse_annex_b(&data);
@@ -571,6 +886,43 @@ mod tests {
             INTRA_PLANAR,
             "expected DM chroma (= PLANAR) for flat-gray fixture, got {}",
             state.last_chroma_pred_mode
+        );
+
+        // Phase 2c-2 sentinels: with `max_transform_hierarchy_depth_intra=0`
+        // and intra_split=false, we expect no split_transform_flag bin to
+        // be decoded — implicit no-split. The TU is the full 16×16 CU.
+        assert!(
+            !state.last_split_transform_flag,
+            "expected implicit no-split for 16x16 CU at depth 0"
+        );
+
+        // The flat-gray fixture's reference YUV is 0x7E (=126), but PLANAR
+        // prediction with no neighbors gives 0x80 (=128). So luma residual
+        // must be non-zero → cbf_luma should be 1. Chroma stays at 0x80 in
+        // both prediction and reference, so cbf_cb and cbf_cr should be 0.
+        assert!(
+            state.last_cbf_luma,
+            "expected cbf_luma=1 for non-trivial luma residual"
+        );
+        assert!(
+            !state.last_cbf_cb,
+            "expected cbf_cb=0 for chroma matching prediction"
+        );
+        assert!(
+            !state.last_cbf_cr,
+            "expected cbf_cr=0 for chroma matching prediction"
+        );
+
+        // cu_qp_delta is signaled (cu_qp_delta_enabled_flag=1 in PPS) once
+        // the first non-zero CBF appears. x265's CRF rate control on this
+        // fixture applies an adaptive QP — encoder log reports
+        // "Avg QP:20.00", and slice_qp_y is 25, so the per-CU delta is -5.
+        // (Decoding -5 successfully also exercises the truncated-unary
+        // prefix at its max value followed by the EG-0 suffix path of
+        // `cu_qp_delta_abs`.)
+        assert_eq!(
+            state.last_cu_qp_delta, -5,
+            "expected cu_qp_delta=-5 for x265 CRF AQ on flat fixture"
         );
     }
 }
