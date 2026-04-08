@@ -1,14 +1,9 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Pure Rust H.265 / HEVC video decoder.
+//!
+//! See `CLAUDE.md` and `TODO.md` for the implementation plan. As of Phase 0
+//! only the bitstream reader, NAL parser, and error type are implemented.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+#[allow(dead_code)]
+mod bitstream;
+pub mod error;
+pub mod nal;
