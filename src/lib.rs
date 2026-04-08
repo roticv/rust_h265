@@ -10,6 +10,8 @@ mod bitstream;
 mod cabac;
 #[allow(dead_code)]
 mod cabac_tables;
+#[allow(dead_code)]
+mod cu_tree;
 pub mod error;
 pub mod nal;
 #[allow(dead_code)]
