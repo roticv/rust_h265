@@ -1004,8 +1004,18 @@ mod tests {
         assert_eq!(resid.last_sig_y, 0, "last_sig_y");
         let nonzero = resid.coeffs.iter().filter(|&&c| c != 0).count();
         assert_eq!(nonzero, 1, "expected single DC coefficient");
-        let dc = resid.coeffs[0];
-        assert!(dc < 0, "DC must be negative for residual = -2/pixel");
+
+        // Hand-derived expected dequant value:
+        //   level   = -5 (x265's actual encoded value for this fixture)
+        //   scale   = level_scale[20%6=2] << (20/6=3) = 51 << 3 = 408
+        //   shift   = bit_depth + log2_trafo_size - 5 = 8 + 4 - 5 = 7
+        //   add     = 1 << 6 = 64
+        //   scale_m = 16  (no scaling list)
+        //   dequant = (-5 * 408 * 16 + 64) >> 7 = -32576 >> 7 = -255
+        // Then idct_dc:
+        //   shift = 14 - 8 = 6, add = 32
+        //   ((-255 + 1) >> 1 + 32) >> 6 = (-127 + 32) >> 6 = -95 >> 6 = -2 ✓
+        assert_eq!(resid.coeffs[0], -255, "dequantized DC coefficient");
 
         // The CABAC stream should now be at the end of slice. The terminate
         // bin returns 1 when we're done.
@@ -1013,6 +1023,24 @@ mod tests {
             cabac.decode_terminate(),
             1,
             "CABAC must be at end of slice after residual_coding"
+        );
+
+        // Phase 2c-4: apply inverse transform. For this DC-only 16x16 block
+        // the result should be -2 at every pixel (matching the encoder's
+        // residual = ref_yuv 0x7E - prediction 0x80).
+        let mut residual_pixels = state.last_luma_residual.as_ref().unwrap().coeffs.clone();
+        crate::inverse_transform::apply_inverse_transform(
+            &mut residual_pixels,
+            4,
+            resid.last_sig_x,
+            resid.last_sig_y,
+            8,
+            false,
+        );
+        assert!(
+            residual_pixels.iter().all(|&p| p == -2),
+            "expected all-(-2) residual after IDCT, got: first 4 = {:?}",
+            &residual_pixels[..4]
         );
     }
 }

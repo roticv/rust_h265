@@ -13,6 +13,8 @@ mod cabac_tables;
 #[allow(dead_code)]
 mod cu_tree;
 pub mod error;
+#[allow(dead_code)]
+mod inverse_transform;
 pub mod nal;
 #[allow(dead_code)]
 mod residual_coding;
