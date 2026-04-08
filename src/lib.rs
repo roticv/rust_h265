@@ -6,12 +6,18 @@
 
 #[allow(dead_code)]
 mod bitstream;
+#[allow(dead_code)]
+mod cabac;
+#[allow(dead_code)]
+mod cabac_tables;
 pub mod error;
 pub mod nal;
 #[allow(dead_code)]
 mod pps;
 #[allow(dead_code)]
 mod profile_tier_level;
+#[allow(dead_code)]
+mod slice;
 #[allow(dead_code)]
 mod sps;
 #[allow(dead_code)]
@@ -91,12 +97,13 @@ mod parameter_set_tests {
 
         assert!(!sps.scaling_list_enabled_flag);
         assert!(!sps.amp_enabled_flag);
-        assert!(sps.sample_adaptive_offset_enabled_flag);
+        // Fixture is encoded with --no-sao --no-strong-intra-smoothing.
+        assert!(!sps.sample_adaptive_offset_enabled_flag);
         assert!(!sps.pcm_enabled_flag);
         assert_eq!(sps.num_short_term_ref_pic_sets, 0);
         assert!(!sps.long_term_ref_pics_present_flag);
         assert!(sps.sps_temporal_mvp_enabled_flag);
-        assert!(sps.strong_intra_smoothing_enabled_flag);
+        assert!(!sps.strong_intra_smoothing_enabled_flag);
 
         // ---- PPS ----
         let pps = pps::parse_pps(&pps_nal.rbsp).expect("parse PPS");
@@ -105,7 +112,8 @@ mod parameter_set_tests {
         assert!(!pps.dependent_slice_segments_enabled_flag);
         assert!(!pps.output_flag_present_flag);
         assert_eq!(pps.num_extra_slice_header_bits, 0);
-        assert!(pps.sign_data_hiding_enabled_flag);
+        // Fixture is encoded with --no-signhide.
+        assert!(!pps.sign_data_hiding_enabled_flag);
         assert!(!pps.cabac_init_present_flag);
         assert_eq!(pps.num_ref_idx_l0_default_active_minus1, 0);
         assert_eq!(pps.num_ref_idx_l1_default_active_minus1, 0);
@@ -123,7 +131,11 @@ mod parameter_set_tests {
         assert!(!pps.tiles_enabled_flag);
         assert!(!pps.entropy_coding_sync_enabled_flag);
         assert!(pps.pps_loop_filter_across_slices_enabled_flag);
-        assert!(!pps.deblocking_filter_control_present_flag);
+        // x265 with --no-deblock sets deblocking_filter_control_present and
+        // pps_deblocking_filter_disabled.
+        assert!(pps.deblocking_filter_control_present_flag);
+        assert!(!pps.deblocking_filter_override_enabled_flag);
+        assert!(pps.pps_deblocking_filter_disabled_flag);
         assert!(!pps.lists_modification_present_flag);
         assert_eq!(pps.log2_parallel_merge_level_minus2, 0);
         assert!(!pps.slice_segment_header_extension_present_flag);
