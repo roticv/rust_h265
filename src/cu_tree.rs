@@ -862,6 +862,11 @@ fn compute_chroma_avail(
 
 /// Apply the inverse transform to a luma residual block and add it to the
 /// already-predicted luma plane at `(x0, y0)`, with clipping.
+///
+/// HEVC uses the **4×4 DST** (`transform_4x4_luma`) for intra luma 4×4 TUs;
+/// every other size and chroma uses the regular DCT. Since this function is
+/// only called from the I-slice intra path, `pred_mode == INTRA` is always
+/// true here.
 fn apply_residual_to_luma(
     state: &mut PictureState,
     x0: u32,
@@ -871,13 +876,14 @@ fn apply_residual_to_luma(
 ) {
     let size = 1usize << log2_size;
     let mut residual_pixels = block.coeffs.clone();
+    let is_luma_intra_4x4 = log2_size == 2;
     apply_inverse_transform(
         &mut residual_pixels,
         log2_size,
         block.last_sig_x,
         block.last_sig_y,
         state.bit_depth as u32,
-        false,
+        is_luma_intra_4x4,
     );
     let dst_stride = state.y_stride;
     let dst_offset = (y0 as usize) * dst_stride + (x0 as usize);

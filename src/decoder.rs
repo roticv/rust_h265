@@ -219,6 +219,89 @@ mod tests {
         );
     }
 
+    // Phase 3a-2 4×4 fixture: deferred to Phase 3a-3.
+    //
+    // x265 with `--max-tu-size 4` on a flat input picks angular intra
+    // modes for some 4×4 PUs (visible as gradient patterns in the reference
+    // YUV). Validating the 4×4 luma DST end-to-end therefore requires
+    // angular intra prediction, which is the next sub-phase. The DST
+    // implementation in `inverse_transform::transform_4x4_luma` is correct
+    // (it mirrors FFmpeg's `transform_4x4_luma` line-for-line), but
+    // exercising it through the full pipeline waits for 3a-3.
+
+    /// **Phase 3a-2 byte-exact test**: 16×16 flat-gray frame with
+    /// `--ctu 16 --max-tu-size 8` → 4 CTUs at 16×16, each split into
+    /// 4 8×8 luma TUs (transform_tree at log2_trafo=4 has implicit
+    /// `split_transform_flag=1` because log2_trafo > max_tb=3). Tests:
+    ///
+    /// - Recursive `transform_tree` split at log2_trafo > max_tb
+    /// - 8×8 inverse DCT (`idct_8x8`)
+    /// - 8×8 residual_coding with the 2×2 sub-block scan (`DIAG_SCAN_2X2`)
+    /// - `last_significant_coeff_x/y_prefix` for `log2_size = 3`
+    /// - `sig_coeff_flag` `scf_offset` for `log2_trafo == 3` (different
+    ///   from `log2_trafo == 4` we already covered)
+    #[test]
+    fn test_decode_tu8_byte_exact() {
+        let h265_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/tu8.h265");
+        let yuv_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/tu8_ref.yuv");
+        let h265 = std::fs::read(h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(yuv_path).expect("read reference yuv");
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+        let mut frame: Option<Frame> = None;
+        for nal in &nals {
+            if let Some(f) = decoder.decode_nal(nal).expect("decode_nal") {
+                assert!(frame.is_none(), "fixture has only one frame");
+                frame = Some(f);
+            }
+        }
+        let frame = frame.expect("expected one decoded frame");
+        let mut decoded = Vec::with_capacity(1536);
+        decoded.extend_from_slice(&frame.y);
+        decoded.extend_from_slice(&frame.u);
+        decoded.extend_from_slice(&frame.v);
+        assert_eq!(
+            decoded, ref_yuv,
+            "decoded planes do not match reference YUV byte-for-byte"
+        );
+    }
+
+    /// **Phase 3a-2 byte-exact test**: 32×32 flat-gray frame with
+    /// `--ctu 32 --max-tu-size 32` → single CTU, single CU, single 32×32
+    /// luma TU. Tests:
+    ///
+    /// - 32×32 inverse DCT (`idct_32x32` / `idct_dc` for the DC fast path)
+    /// - 32×32 residual_coding with the 8×8 sub-block scan (`DIAG_SCAN_8X8`)
+    /// - `last_significant_coeff_x/y_prefix` context derivation for `log2_size = 5`
+    /// - Dequantization with `shift = bit_depth + log2_trafo_size - 5 = 8`
+    #[test]
+    fn test_decode_tu32_byte_exact() {
+        let h265_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/tu32.h265");
+        let yuv_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/tu32_ref.yuv");
+        let h265 = std::fs::read(h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(yuv_path).expect("read reference yuv");
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+        let mut frame: Option<Frame> = None;
+        for nal in &nals {
+            if let Some(f) = decoder.decode_nal(nal).expect("decode_nal") {
+                assert!(frame.is_none(), "fixture has only one frame");
+                frame = Some(f);
+            }
+        }
+        let frame = frame.expect("expected one decoded frame");
+        assert_eq!(frame.width, 32);
+        assert_eq!(frame.height, 32);
+        let mut decoded = Vec::with_capacity(1536);
+        decoded.extend_from_slice(&frame.y);
+        decoded.extend_from_slice(&frame.u);
+        decoded.extend_from_slice(&frame.v);
+        assert_eq!(
+            decoded, ref_yuv,
+            "decoded planes do not match reference YUV byte-for-byte"
+        );
+    }
+
     /// **Phase 3a-1 byte-exact test**: 32×32 flat-gray frame, `--ctu 16` →
     /// 4 CTUs in raster order. Tests:
     ///
