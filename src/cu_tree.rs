@@ -12,6 +12,10 @@
 use crate::cabac::{CabacContexts, CabacReader};
 use crate::cabac_tables::ctx;
 use crate::error::DecodeError;
+use crate::intra_pred::{
+    add_residual, build_reference_samples, predict_dc, predict_planar, ReferenceAvailability,
+};
+use crate::inverse_transform::apply_inverse_transform;
 use crate::pps::Pps;
 use crate::residual_coding::{decode_residual_coding, ResidualBlock, ResidualPlane, ScanOrder};
 use crate::sps::Sps;
@@ -42,11 +46,13 @@ pub enum PartMode {
 ///
 /// `tab_ct_depth` is per-min-CB and used for `split_cu_flag` neighbor
 /// context derivation. `tab_ipm` is per-min-PU (4×4 in HEVC base profile)
-/// and stores the decoded luma intra prediction mode for downstream use
-/// (intra prediction in Phase 2c-5, deblocking in Phase 3+).
+/// and stores the decoded luma intra prediction mode for downstream use.
+/// `y_plane`/`u_plane`/`v_plane` are the reconstructed picture planes that
+/// `decode_transform_unit` writes prediction + residual into.
 pub struct PictureState {
     pub width: u32,
     pub height: u32,
+    pub bit_depth: u8,
     pub log2_min_cb_size: u8,
     pub log2_min_pu_size: u8,
     pub log2_ctb_size: u8,
@@ -54,6 +60,11 @@ pub struct PictureState {
     pub min_pu_width: usize,
     pub tab_ct_depth: Vec<u8>,
     pub tab_ipm: Vec<u8>,
+    pub y_plane: Vec<u8>,
+    pub u_plane: Vec<u8>,
+    pub v_plane: Vec<u8>,
+    pub y_stride: usize,
+    pub uv_stride: usize,
 
     /// Phase 2c-1 sentinel: most recently decoded luma intra mode of the
     /// most recently decoded CU. Will go away once full CU decode is wired up.
@@ -90,9 +101,12 @@ impl PictureState {
         let min_cb_height = (h >> log2_min_cb_size) as usize;
         let min_pu_width = (w >> log2_min_pu_size) as usize;
         let min_pu_height = (h >> log2_min_pu_size) as usize;
+        let y_stride = w as usize;
+        let uv_stride = (w / 2) as usize;
         Self {
             width: w,
             height: h,
+            bit_depth: sps.bit_depth_luma,
             log2_min_cb_size,
             log2_min_pu_size,
             log2_ctb_size,
@@ -102,6 +116,11 @@ impl PictureState {
             // Default IPM is INTRA_DC (matches FFmpeg
             // `intra_prediction_unit_default_value`).
             tab_ipm: vec![INTRA_DC; min_pu_width * min_pu_height],
+            y_plane: vec![0u8; (w * h) as usize],
+            u_plane: vec![0u8; ((w / 2) * (h / 2)) as usize],
+            v_plane: vec![0u8; ((w / 2) * (h / 2)) as usize],
+            y_stride,
+            uv_stride,
             last_luma_pred_mode: 0,
             last_chroma_pred_mode: 0,
             cu_count: 0,
@@ -561,6 +580,8 @@ fn decode_cu_qp_delta_sign_flag(cabac: &mut CabacReader) -> u32 {
 
 /// `transform_unit` decode (spec 7.3.8.11). Decodes the cbf flags,
 /// `cu_qp_delta`, and (if any cbf is set) the per-plane residual_coding.
+/// Also performs intra prediction and reconstruction (residual + prediction
+/// → clipped pixels) into the picture's frame planes.
 #[allow(clippy::too_many_arguments)]
 fn decode_transform_unit(
     cabac: &mut CabacReader,
@@ -569,12 +590,17 @@ fn decode_transform_unit(
     sps: &Sps,
     pps: &Pps,
     slice_qp_y: i32,
-    _x0: u32,
-    _y0: u32,
+    x0: u32,
+    y0: u32,
     log2_trafo_size: u8,
     trafo_depth: u8,
     inherited: TransformTreeCbf,
 ) -> Result<TransformTreeCbf, DecodeError> {
+    // ---- Step 1: luma intra prediction (always for the I-slice intra path).
+    let luma_mode = state.last_luma_pred_mode;
+    predict_intra_luma(state, x0, y0, log2_trafo_size, luma_mode)?;
+
+    // ---- Step 2: cbf_luma decode.
     // FFmpeg gates cbf_luma decoding behind:
     //   pred_mode == INTRA || trafo_depth != 0 || any chroma cbf set
     // For our I-slice intra path, the first clause is always true.
@@ -582,6 +608,7 @@ fn decode_transform_unit(
     state.last_cbf_luma = cbf_luma;
 
     let mut new_cbf = inherited;
+    let do_chroma = sps.chroma_format_idc == 1 && log2_trafo_size > 2;
 
     if cbf_luma || inherited.cbf_cb || inherited.cbf_cr {
         // cu_qp_delta is decoded once per CU, the first time we see a TU
@@ -607,17 +634,12 @@ fn decode_transform_unit(
             new_cbf.cu_qp_delta_coded = true;
         }
 
-        // Effective QP for dequant: slice QP + per-CU delta. For chroma we
-        // would derive a separate qp via the spec 8.6.1 mapping, but our
-        // fixture doesn't have any non-zero chroma CBFs.
+        // Effective per-CU QP for dequant.
         let qp_y = slice_qp_y + state.last_cu_qp_delta;
         state.last_qp_y = qp_y;
 
-        // residual_coding for each non-zero plane.
+        // ---- Step 3: luma residual_coding + IDCT + reconstruction.
         if cbf_luma {
-            // For intra at log2_trafo_size < 4 the scan order depends on the
-            // intra mode. At log2_trafo_size == 4 (our fixture) the scan is
-            // always diagonal.
             let scan_idx = pick_scan_order(log2_trafo_size, state.last_luma_pred_mode);
             let block = decode_residual_coding(
                 cabac,
@@ -629,22 +651,127 @@ fn decode_transform_unit(
                 qp_y,
                 scan_idx,
             )?;
+            apply_residual_to_luma(state, x0, y0, log2_trafo_size, &block);
             state.last_luma_residual = Some(block);
         }
-        if inherited.cbf_cb {
-            // chroma residual: 4:2:0 → log2_trafo_size_c = log2_trafo_size - 1
-            return Err(DecodeError::Unsupported(
-                "chroma residual_coding not yet wired",
-            ));
+
+        // ---- Step 4: chroma intra prediction + (optional) residual.
+        if do_chroma {
+            let chroma_mode = state.last_chroma_pred_mode;
+            predict_intra_chroma(state, x0, y0, log2_trafo_size - 1, chroma_mode)?;
+            if inherited.cbf_cb || inherited.cbf_cr {
+                return Err(DecodeError::Unsupported(
+                    "chroma residual_coding not yet implemented",
+                ));
+            }
         }
-        if inherited.cbf_cr {
-            return Err(DecodeError::Unsupported(
-                "chroma residual_coding not yet wired",
-            ));
-        }
+    } else if do_chroma {
+        // Intra CU with no CBFs at all — still need chroma prediction.
+        let chroma_mode = state.last_chroma_pred_mode;
+        predict_intra_chroma(state, x0, y0, log2_trafo_size - 1, chroma_mode)?;
     }
 
     Ok(new_cbf)
+}
+
+/// Build the reference samples and call PLANAR/DC/angular for a luma TU.
+/// Writes the prediction into `state.y_plane` at `(x0, y0)`.
+fn predict_intra_luma(
+    state: &mut PictureState,
+    x0: u32,
+    y0: u32,
+    log2_size: u8,
+    mode: u8,
+) -> Result<(), DecodeError> {
+    // For the Phase 2c-6 fixture (single CTU with no neighbors), all
+    // reference samples are unavailable. Phase 3+ will derive availability
+    // from previously-decoded neighboring TUs.
+    let avail = ReferenceAvailability::default();
+    let (top, left) = build_reference_samples(avail, log2_size, state.bit_depth);
+
+    let size = 1usize << log2_size;
+    let dst_stride = state.y_stride;
+    let dst_offset = (y0 as usize) * dst_stride + (x0 as usize);
+    let dst = &mut state.y_plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
+
+    match mode {
+        0 => predict_planar(dst, dst_stride, &top, &left, log2_size),
+        1 => predict_dc(dst, dst_stride, &top, &left, log2_size, true),
+        m => {
+            return Err(DecodeError::Unsupported(if m < 35 {
+                "angular intra prediction not yet implemented"
+            } else {
+                "invalid intra prediction mode"
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// Same as `predict_intra_luma` but for one chroma plane (Cb and Cr both
+/// use the same logic — different planes, same prediction). The chroma
+/// position `(x0, y0)` here is in **luma sample coordinates**; we right-shift
+/// by `hshift = vshift = 1` for 4:2:0.
+fn predict_intra_chroma(
+    state: &mut PictureState,
+    x0_luma: u32,
+    y0_luma: u32,
+    log2_size: u8,
+    mode: u8,
+) -> Result<(), DecodeError> {
+    let avail = ReferenceAvailability::default();
+    let (top, left) = build_reference_samples(avail, log2_size, state.bit_depth);
+    let size = 1usize << log2_size;
+    let dst_stride = state.uv_stride;
+    let x_c = (x0_luma >> 1) as usize;
+    let y_c = (y0_luma >> 1) as usize;
+
+    for plane_idx in 0..2 {
+        let plane = if plane_idx == 0 {
+            &mut state.u_plane
+        } else {
+            &mut state.v_plane
+        };
+        let dst_offset = y_c * dst_stride + x_c;
+        let dst = &mut plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
+        match mode {
+            0 => predict_planar(dst, dst_stride, &top, &left, log2_size),
+            1 => predict_dc(dst, dst_stride, &top, &left, log2_size, false),
+            m => {
+                return Err(DecodeError::Unsupported(if m < 35 {
+                    "angular intra prediction not yet implemented"
+                } else {
+                    "invalid intra prediction mode"
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply the inverse transform to a luma residual block and add it to the
+/// already-predicted luma plane at `(x0, y0)`, with clipping.
+fn apply_residual_to_luma(
+    state: &mut PictureState,
+    x0: u32,
+    y0: u32,
+    log2_size: u8,
+    block: &ResidualBlock,
+) {
+    let size = 1usize << log2_size;
+    let mut residual_pixels = block.coeffs.clone();
+    apply_inverse_transform(
+        &mut residual_pixels,
+        log2_size,
+        block.last_sig_x,
+        block.last_sig_y,
+        state.bit_depth as u32,
+        false,
+    );
+    let dst_stride = state.y_stride;
+    let dst_offset = (y0 as usize) * dst_stride + (x0 as usize);
+    let dst = &mut state.y_plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
+    add_residual(dst, dst_stride, &residual_pixels, log2_size);
 }
 
 /// Pick `scan_idx` for residual_coding (spec 7.4.9.11). For intra TUs at

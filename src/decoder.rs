@@ -1,0 +1,220 @@
+//! Top-level HEVC decoder.
+//!
+//! Phase 2c-6 scope: a `Decoder` that owns the active VPS/SPS/PPS, accepts
+//! NAL units one at a time, parses slice headers + drives the CU tree
+//! decode (which in turn calls intra prediction + IDCT + reconstruction),
+//! and emits a `Frame` for each completed picture.
+//!
+//! For Phase 2c-6 we only handle IDR I-slice pictures with one CU per CTU
+//! (= what `testdata/tiny_intra.h265` produces). Anything outside that
+//! subset is rejected via `Unsupported` from the underlying parsers.
+
+use crate::cabac::{CabacContexts, CabacReader};
+use crate::cu_tree::{decode_coding_quadtree, PictureState};
+use crate::error::DecodeError;
+use crate::nal::{NalUnit, NalUnitType};
+use crate::pps::{parse_pps, Pps};
+use crate::slice::{parse_slice_segment_header, SliceType};
+use crate::sps::{parse_sps, Sps};
+use crate::vps::{parse_vps, Vps};
+
+/// A reconstructed video frame in YUV420 8-bit planar layout.
+///
+/// Plane lengths are `width * height` for luma and `(width/2) * (height/2)`
+/// for each chroma plane. `pic_order_cnt` is 0 for IDR pictures (we'll add
+/// non-IDR POC computation in Phase 3+).
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub pic_order_cnt: u32,
+}
+
+/// Streaming HEVC decoder.
+///
+/// Usage:
+/// ```ignore
+/// let mut dec = rust_h265::decoder::Decoder::new();
+/// for nal in nal_units {
+///     if let Some(frame) = dec.decode_nal(&nal)? {
+///         // ... display, encode, etc.
+///     }
+/// }
+/// if let Some(frame) = dec.flush() {
+///     // ... last buffered frame
+/// }
+/// ```
+#[derive(Default)]
+pub struct Decoder {
+    vps: Option<Vps>,
+    sps: Option<Sps>,
+    pps: Option<Pps>,
+}
+
+impl Decoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one NAL unit. Returns `Ok(Some(frame))` when a picture has just
+    /// finished decoding, `Ok(None)` otherwise (e.g. parameter sets, SEI).
+    pub fn decode_nal(&mut self, nal: &NalUnit<'_>) -> Result<Option<Frame>, DecodeError> {
+        match nal.nal_unit_type {
+            NalUnitType::Vps => {
+                self.vps = Some(parse_vps(&nal.rbsp)?);
+                Ok(None)
+            }
+            NalUnitType::Sps => {
+                self.sps = Some(parse_sps(&nal.rbsp)?);
+                Ok(None)
+            }
+            NalUnitType::Pps => {
+                self.pps = Some(parse_pps(&nal.rbsp)?);
+                Ok(None)
+            }
+            t if t.is_vcl() => self.decode_slice(nal, t),
+            _ => Ok(None),
+        }
+    }
+
+    /// Flush any buffered frame. Phase 2c-6 has no reordering buffer (single
+    /// IDR fixture), so this always returns `None`. Phase 3+ will rework
+    /// this when B-frame reorder buffering lands.
+    pub fn flush(&mut self) -> Option<Frame> {
+        None
+    }
+
+    fn decode_slice(
+        &mut self,
+        nal: &NalUnit<'_>,
+        nut: NalUnitType,
+    ) -> Result<Option<Frame>, DecodeError> {
+        let sps = self
+            .sps
+            .as_ref()
+            .ok_or(DecodeError::InvalidSyntax("slice without active SPS"))?;
+        let pps = self
+            .pps
+            .as_ref()
+            .ok_or(DecodeError::InvalidSyntax("slice without active PPS"))?;
+
+        let sh = parse_slice_segment_header(&nal.rbsp, nut, sps, pps)?;
+        if sh.slice_type != SliceType::I {
+            return Err(DecodeError::Unsupported(
+                "only I-slices are supported in Phase 2",
+            ));
+        }
+
+        // Initialize CABAC at the byte right after the slice header.
+        let mut contexts = CabacContexts::init(sh.slice_qp_y, sh.slice_type, false);
+        let cabac_byte_offset = sh.header_size_bits / 8;
+        let mut cabac = CabacReader::new(&nal.rbsp, cabac_byte_offset);
+
+        // Phase 2c-6 limitation: single CTU per picture. The Phase 1 fixture
+        // is 16×16 with `--ctu 16`, so this is exactly right; multi-CTU
+        // pictures will need a CTU loop here in Phase 3+.
+        if sps.pic_width_in_ctbs_y() != 1 || sps.pic_height_in_ctbs_y() != 1 {
+            return Err(DecodeError::Unsupported(
+                "multi-CTU slices not yet supported",
+            ));
+        }
+
+        let mut state = PictureState::new(sps);
+        decode_coding_quadtree(
+            &mut cabac,
+            &mut contexts,
+            &mut state,
+            sps,
+            pps,
+            sh.slice_qp_y,
+            0,
+            0,
+            sps.ctb_log2_size_y,
+            0,
+        )?;
+
+        // After the CU tree, the slice should be at end-of-data.
+        let term = cabac.decode_terminate();
+        if term != 1 {
+            return Err(DecodeError::InvalidSyntax(
+                "CABAC stream did not terminate at end of slice",
+            ));
+        }
+
+        Ok(Some(Frame {
+            y: state.y_plane,
+            u: state.u_plane,
+            v: state.v_plane,
+            width: sps.pic_width_in_luma_samples,
+            height: sps.pic_height_in_luma_samples,
+            // IDR pictures always have POC 0; non-IDR POC will be wired in
+            // Phase 3+ when we add slice POC LSB parsing.
+            pic_order_cnt: 0,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nal::parse_annex_b;
+
+    /// **Phase 2d byte-exact test**: feed `testdata/tiny_intra.h265` through
+    /// `Decoder::decode_nal` and assert the resulting `Frame.y/u/v` matches
+    /// `testdata/tiny_intra_ref.yuv` byte-for-byte.
+    ///
+    /// Reference YUV layout (`ffmpeg -i tiny_intra.h265 -f rawvideo
+    /// -pix_fmt yuv420p tiny_intra_ref.yuv`):
+    ///
+    /// - 256 bytes of luma (16×16) all `0x7E`
+    /// - 64 bytes of Cb (8×8) all `0x80`
+    /// - 64 bytes of Cr (8×8) all `0x80`
+    /// - 384 bytes total
+    #[test]
+    fn test_decode_tiny_intra_byte_exact() {
+        let h265_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/tiny_intra.h265");
+        let yuv_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/tiny_intra_ref.yuv");
+
+        let h265 = std::fs::read(h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(yuv_path).expect("read reference yuv");
+
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+
+        let mut frame: Option<Frame> = None;
+        for nal in &nals {
+            if let Some(f) = decoder.decode_nal(nal).expect("decode_nal") {
+                assert!(frame.is_none(), "fixture has only one frame");
+                frame = Some(f);
+            }
+        }
+        let frame = frame.expect("expected one decoded frame");
+
+        assert_eq!(frame.width, 16);
+        assert_eq!(frame.height, 16);
+        assert_eq!(frame.y.len(), 256);
+        assert_eq!(frame.u.len(), 64);
+        assert_eq!(frame.v.len(), 64);
+
+        // Reassemble in the same layout as the reference YUV (Y then U then V).
+        let mut decoded = Vec::with_capacity(384);
+        decoded.extend_from_slice(&frame.y);
+        decoded.extend_from_slice(&frame.u);
+        decoded.extend_from_slice(&frame.v);
+
+        assert_eq!(
+            decoded.len(),
+            ref_yuv.len(),
+            "size mismatch: {} vs {}",
+            decoded.len(),
+            ref_yuv.len()
+        );
+        assert_eq!(
+            decoded, ref_yuv,
+            "decoded planes do not match reference YUV byte-for-byte"
+        );
+    }
+}

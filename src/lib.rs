@@ -12,6 +12,7 @@ mod cabac;
 mod cabac_tables;
 #[allow(dead_code)]
 mod cu_tree;
+pub mod decoder;
 pub mod error;
 #[allow(dead_code)]
 mod intra_pred;
