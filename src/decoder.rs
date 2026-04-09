@@ -124,6 +124,10 @@ impl Decoder {
         while more_data && ctb_addr_rs < total_ctbs {
             let x_ctb = (ctb_addr_rs % pic_width_in_ctbs) * ctb_size;
             let y_ctb = (ctb_addr_rs / pic_width_in_ctbs) * ctb_size;
+            // Phase 3b-2: per-CTB SAO parameters decoded BEFORE the coding tree.
+            let rx = (x_ctb >> sps.ctb_log2_size_y) as usize;
+            let ry = (y_ctb >> sps.ctb_log2_size_y) as usize;
+            crate::sao::decode_sao_param(&mut cabac, &mut contexts, &mut state, sps, &sh, rx, ry);
             more_data = decode_coding_quadtree(
                 &mut cabac,
                 &mut contexts,
@@ -149,6 +153,9 @@ impl Decoder {
         if !sh.slice_deblocking_filter_disabled_flag {
             crate::deblock::deblock_picture(&mut state, sps, pps, &sh);
         }
+
+        // Phase 3b-2: SAO filter (after deblocking).
+        crate::sao::apply_sao_picture(&mut state, sps, &sh);
 
         Ok(Some(Frame {
             y: state.y_plane,
@@ -218,6 +225,40 @@ mod tests {
             decoded.len(),
             ref_yuv.len()
         );
+        assert_eq!(
+            decoded, ref_yuv,
+            "decoded planes do not match reference YUV byte-for-byte"
+        );
+    }
+
+    /// **Phase 3b-2 byte-exact test**: 16×16 flat-gray with SAO enabled
+    /// (no `--no-sao`). Tests:
+    ///
+    /// - `sample_adaptive_offset_enabled_flag = 1` SPS path
+    /// - `slice_sao_luma_flag` / `slice_sao_chroma_flag` parsing in slice header
+    /// - Per-CTB `decode_sao_param` parsing (merge flags, type_idx, offsets,
+    ///   eo_class / band_position) at the start of each CTU
+    /// - `apply_sao_picture` running over the picture after deblock
+    #[test]
+    fn test_decode_sao_byte_exact() {
+        let h265_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/sao.h265");
+        let yuv_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/sao_ref.yuv");
+        let h265 = std::fs::read(h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(yuv_path).expect("read reference yuv");
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+        let mut frame: Option<Frame> = None;
+        for nal in &nals {
+            if let Some(f) = decoder.decode_nal(nal).expect("decode_nal") {
+                assert!(frame.is_none(), "fixture has only one frame");
+                frame = Some(f);
+            }
+        }
+        let frame = frame.expect("expected one decoded frame");
+        let mut decoded = Vec::with_capacity(ref_yuv.len());
+        decoded.extend_from_slice(&frame.y);
+        decoded.extend_from_slice(&frame.u);
+        decoded.extend_from_slice(&frame.v);
         assert_eq!(
             decoded, ref_yuv,
             "decoded planes do not match reference YUV byte-for-byte"

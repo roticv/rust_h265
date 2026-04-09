@@ -96,6 +96,8 @@ pub struct PictureState {
     pub bs_vertical: Vec<u8>,
     /// Phase 3b-1 deblocking: per-4×4 boundary strength for horizontal edges.
     pub bs_horizontal: Vec<u8>,
+    /// Phase 3b-2 SAO: per-CTB SAO parameters, indexed by CTB raster address.
+    pub sao_params: Vec<crate::sao::SaoParams>,
 }
 
 impl PictureState {
@@ -143,6 +145,12 @@ impl PictureState {
             tab_qp_y: vec![0u8; min_cb_width * min_cb_height],
             bs_vertical: vec![0u8; ((w / 4) * (h / 4)) as usize],
             bs_horizontal: vec![0u8; ((w / 4) * (h / 4)) as usize],
+            sao_params: {
+                let ctb_size = 1u32 << log2_ctb_size;
+                let pw = w.div_ceil(ctb_size) as usize;
+                let ph = h.div_ceil(ctb_size) as usize;
+                vec![crate::sao::SaoParams::default(); pw * ph]
+            },
         }
     }
 }
