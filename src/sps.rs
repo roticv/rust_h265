@@ -9,6 +9,7 @@
 use crate::bitstream::BitstreamReader;
 use crate::error::DecodeError;
 use crate::profile_tier_level::{ProfileTierLevel, parse_profile_tier_level};
+use crate::scaling_list::{ScalingList, parse_scaling_list_data};
 
 #[derive(Debug, Clone)]
 pub struct Sps {
@@ -34,6 +35,10 @@ pub struct Sps {
     pub max_transform_hierarchy_depth_intra: u32,
 
     pub scaling_list_enabled_flag: bool,
+    /// The active scaling list. Present when `scaling_list_enabled_flag` is true.
+    /// Contains default values when `sps_scaling_list_data_present_flag` is false,
+    /// or explicitly parsed values when true.
+    pub scaling_list: Option<ScalingList>,
     pub amp_enabled_flag: bool,
     pub sample_adaptive_offset_enabled_flag: bool,
     pub pcm_enabled_flag: bool,
@@ -135,14 +140,16 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     let max_transform_hierarchy_depth_intra = r.read_ue()?;
 
     let scaling_list_enabled_flag = r.read_bit()? == 1;
-    if scaling_list_enabled_flag {
+    let scaling_list = if scaling_list_enabled_flag {
+        let mut sl = ScalingList::default_scaling_list();
         let sps_scaling_list_data_present_flag = r.read_bit()? == 1;
         if sps_scaling_list_data_present_flag {
-            return Err(DecodeError::Unsupported(
-                "explicit scaling lists not yet supported",
-            ));
+            parse_scaling_list_data(&mut r, &mut sl)?;
         }
-    }
+        Some(sl)
+    } else {
+        None
+    };
 
     let amp_enabled_flag = r.read_bit()? == 1;
     let sample_adaptive_offset_enabled_flag = r.read_bit()? == 1;
@@ -200,6 +207,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         max_transform_hierarchy_depth_inter,
         max_transform_hierarchy_depth_intra,
         scaling_list_enabled_flag,
+        scaling_list,
         amp_enabled_flag,
         sample_adaptive_offset_enabled_flag,
         pcm_enabled_flag,

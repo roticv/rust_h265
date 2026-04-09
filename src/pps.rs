@@ -6,6 +6,7 @@
 
 use crate::bitstream::BitstreamReader;
 use crate::error::DecodeError;
+use crate::scaling_list::{ScalingList, parse_scaling_list_data};
 
 #[derive(Debug, Clone)]
 pub struct Pps {
@@ -38,6 +39,9 @@ pub struct Pps {
     pub pps_deblocking_filter_disabled_flag: bool,
     pub pps_beta_offset_div2: i32,
     pub pps_tc_offset_div2: i32,
+    pub pps_scaling_list_data_present_flag: bool,
+    /// PPS-level scaling list override. When present, takes priority over SPS scaling list.
+    pub scaling_list: Option<ScalingList>,
     pub lists_modification_present_flag: bool,
     pub log2_parallel_merge_level_minus2: u32,
     pub slice_segment_header_extension_present_flag: bool,
@@ -101,11 +105,13 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
     }
 
     let pps_scaling_list_data_present_flag = r.read_bit()? == 1;
-    if pps_scaling_list_data_present_flag {
-        return Err(DecodeError::Unsupported(
-            "PPS scaling list data not yet supported",
-        ));
-    }
+    let pps_scaling_list = if pps_scaling_list_data_present_flag {
+        let mut sl = ScalingList::default_scaling_list();
+        parse_scaling_list_data(&mut r, &mut sl)?;
+        Some(sl)
+    } else {
+        None
+    };
 
     let lists_modification_present_flag = r.read_bit()? == 1;
     let log2_parallel_merge_level_minus2 = r.read_ue()?;
@@ -144,6 +150,8 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
         pps_deblocking_filter_disabled_flag,
         pps_beta_offset_div2,
         pps_tc_offset_div2,
+        pps_scaling_list_data_present_flag,
+        scaling_list: pps_scaling_list,
         lists_modification_present_flag,
         log2_parallel_merge_level_minus2,
         slice_segment_header_extension_present_flag,

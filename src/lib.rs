@@ -26,6 +26,8 @@ mod profile_tier_level;
 #[allow(dead_code)]
 mod residual_coding;
 #[allow(dead_code)]
+mod scaling_list;
+#[allow(dead_code)]
 mod slice;
 #[allow(dead_code)]
 mod sps;

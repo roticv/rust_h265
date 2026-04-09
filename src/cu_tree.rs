@@ -694,6 +694,7 @@ fn decode_transform_unit(
                 ResidualPlane::Luma,
                 qp_y,
                 scan_idx,
+                true, // is_intra (I-slice path)
             )?;
             apply_residual_to_luma(state, x0, y0, log2_trafo_size, &block);
             state.last_luma_residual = Some(block);

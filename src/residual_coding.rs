@@ -9,7 +9,7 @@
 //!   - 8-bit luma/chroma 4:2:0
 //!   - No `transform_skip_flag` (PPS rejects it)
 //!   - No `cu_transquant_bypass_flag`
-//!   - No `scaling_list_enabled_flag` (SPS rejects it)
+//!   - `scaling_list_enabled_flag` supported (default or explicit lists)
 //!   - No `persistent_rice_adaptation_enabled` (range extension)
 //!   - No `sign_data_hiding` (slice header / x265 `--no-signhide`)
 //!   - No `explicit_rdpcm` (range extension)
@@ -20,6 +20,7 @@ use crate::cabac::{CabacContexts, CabacReader};
 use crate::cabac_tables::ctx;
 use crate::error::DecodeError;
 use crate::pps::Pps;
+use crate::scaling_list::ScalingList;
 use crate::sps::Sps;
 
 /// Component index passed into `decode_residual_coding`.
@@ -396,8 +397,9 @@ pub struct ResidualBlock {
 /// Compute the dequantization scale parameters for a TU.
 ///
 /// Returns `(shift, add, scale)` for the formula
-/// `dequant = (level * scale * scale_m + add) >> shift`. `scale_m` is 16
-/// (no scaling lists) for our subset.
+/// `dequant = (level * scale * scale_m + add) >> shift`. `scale_m` is either
+/// 16 (no scaling lists) or looked up from the active scaling matrix (when
+/// `scaling_list_enabled_flag = 1`).
 fn compute_dequant_scale(qp: i32, log2_trafo_size: u8, bit_depth: u8) -> (u32, u32, u32) {
     let shift = (bit_depth as u32 + log2_trafo_size as u32) - 5;
     let add = 1u32 << (shift - 1);
@@ -435,15 +437,11 @@ pub fn decode_residual_coding(
     plane: ResidualPlane,
     qp: i32,
     scan_idx: ScanOrder,
+    is_intra: bool,
 ) -> Result<ResidualBlock, DecodeError> {
     if pps.transform_skip_enabled_flag {
         return Err(DecodeError::Unsupported(
             "transform_skip_flag in residual_coding not supported",
-        ));
-    }
-    if sps.scaling_list_enabled_flag {
-        return Err(DecodeError::Unsupported(
-            "scaling_list_enabled in residual_coding not supported",
         ));
     }
     if pps.sign_data_hiding_enabled_flag {
@@ -539,8 +537,10 @@ pub fn decode_residual_coding(
     let num_last_subset = ((num_coeff - 1) >> 4) as usize;
 
     let (shift, add, scale) = compute_dequant_scale(qp, log2_trafo_size, sps.bit_depth_luma);
-    let scale_m = 16u32; // no scaling list
-    let _ = scale_m; // (kept symbolic for now; spec multiplies it through)
+
+    // Resolve the active scaling matrix and DC scale value.
+    let (scale_matrix, dc_scale) =
+        resolve_scaling_matrix(sps, pps, log2_trafo_size, c_idx, is_intra);
 
     // 8×8 grid of CG flags. The largest TU is 32×32 → 8×8 sub-blocks.
     let mut significant_coeff_group_flag = [[false; 8]; 8];
@@ -740,7 +740,24 @@ pub fn decode_residual_coding(
             }
             sign_bits <<= 1;
 
-            // Dequantize: clamp to int16.
+            // Dequantize with scaling matrix lookup (HEVC spec 8.6.3).
+            let scale_m: u32 = match &scale_matrix {
+                Some(sm) => {
+                    // For 16×16 and 32×32 TUs, the DC position uses dc_scale.
+                    if x_c != 0 || y_c != 0 || log2_trafo_size < 4 {
+                        let pos = match log2_trafo_size {
+                            3 => (y_c << 3) + x_c,
+                            4 => ((y_c >> 1) << 3) + (x_c >> 1),
+                            5 => ((y_c >> 2) << 3) + (x_c >> 2),
+                            _ => (y_c << 2) + x_c, // log2 == 2 (4×4)
+                        };
+                        sm[pos] as u32
+                    } else {
+                        dc_scale as u32
+                    }
+                }
+                None => 16,
+            };
             let dq = (trans_coeff_level * scale as i64 * scale_m as i64 + add as i64) >> shift;
             let dq = dq.clamp(-32768, 32767) as i16;
             coeffs[y_c * trafo_size + x_c] = dq;
@@ -753,6 +770,47 @@ pub fn decode_residual_coding(
         last_sig_x,
         last_sig_y,
     })
+}
+
+/// Resolve the active scaling matrix and DC scale value for a TU.
+///
+/// Returns `(Some(matrix), dc_scale)` when scaling lists are enabled, or
+/// `(None, 16)` when they are not. The matrix is a 64-element `[u8; 64]`
+/// in raster order for the 8×8 base matrix. For 4×4 TUs, only the first
+/// 16 entries are meaningful.
+///
+/// Matrix ID mapping matches FFmpeg: `matrix_id = 3 * is_inter + c_idx`.
+fn resolve_scaling_matrix(
+    sps: &Sps,
+    pps: &Pps,
+    log2_trafo_size: u8,
+    c_idx: usize,
+    is_intra: bool,
+) -> (Option<[u8; 64]>, u8) {
+    if !sps.scaling_list_enabled_flag {
+        return (None, 16);
+    }
+
+    // PPS scaling list takes priority over SPS scaling list.
+    let sl: &ScalingList = if pps.pps_scaling_list_data_present_flag {
+        pps.scaling_list.as_ref().unwrap()
+    } else {
+        sps.scaling_list.as_ref().unwrap()
+    };
+
+    let intra_base = if is_intra { 0 } else { 3 };
+    let matrix_id = intra_base + c_idx;
+    let size_id = (log2_trafo_size - 2) as usize;
+
+    let matrix = sl.sl[size_id][matrix_id];
+    let dc_scale = if log2_trafo_size >= 4 {
+        sl.sl_dc[size_id - 2][matrix_id]
+    } else {
+        // DC scale is not separately coded for 4×4 and 8×8; use matrix[0].
+        matrix[0]
+    };
+
+    (Some(matrix), dc_scale)
 }
 
 /// 1×1 scan order (used as the sub-block scan for 4×4 TUs).
