@@ -779,6 +779,172 @@ mod tests {
         }
     }
 
+    /// **Phase 3a-6 byte-exact test**: 16×16 vertical-stripe frame encoded
+    /// *without* `--no-signhide`, so `pps_sign_data_hiding_enabled_flag` is
+    /// set and x265 will omit the sign bit of the last-in-scan-order
+    /// non-zero coefficient in sub-blocks that meet the 4-position gap
+    /// criterion.
+    ///
+    /// Exercises:
+    /// - `sign_data_hiding_enabled_flag = 1` in the PPS (no longer rejected)
+    /// - `sign_hidden = (last_nz_pos_in_cg - first_nz_pos_in_cg >= 4)` gate
+    /// - Decoding `n_end - 1` sign bits in hidden sub-blocks
+    /// - Sum-of-abs parity adjustment on the hidden coefficient
+    #[test]
+    fn test_decode_signhide_byte_exact() {
+        use std::process::Command;
+
+        let tmp = std::env::temp_dir();
+        let input_yuv = tmp.join("signhide_input.yuv");
+        let h265_path = tmp.join("signhide.h265");
+        let ref_yuv_path = tmp.join("signhide_ref.yuv");
+
+        // Vertical-stripe pattern: produces many non-zero high-frequency
+        // coefficients per sub-block, so the 4-position SDH gap condition
+        // is met often (the encoder is free to actually hide signs).
+        let w: usize = 16;
+        let h: usize = 16;
+        let mut yuv_data = Vec::with_capacity(w * h + 2 * (w / 2) * (h / 2));
+        for _y in 0..h {
+            for x in 0..w {
+                yuv_data.push(if x < 8 { 40u8 } else { 200u8 });
+            }
+        }
+        yuv_data.extend(std::iter::repeat_n(128u8, (w / 2) * (h / 2) * 2));
+        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
+
+        // `--preset ultrafast` implicitly sets `signhide 0`, so we have to
+        // explicitly request `--signhide` to enable it. That's exactly the
+        // path we want to exercise.
+        let x265_status = Command::new("x265")
+            .args([
+                "--input",
+                input_yuv.to_str().unwrap(),
+                "--input-res",
+                "16x16",
+                "--fps",
+                "1",
+                "--frames",
+                "1",
+                "--output",
+                h265_path.to_str().unwrap(),
+                "--preset",
+                "ultrafast",
+                "--no-wpp",
+                "--signhide",
+                "--ctu",
+                "16",
+                "--max-tu-size",
+                "4",
+                "--no-open-gop",
+                "--keyint",
+                "1",
+                "--no-scenecut",
+                "--no-sao",
+                "--no-deblock",
+                "--qp",
+                "20",
+                "--no-psnr",
+                "--no-ssim",
+                "--no-info",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let x265_status = match x265_status {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("x265 not found, skipping signhide fixture test");
+                return;
+            }
+        };
+        assert!(x265_status.success(), "x265 encoding failed");
+
+        let ffmpeg_status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-i",
+                h265_path.to_str().unwrap(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                ref_yuv_path.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let ffmpeg_status = match ffmpeg_status {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("ffmpeg not found, skipping signhide fixture test");
+                return;
+            }
+        };
+        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
+
+        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
+
+        let nals = parse_annex_b(&h265);
+
+        // Sanity-check: the PPS in this fixture must actually have SDH on.
+        // If it doesn't we're not exercising the new path at all.
+        let pps_nal = nals
+            .iter()
+            .find(|n| n.nal_unit_type == NalUnitType::Pps)
+            .expect("fixture must contain a PPS");
+        let pps = parse_pps(&pps_nal.rbsp).expect("parse PPS");
+        assert!(
+            pps.sign_data_hiding_enabled_flag,
+            "signhide fixture must have sign_data_hiding_enabled_flag = 1"
+        );
+
+        let mut decoder = Decoder::new();
+        let mut frame: Option<Frame> = None;
+        for nal in &nals {
+            if let Some(f) = decoder.decode_nal(nal).expect("decode_nal") {
+                assert!(frame.is_none(), "fixture has only one frame");
+                frame = Some(f);
+            }
+        }
+        let frame = frame.expect("expected one decoded frame");
+
+        assert_eq!(frame.width as usize, w);
+        assert_eq!(frame.height as usize, h);
+
+        let mut decoded = Vec::with_capacity(ref_yuv.len());
+        decoded.extend_from_slice(&frame.y);
+        decoded.extend_from_slice(&frame.u);
+        decoded.extend_from_slice(&frame.v);
+
+        assert_eq!(
+            decoded.len(),
+            ref_yuv.len(),
+            "size mismatch: {} vs {}",
+            decoded.len(),
+            ref_yuv.len()
+        );
+
+        if decoded != ref_yuv {
+            for (i, (a, b)) in decoded.iter().zip(ref_yuv.iter()).enumerate() {
+                if a != b {
+                    let plane = if i < w * h {
+                        "Y"
+                    } else if i < w * h + (w / 2) * (h / 2) {
+                        "U"
+                    } else {
+                        "V"
+                    };
+                    panic!(
+                        "mismatch at byte {} (plane {}) ours={} ref={}",
+                        i, plane, a, b
+                    );
+                }
+            }
+        }
+    }
+
     /// **Phase 3a-5 byte-exact test**: attempt to produce a PCM-bearing
     /// bitstream via x265 `--pcm`. x265 is notoriously reluctant to choose
     /// PCM over intra; on a flat-gray frame with a very high QP it *may*

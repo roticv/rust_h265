@@ -11,7 +11,7 @@
 //!   - No `cu_transquant_bypass_flag`
 //!   - `scaling_list_enabled_flag` supported (default or explicit lists)
 //!   - No `persistent_rice_adaptation_enabled` (range extension)
-//!   - No `sign_data_hiding` (slice header / x265 `--no-signhide`)
+//!   - `sign_data_hiding_enabled_flag` supported (Phase 3a-6)
 //!   - No `explicit_rdpcm` (range extension)
 //!
 //! Anything outside that subset returns `Unsupported`.
@@ -444,11 +444,6 @@ pub fn decode_residual_coding(
             "transform_skip_flag in residual_coding not supported",
         ));
     }
-    if pps.sign_data_hiding_enabled_flag {
-        return Err(DecodeError::Unsupported(
-            "sign_data_hiding in residual_coding not supported",
-        ));
-    }
     // Horizontal and vertical scan orders are used for angular intra modes
     // 6..14 (vert) and 22..30 (horiz) at log2_trafo_size <= 3.
 
@@ -698,6 +693,14 @@ pub fn decode_residual_coding(
             }
         }
 
+        // Record sub-block scan extremes for sign data hiding. The first
+        // entry in `significant_coeff_flag_idx` is the highest scan position
+        // decoded in this sub-block (the "last" non-zero in forward scan
+        // order); the entry at `n_end - 1` is the lowest scan position (the
+        // "first" non-zero in forward scan order, i.e. the DC-ward one).
+        let last_nz_pos_in_cg = significant_coeff_flag_idx[0] as i32;
+        let first_nz_pos_in_cg = significant_coeff_flag_idx[(n_end as usize) - 1] as i32;
+
         // greater2 only applies to the first level > 1.
         if first_greater1_idx != -1 {
             let greater2 =
@@ -705,12 +708,35 @@ pub fn decode_residual_coding(
             coeff_abs_level_greater1_flag[first_greater1_idx as usize] += greater2;
         }
 
-        // Sign flags (bypass; no sign hiding in our subset).
-        let coeff_sign_flag = decode_coeff_sign_flag(cabac, n_end);
-        let mut sign_bits = coeff_sign_flag << (16 - n_end);
+        // Sign data hiding gating (HEVC spec 7.4.9.11 / FFmpeg cabac.c).
+        // We don't support `cu_transquant_bypass_flag`, `transform_skip_flag`
+        // (which would gate implicit RDPCM), or `explicit_rdpcm_flag`, so the
+        // only condition that matters is the scan-distance test.
+        let sign_hidden =
+            pps.sign_data_hiding_enabled_flag && (last_nz_pos_in_cg - first_nz_pos_in_cg >= 4);
+
+        // Sign flags (bypass). When SDH is active on this sub-block, the
+        // encoder omitted the sign bit of the first non-zero coefficient in
+        // forward scan order — we'll recover it from the parity of the sum
+        // of absolute levels below. `sign_hidden` implies `n_end >= 2`
+        // (because `last_nz_pos_in_cg - first_nz_pos_in_cg >= 4` requires
+        // at least two non-zero coefficients in the sub-block), so
+        // `sign_nb >= 1` here.
+        //
+        // `sign_bits` must be kept in a 16-bit window to match FFmpeg's
+        // `uint16_t coeff_sign_flag` (see spec 9.3.4.2.9). Using a raw
+        // `u32` would leak the previously-consumed sign bits into bit 16
+        // and higher on each `<<= 1`, and `(sign_bits >> 15) != 0` would
+        // then spuriously flip later coefficients. Earlier fixtures hid
+        // this pre-existing bug because they had few non-zero coefficients
+        // per sub-block; the new signhide fixture forces the issue.
+        let sign_nb = if sign_hidden { n_end - 1 } else { n_end };
+        let coeff_sign_flag = decode_coeff_sign_flag(cabac, sign_nb);
+        let mut sign_bits: u32 = (coeff_sign_flag << (16 - sign_nb)) & 0xffff;
 
         // Levels in reverse scan order, dequantize, and store.
         let mut c_rice_param = 0u32;
+        let mut sum_abs: i64 = 0;
         for m in 0..n_end as usize {
             let n = significant_coeff_flag_idx[m] as usize;
             let x_c = (x_cg << 2) + scan_x_off[n] as usize;
@@ -735,10 +761,21 @@ pub fn decode_residual_coding(
                 }
             }
 
+            // Sign data hiding: accumulate the absolute level, and at the
+            // hidden coefficient (the one at `first_nz_pos_in_cg` in scan
+            // order, which is the LAST one visited by this reverse loop)
+            // derive its sign from the parity.
+            if sign_hidden {
+                sum_abs += trans_coeff_level;
+                if (n as i32) == first_nz_pos_in_cg && (sum_abs & 1) != 0 {
+                    trans_coeff_level = -trans_coeff_level;
+                }
+            }
+
             if (sign_bits >> 15) != 0 {
                 trans_coeff_level = -trans_coeff_level;
             }
-            sign_bits <<= 1;
+            sign_bits = (sign_bits << 1) & 0xffff;
 
             // Dequantize with scaling matrix lookup (HEVC spec 8.6.3).
             let scale_m: u32 = match &scale_matrix {
