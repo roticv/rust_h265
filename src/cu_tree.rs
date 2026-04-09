@@ -98,6 +98,10 @@ pub struct PictureState {
     pub bs_horizontal: Vec<u8>,
     /// Phase 3b-2 SAO: per-CTB SAO parameters, indexed by CTB raster address.
     pub sao_params: Vec<crate::sao::SaoParams>,
+    /// Phase 3c-1 multi-slice: per-CTB slice address (`slice_segment_address`
+    /// of the slice the CTB belongs to), indexed by CTB raster address.
+    /// `-1` means the CTB has not been decoded yet (not part of any slice).
+    pub tab_slice_addr_rs: Vec<i32>,
 }
 
 impl PictureState {
@@ -150,6 +154,12 @@ impl PictureState {
                 let pw = w.div_ceil(ctb_size) as usize;
                 let ph = h.div_ceil(ctb_size) as usize;
                 vec![crate::sao::SaoParams::default(); pw * ph]
+            },
+            tab_slice_addr_rs: {
+                let ctb_size = 1u32 << log2_ctb_size;
+                let pw = w.div_ceil(ctb_size) as usize;
+                let ph = h.div_ceil(ctb_size) as usize;
+                vec![-1i32; pw * ph]
             },
         }
     }
@@ -1010,8 +1020,9 @@ fn predict_intra_luma(
 /// `(x0, y0)` of size `size`. For Phase 3a-1 we use a simple raster-scan
 /// availability rule: a neighbor is available iff its bottom-right pixel
 /// has a strictly smaller raster index than `(x0, y0)` AND lies within the
-/// picture. This works for single-slice intra-only pictures with raster
-/// CTU order — multi-slice / tiles / WPP will need a more elaborate check.
+/// picture. Phase 3c-1 adds a cross-slice check: a neighbor pixel belonging
+/// to a CTB in a different slice is treated as unavailable, matching the
+/// spec rule (`ctb_addr_in_slice > 0` / `>= ctb_width`).
 fn compute_luma_avail(state: &PictureState, x0: u32, y0: u32, size: u32) -> ReferenceAvailability {
     let pic_w = state.width;
     let pic_h = state.height;
@@ -1019,11 +1030,38 @@ fn compute_luma_avail(state: &PictureState, x0: u32, y0: u32, size: u32) -> Refe
     // Raster index of the current TU's top-left.
     let cur_idx = (y0 as u64) * (pic_w as u64) + (x0 as u64);
 
+    // CTB raster address + slice address of the current TU's containing CTB.
+    let log2_ctb = state.log2_ctb_size;
+    let ctb_size = 1u32 << log2_ctb;
+    let pic_w_in_ctbs = pic_w.div_ceil(ctb_size);
+    let cur_ctb_rs = (y0 >> log2_ctb) * pic_w_in_ctbs + (x0 >> log2_ctb);
+    let cur_slice_addr = state
+        .tab_slice_addr_rs
+        .get(cur_ctb_rs as usize)
+        .copied()
+        .unwrap_or(-1);
+
     let pixel_decoded = |x: u32, y: u32| -> bool {
         if x >= pic_w || y >= pic_h {
             return false;
         }
-        ((y as u64) * (pic_w as u64) + (x as u64)) < cur_idx
+        if ((y as u64) * (pic_w as u64) + (x as u64)) >= cur_idx {
+            return false;
+        }
+        // Slice-boundary check: if the neighbor pixel is in a different CTB
+        // AND that CTB belongs to a different slice, treat as unavailable.
+        let n_ctb_rs = (y >> log2_ctb) * pic_w_in_ctbs + (x >> log2_ctb);
+        if n_ctb_rs != cur_ctb_rs {
+            let neighbor_slice_addr = state
+                .tab_slice_addr_rs
+                .get(n_ctb_rs as usize)
+                .copied()
+                .unwrap_or(-1);
+            if neighbor_slice_addr < 0 || neighbor_slice_addr != cur_slice_addr {
+                return false;
+            }
+        }
+        true
     };
 
     // Up-left: pixel at (x0 - 1, y0 - 1)

@@ -8,13 +8,20 @@
 //! For Phase 2c-6 we only handle IDR I-slice pictures with one CU per CTU
 //! (= what `testdata/tiny_intra.h265` produces). Anything outside that
 //! subset is rejected via `Unsupported` from the underlying parsers.
+//!
+//! Phase 3c-1 extends this to independent multi-slice pictures: a picture
+//! can be split across several VCL NAL units where each slice segment
+//! carries its own slice header and covers a contiguous range of CTBs
+//! starting at `slice_segment_address`. The decoder lazily creates a
+//! `PictureState` on the first slice of the picture and finalizes the
+//! picture (deblock + SAO) when the CTB count reaches the picture total.
 
 use crate::cabac::{CabacContexts, CabacReader};
 use crate::cu_tree::{PictureState, decode_coding_quadtree};
 use crate::error::DecodeError;
 use crate::nal::{NalUnit, NalUnitType};
 use crate::pps::{Pps, parse_pps};
-use crate::slice::{SliceType, parse_slice_segment_header};
+use crate::slice::{SliceHeader, SliceType, parse_slice_segment_header};
 use crate::sps::{Sps, parse_sps};
 use crate::vps::{Vps, parse_vps};
 
@@ -47,11 +54,31 @@ pub struct Frame {
 ///     // ... last buffered frame
 /// }
 /// ```
+/// In-flight picture state: the reconstruction buffers plus the bookkeeping
+/// needed to stitch multi-slice decode back together.
+struct PictureInProgress {
+    state: PictureState,
+    /// Header of the most recently decoded slice segment. Phase 3c-1 uses
+    /// it for deblock/SAO finalization — in the common case all slices in a
+    /// picture share the same filter flags, which this approximation
+    /// matches.
+    last_slice_header: SliceHeader,
+    /// Number of CTBs already decoded in this picture (sum across all
+    /// slice segments seen so far).
+    ctbs_decoded: u32,
+    /// Total CTBs in the picture = `pic_width_in_ctbs * pic_height_in_ctbs`.
+    total_ctbs: u32,
+}
+
 #[derive(Default)]
 pub struct Decoder {
     vps: Option<Vps>,
     sps: Option<Sps>,
     pps: Option<Pps>,
+    /// The picture currently being assembled from one or more slice segments.
+    /// Phase 3c-1: created on the first slice segment, finalized and
+    /// returned as a `Frame` when all CTBs have been decoded.
+    current_picture: Option<PictureInProgress>,
 }
 
 impl Decoder {
@@ -107,31 +134,128 @@ impl Decoder {
                 "only I-slices are supported in Phase 2",
             ));
         }
-
-        // Initialize CABAC at the byte right after the slice header.
+        // Per-slice CABAC reinit (independent slice segments only — dependent
+        // slice segments would reuse the previous segment's context state,
+        // which we reject at parse time).
         let mut contexts = CabacContexts::init(sh.slice_qp_y, sh.slice_type, false);
         let cabac_byte_offset = sh.header_size_bits / 8;
         let mut cabac = CabacReader::new(&nal.rbsp, cabac_byte_offset);
 
-        let mut state = PictureState::new(sps);
         let ctb_size = 1u32 << sps.ctb_log2_size_y;
         let pic_width_in_ctbs = sps.pic_width_in_ctbs_y();
         let pic_height_in_ctbs = sps.pic_height_in_ctbs_y();
-        let mut more_data = true;
-        let mut ctb_addr_rs: u32 = 0;
         let total_ctbs = pic_width_in_ctbs * pic_height_in_ctbs;
 
+        // Phase 3c-1: a first slice segment starts a new picture. Subsequent
+        // slice segments (`first_slice_segment_in_pic_flag = 0`) attach to
+        // the already-in-flight picture.
+        if sh.first_slice_segment_in_pic_flag {
+            if self.current_picture.is_some() {
+                // Starting a new picture while the previous one is still
+                // in flight means we missed CTBs. That's a malformed stream
+                // for the Phase 3c-1 subset (no WPP / tiles, no dependent
+                // slices), so bail loudly rather than silently dropping the
+                // previous picture.
+                return Err(DecodeError::InvalidSyntax(
+                    "new first slice segment arrived while previous picture was incomplete",
+                ));
+            }
+            self.current_picture = Some(PictureInProgress {
+                state: PictureState::new(sps),
+                last_slice_header: sh.clone(),
+                ctbs_decoded: 0,
+                total_ctbs,
+            });
+        } else {
+            let pic = self
+                .current_picture
+                .as_ref()
+                .ok_or(DecodeError::InvalidSyntax(
+                    "non-first slice segment without an active picture",
+                ))?;
+            if pic.total_ctbs != total_ctbs {
+                return Err(DecodeError::InvalidSyntax(
+                    "slice SPS dimensions changed within picture",
+                ));
+            }
+            if sh.slice_segment_address != pic.ctbs_decoded {
+                // Phase 3c-1 assumes slices arrive in raster CTB order and
+                // cover contiguous ranges (no gaps or overlap). Tiles and
+                // out-of-order slices are Phase 3c-2.
+                return Err(DecodeError::Unsupported(
+                    "non-contiguous slice segment address (tile-scan order)",
+                ));
+            }
+        }
+
+        // Borrow the in-flight picture mutably for the rest of decode.
+        let pic = self
+            .current_picture
+            .as_mut()
+            .expect("current_picture set above");
+        let state = &mut pic.state;
+
+        let wpp = pps.entropy_coding_sync_enabled_flag;
+        let slice_start_ctb = sh.slice_segment_address;
+        // Phase 3c-3 (WPP): saved CABAC context state captured after the
+        // second CTB of each row, to be loaded at the start of the next row.
+        let mut saved_state: Option<[u8; crate::cabac_tables::HEVC_CONTEXTS]> = None;
+
+        let mut more_data = true;
+        let mut ctb_addr_rs: u32 = slice_start_ctb;
+
         while more_data && ctb_addr_rs < total_ctbs {
-            let x_ctb = (ctb_addr_rs % pic_width_in_ctbs) * ctb_size;
+            // WPP row boundary reinit (spec 9.3.2.2 + FFmpeg
+            // `ff_hevc_cabac_init` / `load_states`). The first CTB of every
+            // non-first row of the slice triggers:
+            //   1. A fresh `CabacReader` at the row's entry-point byte offset
+            //   2. Loading the saved context state from the previous row
+            //      (when `ctb_width > 1`) or a fresh init (when `ctb_width == 1`)
+            let col = ctb_addr_rs % pic_width_in_ctbs;
+            let is_row_start = col == 0;
+            let is_first_ctb_of_slice = ctb_addr_rs == slice_start_ctb;
+            if wpp && is_row_start && !is_first_ctb_of_slice {
+                let row_within_slice =
+                    ((ctb_addr_rs - slice_start_ctb) / pic_width_in_ctbs) as usize;
+                // row_within_slice == 1 for the 2nd row, 2 for the 3rd row, ...
+                // entry_point_offsets[ep_idx] gives the cumulative byte
+                // offset (from the start of the slice data) of substream
+                // (row_within_slice). For the second row that's ep_idx = 0.
+                let ep_idx = row_within_slice - 1;
+                if ep_idx >= sh.entry_point_offsets.len() {
+                    return Err(DecodeError::InvalidSyntax(
+                        "WPP slice missing entry_point_offset for row",
+                    ));
+                }
+                let byte_offset = cabac_byte_offset + sh.entry_point_offsets[ep_idx] as usize;
+                cabac.reinit_at(byte_offset);
+                if pic_width_in_ctbs == 1 {
+                    // Single-column picture: per HEVC spec and FFmpeg, state
+                    // is re-initialized afresh rather than loaded.
+                    contexts = CabacContexts::init(sh.slice_qp_y, sh.slice_type, false);
+                } else if let Some(saved) = saved_state.as_ref() {
+                    contexts.state.copy_from_slice(saved);
+                } else {
+                    return Err(DecodeError::InvalidSyntax(
+                        "WPP row start without a saved context state",
+                    ));
+                }
+            }
+
+            let x_ctb = col * ctb_size;
             let y_ctb = (ctb_addr_rs / pic_width_in_ctbs) * ctb_size;
             // Phase 3b-2: per-CTB SAO parameters decoded BEFORE the coding tree.
             let rx = (x_ctb >> sps.ctb_log2_size_y) as usize;
             let ry = (y_ctb >> sps.ctb_log2_size_y) as usize;
-            crate::sao::decode_sao_param(&mut cabac, &mut contexts, &mut state, sps, &sh, rx, ry);
+            // Record the slice this CTB belongs to BEFORE decoding, so the
+            // intra prediction availability check can see the current CTB's
+            // slice address.
+            state.tab_slice_addr_rs[ctb_addr_rs as usize] = sh.slice_segment_address as i32;
+            crate::sao::decode_sao_param(&mut cabac, &mut contexts, state, sps, &sh, rx, ry);
             more_data = decode_coding_quadtree(
                 &mut cabac,
                 &mut contexts,
-                &mut state,
+                state,
                 sps,
                 pps,
                 sh.slice_qp_y,
@@ -141,26 +265,66 @@ impl Decoder {
                 0,
             )?;
             ctb_addr_rs += 1;
+
+            // Phase 3c-3 (WPP): snapshot the CABAC contexts after the 2nd
+            // CTB of each row so the next row can load them. Mirrors
+            // FFmpeg's `ff_hevc_save_states`: save when `col_after == 2`,
+            // or `col_after == 0` in the special `ctb_width == 2` case
+            // (which still means "after the 2nd CTB of a row").
+            if wpp {
+                let col_after = ctb_addr_rs % pic_width_in_ctbs;
+                let should_save = col_after == 2
+                    || (pic_width_in_ctbs == 2 && col_after == 0)
+                    || pic_width_in_ctbs == 1;
+                if should_save {
+                    saved_state = Some(contexts.state);
+                }
+            }
+
+            // In WPP, `end_of_slice_flag` is decoded at the end of EVERY
+            // row (spec 7.3.8.5). For non-final rows it is 0 → `more_data`
+            // stays true → we fall through to the next row, which triggers
+            // the reinit block above.
         }
 
-        if more_data || ctb_addr_rs != total_ctbs {
+        // `more_data == false` means we decoded an `end_of_slice_flag = 1`
+        // terminate bin — the slice has finished its CTB range. For the
+        // last slice in the picture this also coincides with `ctb_addr_rs ==
+        // total_ctbs`. Any mid-picture slice must also end on a terminate
+        // bin, otherwise the CABAC state would be out of sync.
+        if more_data {
             return Err(DecodeError::InvalidSyntax(
-                "slice did not consume the expected number of CTUs",
+                "slice did not end on terminate bin",
             ));
         }
 
+        pic.ctbs_decoded = ctb_addr_rs;
+        pic.last_slice_header = sh;
+
+        if pic.ctbs_decoded != total_ctbs {
+            // More slice segments still to come for this picture.
+            return Ok(None);
+        }
+
+        // Picture complete — run in-loop filters and emit the frame.
+        let mut pic = self
+            .current_picture
+            .take()
+            .expect("current_picture taken after completion");
+        let last_sh = &pic.last_slice_header;
+
         // Phase 3b-1: in-loop deblocking filter.
-        if !sh.slice_deblocking_filter_disabled_flag {
-            crate::deblock::deblock_picture(&mut state, sps, pps, &sh);
+        if !last_sh.slice_deblocking_filter_disabled_flag {
+            crate::deblock::deblock_picture(&mut pic.state, sps, pps, last_sh);
         }
 
         // Phase 3b-2: SAO filter (after deblocking).
-        crate::sao::apply_sao_picture(&mut state, sps, &sh);
+        crate::sao::apply_sao_picture(&mut pic.state, sps, last_sh);
 
         Ok(Some(Frame {
-            y: state.y_plane,
-            u: state.u_plane,
-            v: state.v_plane,
+            y: pic.state.y_plane,
+            u: pic.state.u_plane,
+            v: pic.state.v_plane,
             width: sps.pic_width_in_luma_samples,
             height: sps.pic_height_in_luma_samples,
             // IDR pictures always have POC 0; non-IDR POC will be wired in
@@ -1187,6 +1351,77 @@ mod tests {
                     panic!(
                         "mismatch at byte {} (plane {}) ours={} ref={}",
                         i, plane, a, b
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Phase 3c-1 / 3c-3 byte-exact test**: 64×64 flat-gray frame encoded
+    /// with `--slices 2`. x265 hard-requires `--wpp` whenever `--slices > 1`,
+    /// so the fixture's PPS has `entropy_coding_sync_enabled_flag = 1` and
+    /// exercises both the multi-slice infrastructure from 3c-1 AND the WPP
+    /// per-row CABAC reinit / state propagation from 3c-3.
+    ///
+    /// At `--ctu 16` the picture has 16 CTBs laid out 4×4. Each slice
+    /// covers 8 CTBs = 2 CTB rows, so each slice carries one
+    /// `entry_point_offset` pointing at the start of its second row's
+    /// substream.
+    ///
+    /// Exercises:
+    ///
+    /// - `first_slice_segment_in_pic_flag = 0` + `slice_segment_address`
+    ///   parsing in the slice header
+    /// - Multi-slice picture assembly in `Decoder::decode_slice`
+    /// - CABAC reinit per slice (fresh contexts from the slice's QP)
+    /// - WPP `entropy_coding_sync_enabled_flag = 1` PPS path
+    /// - `num_entry_point_offsets` + `entry_point_offset_minus1[]` parsing
+    /// - Per-row CABAC reinit + context state save/load across rows
+    /// - `end_of_slice_flag` decoded at the end of every row (WPP)
+    /// - Deblock + SAO finalize only after the last slice arrives
+    /// - Byte-exact match against FFmpeg for a multi-slice WPP bitstream
+    #[test]
+    fn test_decode_multi_slice_byte_exact() {
+        let h265_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/multi_slice.h265");
+        let yuv_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/multi_slice_ref.yuv");
+        let h265 = std::fs::read(h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(yuv_path).expect("read reference yuv");
+        let nals = parse_annex_b(&h265);
+        let vcl_count = nals.iter().filter(|n| n.nal_unit_type.is_vcl()).count();
+        assert_eq!(vcl_count, 2, "fixture must have exactly 2 VCL NAL units");
+
+        let mut decoder = Decoder::new();
+        let mut frame: Option<Frame> = None;
+        for nal in &nals {
+            if let Some(f) = decoder.decode_nal(nal).expect("decode_nal") {
+                assert!(frame.is_none(), "fixture has only one frame");
+                frame = Some(f);
+            }
+        }
+        let frame = frame.expect("expected one decoded frame");
+        assert_eq!(frame.width, 64);
+        assert_eq!(frame.height, 64);
+
+        let mut decoded = Vec::with_capacity(ref_yuv.len());
+        decoded.extend_from_slice(&frame.y);
+        decoded.extend_from_slice(&frame.u);
+        decoded.extend_from_slice(&frame.v);
+        if decoded != ref_yuv {
+            let w = frame.width as usize;
+            let h = frame.height as usize;
+            for (i, (a, b)) in decoded.iter().zip(ref_yuv.iter()).enumerate() {
+                if a != b {
+                    let (plane, idx) = if i < w * h {
+                        ("Y", i)
+                    } else if i < w * h + (w / 2) * (h / 2) {
+                        ("U", i - w * h)
+                    } else {
+                        ("V", i - w * h - (w / 2) * (h / 2))
+                    };
+                    let (px, py) = (idx % w, idx / w);
+                    panic!(
+                        "first mismatch at byte {} (plane {} x={} y={}) ours={} ref={}",
+                        i, plane, px, py, a, b
                     );
                 }
             }

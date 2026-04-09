@@ -4,6 +4,10 @@
 //! the Phase 1 fixture (`testdata/tiny_intra.h265`). Anything not exercised
 //! by that fixture is gated as `Unsupported` so we never silently advance
 //! the bitstream past data we can't interpret.
+//!
+//! Phase 3c-1 extends this to independent multi-slice pictures: non-first
+//! slice segments are allowed, but dependent slice segments remain
+//! `Unsupported` (deferred to Phase 3c-4).
 
 use crate::bitstream::BitstreamReader;
 use crate::error::DecodeError;
@@ -42,6 +46,16 @@ pub struct SliceHeader {
     pub slice_beta_offset_div2: i32,
     /// Slice-level tc offset (per spec, in `2 *` units when applied).
     pub slice_tc_offset_div2: i32,
+    /// Phase 3c-3 (WPP): cumulative byte offsets (relative to the start of
+    /// the slice data, i.e. the first byte after the slice header's byte
+    /// alignment) where each WPP substream / tile substream starts. The
+    /// i-th entry is the byte offset of substream `i + 1`; substream 0
+    /// always starts at offset 0.
+    ///
+    /// Empty for non-WPP / non-tiles slices. For WPP, the length equals
+    /// `num_entry_point_offsets` which (for a single slice) equals
+    /// `num_ctb_rows_in_slice - 1` when WPP is enabled.
+    pub entry_point_offsets: Vec<u32>,
     /// Number of bits consumed by the slice header so we know where the
     /// slice data (CABAC bytestream) begins.
     pub header_size_bits: usize,
@@ -60,11 +74,6 @@ pub fn parse_slice_segment_header(
     let mut r = BitstreamReader::new(rbsp);
 
     let first_slice_segment_in_pic_flag = r.read_bit()? == 1;
-    if !first_slice_segment_in_pic_flag {
-        return Err(DecodeError::Unsupported(
-            "non-first slice segments not supported",
-        ));
-    }
 
     let mut no_output_of_prior_pics_flag = false;
     if nal_unit_type.is_irap() {
@@ -78,16 +87,42 @@ pub fn parse_slice_segment_header(
         ));
     }
 
-    // dependent_slice_segment_flag and slice_segment_address only follow when
-    // we're NOT the first slice segment, but the spec also allows the flag to
-    // be present when first_slice_segment_in_pic_flag is set if the PPS has
-    // dependent_slice_segments_enabled_flag. We rejected dependent slices
-    // already by gating below.
-    let dependent_slice_segment_flag = false;
-    let slice_segment_address = 0u32;
-    if pps.dependent_slice_segments_enabled_flag {
+    // spec 7.3.6.1: dependent_slice_segment_flag and slice_segment_address
+    // are only present when first_slice_segment_in_pic_flag == 0. Phase 3c-1
+    // supports independent slice segments only — dependent slices are
+    // Phase 3c-4.
+    let mut dependent_slice_segment_flag = false;
+    let mut slice_segment_address = 0u32;
+    if !first_slice_segment_in_pic_flag {
+        if pps.dependent_slice_segments_enabled_flag {
+            dependent_slice_segment_flag = r.read_bit()? == 1;
+            if dependent_slice_segment_flag {
+                return Err(DecodeError::Unsupported(
+                    "dependent slice segments not supported (Phase 3c-4)",
+                ));
+            }
+        }
+        // slice_segment_address: ceil(log2(NumCtbsInPic)) bits. Spec eq. 7-78.
+        let num_ctbs_in_pic = sps.pic_width_in_ctbs_y() * sps.pic_height_in_ctbs_y();
+        let slice_address_length = ceil_log2(num_ctbs_in_pic) as u8;
+        slice_segment_address = if slice_address_length > 0 {
+            r.read_bits(slice_address_length)?
+        } else {
+            0
+        };
+        if slice_segment_address >= num_ctbs_in_pic {
+            return Err(DecodeError::InvalidSyntax(
+                "slice_segment_address out of range",
+            ));
+        }
+    } else if pps.dependent_slice_segments_enabled_flag {
+        // PPS enables dependent slices but this is the first slice segment;
+        // the flag is implicitly 0 for the first segment and no bit is coded.
+        // We still reject with Unsupported to keep the surface tight — any
+        // subsequent slice in this picture could be dependent, which we
+        // cannot handle.
         return Err(DecodeError::Unsupported(
-            "dependent slice segments not supported",
+            "dependent_slice_segments_enabled_flag=1 not supported (Phase 3c-4)",
         ));
     }
 
@@ -172,11 +207,37 @@ pub fn parse_slice_segment_header(
         let _slice_loop_filter_across_slices_enabled_flag = r.read_bit()?;
     }
 
+    // Phase 3c-3: WPP entry point parsing. `tiles_enabled_flag` is still
+    // rejected at PPS parse time, so this branch currently only fires for
+    // `entropy_coding_sync_enabled_flag = 1`.
+    let mut entry_point_offsets: Vec<u32> = Vec::new();
     if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag {
-        // Both rejected at PPS parse time, so this branch is dead today.
-        return Err(DecodeError::Unsupported(
-            "tiles / WPP entry point parsing not supported",
-        ));
+        let num_entry_point_offsets = r.read_ue()?;
+        if num_entry_point_offsets > 0 {
+            let offset_len_minus1 = r.read_ue()?;
+            if offset_len_minus1 >= 32 {
+                return Err(DecodeError::InvalidSyntax(
+                    "offset_len_minus1 out of range [0, 31]",
+                ));
+            }
+            let offset_len = (offset_len_minus1 + 1) as u8;
+            entry_point_offsets.reserve(num_entry_point_offsets as usize);
+            let mut cumulative: u32 = 0;
+            for _ in 0..num_entry_point_offsets {
+                let v = r.read_bits(offset_len)?;
+                // Each entry is the substream byte length minus one; the
+                // stored "entry point" is the cumulative byte offset of the
+                // next substream from the start of the slice data. So
+                // substream 0 starts at 0, substream 1 starts at
+                // (entry_point_offset_minus1[0] + 1), substream 2 starts at
+                // (entry_point_offset_minus1[0] + 1) +
+                // (entry_point_offset_minus1[1] + 1), etc.
+                cumulative = cumulative
+                    .checked_add(v + 1)
+                    .ok_or(DecodeError::InvalidSyntax("entry_point_offset overflow"))?;
+                entry_point_offsets.push(cumulative);
+            }
+        }
     }
 
     if pps.slice_segment_header_extension_present_flag {
@@ -218,6 +279,7 @@ pub fn parse_slice_segment_header(
         slice_deblocking_filter_disabled_flag,
         slice_beta_offset_div2,
         slice_tc_offset_div2,
+        entry_point_offsets,
         header_size_bits,
     })
 }
@@ -227,6 +289,15 @@ pub fn parse_slice_segment_header(
 fn at_byte_boundary(r: &BitstreamReader) -> bool {
     let (_, bit_offset) = r.position();
     bit_offset == 0
+}
+
+/// `ceil(log2(n))` per spec convention (spec 5.2). Returns 0 for n <= 1.
+fn ceil_log2(n: u32) -> u32 {
+    if n <= 1 {
+        0
+    } else {
+        32 - (n - 1).leading_zeros()
+    }
 }
 
 #[cfg(test)]

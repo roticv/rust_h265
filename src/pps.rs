@@ -82,11 +82,10 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
     if tiles_enabled_flag {
         return Err(DecodeError::Unsupported("tiles_enabled_flag not supported"));
     }
-    if entropy_coding_sync_enabled_flag {
-        return Err(DecodeError::Unsupported(
-            "entropy_coding_sync_enabled_flag (WPP) not supported",
-        ));
-    }
+    // `entropy_coding_sync_enabled_flag = 1` (WPP) is accepted and wired up in
+    // `Decoder::decode_slice` as of Phase 3c-3. Sequential decode only — we
+    // still decode rows one after another, but with the spec's per-row CABAC
+    // reinit + state propagation.
 
     let pps_loop_filter_across_slices_enabled_flag = r.read_bit()? == 1;
 
