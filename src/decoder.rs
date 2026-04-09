@@ -70,11 +70,119 @@ struct PictureInProgress {
     total_ctbs: u32,
 }
 
+/// Tile scan derivation tables for a given (SPS, PPS) pair (spec 6.5.1).
+///
+/// `ctb_addr_rs_to_ts[rs]` = tile-scan address for a CTB at raster address
+/// `rs`. `ctb_addr_ts_to_rs[ts]` is the inverse. `tile_id[rs]` gives the
+/// 0-based tile index of the CTB at raster address `rs`.
+///
+/// Single-tile (`num_tile_columns = 1 && num_tile_rows = 1`) degenerates to
+/// identity tables and `tile_id` = 0 everywhere, preserving raster scan.
+#[derive(Debug, Clone)]
+struct TileScanTables {
+    /// Raster → tile-scan. Kept for completeness (we currently only need the
+    /// inverse during decode) and for future parallel / out-of-order work.
+    #[allow(dead_code)]
+    ctb_addr_rs_to_ts: Vec<u32>,
+    ctb_addr_ts_to_rs: Vec<u32>,
+    tile_id: Vec<u32>,
+}
+
+impl TileScanTables {
+    /// Derive the scan tables from an SPS and a PPS whose
+    /// `resolve_tile_geometry` has already been called.
+    fn build(sps: &Sps, pps: &Pps) -> Self {
+        let pic_w_ctbs = sps.pic_width_in_ctbs_y() as usize;
+        let pic_h_ctbs = sps.pic_height_in_ctbs_y() as usize;
+        let total = pic_w_ctbs * pic_h_ctbs;
+
+        let mut rs_to_ts = vec![0u32; total];
+        let mut ts_to_rs = vec![0u32; total];
+        let mut tile_id = vec![0u32; total];
+
+        // Tile column / row boundaries in CTB coords (cumulative).
+        let n_cols = pps.num_tile_columns;
+        let n_rows = pps.num_tile_rows;
+        let mut col_bd = vec![0u32; n_cols + 1];
+        for i in 0..n_cols {
+            col_bd[i + 1] = col_bd[i] + pps.column_widths_in_ctbs[i];
+        }
+        let mut row_bd = vec![0u32; n_rows + 1];
+        for i in 0..n_rows {
+            row_bd[i + 1] = row_bd[i] + pps.row_heights_in_ctbs[i];
+        }
+
+        // Fill `ctb_addr_rs_to_ts` via the formula in FFmpeg's `setup_pps`
+        // (spec 6.5.1, HEVC reference decoder). For every raster address we
+        // locate its tile (tile_x, tile_y) and count how many CTBs precede
+        // it in tile-scan order.
+        #[allow(clippy::needless_range_loop)]
+        for ctb_addr_rs in 0..total {
+            let tb_x = (ctb_addr_rs % pic_w_ctbs) as u32;
+            let tb_y = (ctb_addr_rs / pic_w_ctbs) as u32;
+
+            let mut tile_x = 0usize;
+            for i in 0..n_cols {
+                if tb_x < col_bd[i + 1] {
+                    tile_x = i;
+                    break;
+                }
+            }
+            let mut tile_y = 0usize;
+            for i in 0..n_rows {
+                if tb_y < row_bd[i + 1] {
+                    tile_y = i;
+                    break;
+                }
+            }
+
+            // Count CTBs in all earlier tiles within the same tile row (tile_y)
+            // + all earlier tile rows.
+            let mut val: u32 = 0;
+            for i in 0..tile_x {
+                val += pps.row_heights_in_ctbs[tile_y] * pps.column_widths_in_ctbs[i];
+            }
+            for i in 0..tile_y {
+                val += (pic_w_ctbs as u32) * pps.row_heights_in_ctbs[i];
+            }
+            val += (tb_y - row_bd[tile_y]) * pps.column_widths_in_ctbs[tile_x]
+                + (tb_x - col_bd[tile_x]);
+
+            rs_to_ts[ctb_addr_rs] = val;
+            ts_to_rs[val as usize] = ctb_addr_rs as u32;
+        }
+
+        // Tile id per CTB raster address. Flattening by tile-row then
+        // tile-column gives the standard tile ordering.
+        let mut cur_id: u32 = 0;
+        for j in 0..n_rows {
+            for i in 0..n_cols {
+                for y in row_bd[j]..row_bd[j + 1] {
+                    for x in col_bd[i]..col_bd[i + 1] {
+                        let rs = (y as usize) * pic_w_ctbs + x as usize;
+                        tile_id[rs] = cur_id;
+                    }
+                }
+                cur_id += 1;
+            }
+        }
+
+        Self {
+            ctb_addr_rs_to_ts: rs_to_ts,
+            ctb_addr_ts_to_rs: ts_to_rs,
+            tile_id,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Decoder {
     vps: Option<Vps>,
     sps: Option<Sps>,
     pps: Option<Pps>,
+    /// Phase 3c-2: cached tile-scan tables for the active (SPS, PPS) pair.
+    /// Rebuilt lazily on the first slice following a parameter-set change.
+    tile_tables: Option<TileScanTables>,
     /// The picture currently being assembled from one or more slice segments.
     /// Phase 3c-1: created on the first slice segment, finalized and
     /// returned as a `Frame` when all CTBs have been decoded.
@@ -96,10 +204,12 @@ impl Decoder {
             }
             NalUnitType::Sps => {
                 self.sps = Some(parse_sps(&nal.rbsp)?);
+                self.tile_tables = None;
                 Ok(None)
             }
             NalUnitType::Pps => {
                 self.pps = Some(parse_pps(&nal.rbsp)?);
+                self.tile_tables = None;
                 Ok(None)
             }
             t if t.is_vcl() => self.decode_slice(nal, t),
@@ -119,14 +229,30 @@ impl Decoder {
         nal: &NalUnit<'_>,
         nut: NalUnitType,
     ) -> Result<Option<Frame>, DecodeError> {
-        let sps = self
-            .sps
-            .as_ref()
-            .ok_or(DecodeError::InvalidSyntax("slice without active SPS"))?;
-        let pps = self
-            .pps
-            .as_ref()
-            .ok_or(DecodeError::InvalidSyntax("slice without active PPS"))?;
+        // Phase 3c-2: resolve PPS tile geometry and cache the tile-scan
+        // tables up front. We need `&mut self.pps` for `resolve_tile_geometry`
+        // but `&self.sps` for the inputs — take the SPS out of the option
+        // temporarily via a clone of the reference.
+        {
+            let sps = self
+                .sps
+                .as_ref()
+                .ok_or(DecodeError::InvalidSyntax("slice without active SPS"))?;
+            let pps = self
+                .pps
+                .as_mut()
+                .ok_or(DecodeError::InvalidSyntax("slice without active PPS"))?;
+            if pps.column_widths_in_ctbs.is_empty() {
+                pps.resolve_tile_geometry(sps)?;
+            }
+            if self.tile_tables.is_none() {
+                self.tile_tables = Some(TileScanTables::build(sps, pps));
+            }
+        }
+
+        let sps = self.sps.as_ref().expect("sps present above");
+        let pps = self.pps.as_ref().expect("pps present above");
+        let tile_tables = self.tile_tables.as_ref().expect("tile tables built above");
 
         let sh = parse_slice_segment_header(&nal.rbsp, nut, sps, pps)?;
         if sh.slice_type != SliceType::I {
@@ -148,7 +274,10 @@ impl Decoder {
 
         // Phase 3c-1: a first slice segment starts a new picture. Subsequent
         // slice segments (`first_slice_segment_in_pic_flag = 0`) attach to
-        // the already-in-flight picture.
+        // the already-in-flight picture. Phase 3c-2: `slice_segment_address`
+        // is a tile-scan address (not raster), and `pic.ctbs_decoded`
+        // likewise counts in tile-scan order so the continuity check below
+        // still works for tiled pictures.
         if sh.first_slice_segment_in_pic_flag {
             if self.current_picture.is_some() {
                 // Starting a new picture while the previous one is still
@@ -160,8 +289,13 @@ impl Decoder {
                     "new first slice segment arrived while previous picture was incomplete",
                 ));
             }
+            // Populate `tab_tile_id` on the fresh picture state so intra
+            // availability checks can see it.
+            let mut ps = PictureState::new(sps);
+            let n = ps.tab_tile_id.len();
+            ps.tab_tile_id.copy_from_slice(&tile_tables.tile_id[..n]);
             self.current_picture = Some(PictureInProgress {
-                state: PictureState::new(sps),
+                state: ps,
                 last_slice_header: sh.clone(),
                 ctbs_decoded: 0,
                 total_ctbs,
@@ -179,9 +313,8 @@ impl Decoder {
                 ));
             }
             if sh.slice_segment_address != pic.ctbs_decoded {
-                // Phase 3c-1 assumes slices arrive in raster CTB order and
-                // cover contiguous ranges (no gaps or overlap). Tiles and
-                // out-of-order slices are Phase 3c-2.
+                // Slices must arrive in tile-scan order and cover a
+                // contiguous range — gaps / reordering are Phase 3c-4.
                 return Err(DecodeError::Unsupported(
                     "non-contiguous slice segment address (tile-scan order)",
                 ));
@@ -196,49 +329,79 @@ impl Decoder {
         let state = &mut pic.state;
 
         let wpp = pps.entropy_coding_sync_enabled_flag;
-        let slice_start_ctb = sh.slice_segment_address;
+        let tiles_on = pps.tiles_enabled_flag;
+        let slice_start_ts = sh.slice_segment_address;
+
         // Phase 3c-3 (WPP): saved CABAC context state captured after the
         // second CTB of each row, to be loaded at the start of the next row.
+        // Not used by tiles — tiles reinit from the slice QP at every tile
+        // boundary instead.
         let mut saved_state: Option<[u8; crate::cabac_tables::HEVC_CONTEXTS]> = None;
 
         let mut more_data = true;
-        let mut ctb_addr_rs: u32 = slice_start_ctb;
+        // Phase 3c-2: iterate in tile-scan order. For single-tile pictures
+        // `ctb_addr_ts_to_rs` is the identity, so the loop visits CTBs in
+        // raster order exactly as before.
+        let mut ctb_addr_ts: u32 = slice_start_ts;
 
-        while more_data && ctb_addr_rs < total_ctbs {
-            // WPP row boundary reinit (spec 9.3.2.2 + FFmpeg
-            // `ff_hevc_cabac_init` / `load_states`). The first CTB of every
-            // non-first row of the slice triggers:
-            //   1. A fresh `CabacReader` at the row's entry-point byte offset
-            //   2. Loading the saved context state from the previous row
-            //      (when `ctb_width > 1`) or a fresh init (when `ctb_width == 1`)
+        // Substream index within the slice — 0 for the first substream
+        // (implicit offset 0), 1 for the second (at entry_point_offsets[0]),
+        // etc. Bumped every time we cross a tile boundary (tiles) or a row
+        // start (WPP).
+        let mut substream_idx: u32 = 0;
+
+        while more_data && ctb_addr_ts < total_ctbs {
+            let ctb_addr_rs = tile_tables.ctb_addr_ts_to_rs[ctb_addr_ts as usize];
             let col = ctb_addr_rs % pic_width_in_ctbs;
+            let is_first_ctb_of_slice = ctb_addr_ts == slice_start_ts;
+
+            // Phase 3c-2: tile boundary reinit. At the start of every tile
+            // (other than the first CTB of the slice), re-init the CABAC
+            // reader at the tile's entry-point byte offset and reset the
+            // context state from the slice QP. The first tile of the slice
+            // was already set up above.
+            let is_tile_start = if is_first_ctb_of_slice {
+                false
+            } else {
+                let prev_ts = ctb_addr_ts - 1;
+                let prev_rs = tile_tables.ctb_addr_ts_to_rs[prev_ts as usize];
+                tile_tables.tile_id[ctb_addr_rs as usize] != tile_tables.tile_id[prev_rs as usize]
+            };
+
+            // Phase 3c-3 (WPP): row boundary reinit. Mutually exclusive with
+            // `is_tile_start` in practice because WPP entry points and tile
+            // entry points share the same mechanism. For single-tile
+            // pictures with WPP the row start is detected via `col == 0`.
             let is_row_start = col == 0;
-            let is_first_ctb_of_slice = ctb_addr_rs == slice_start_ctb;
-            if wpp && is_row_start && !is_first_ctb_of_slice {
-                let row_within_slice =
-                    ((ctb_addr_rs - slice_start_ctb) / pic_width_in_ctbs) as usize;
-                // row_within_slice == 1 for the 2nd row, 2 for the 3rd row, ...
-                // entry_point_offsets[ep_idx] gives the cumulative byte
-                // offset (from the start of the slice data) of substream
-                // (row_within_slice). For the second row that's ep_idx = 0.
-                let ep_idx = row_within_slice - 1;
-                if ep_idx >= sh.entry_point_offsets.len() {
+            let needs_wpp_reinit = wpp && !tiles_on && is_row_start && !is_first_ctb_of_slice;
+
+            if is_tile_start || needs_wpp_reinit {
+                substream_idx += 1;
+                let ep_idx = substream_idx as usize;
+                if ep_idx == 0 || ep_idx > sh.entry_point_offsets.len() {
                     return Err(DecodeError::InvalidSyntax(
-                        "WPP slice missing entry_point_offset for row",
+                        "slice missing entry_point_offset for substream",
                     ));
                 }
-                let byte_offset = cabac_byte_offset + sh.entry_point_offsets[ep_idx] as usize;
+                let byte_offset = cabac_byte_offset + sh.entry_point_offsets[ep_idx - 1] as usize;
                 cabac.reinit_at(byte_offset);
-                if pic_width_in_ctbs == 1 {
-                    // Single-column picture: per HEVC spec and FFmpeg, state
-                    // is re-initialized afresh rather than loaded.
+
+                if is_tile_start {
+                    // Per-tile CABAC context reinit from the slice QP.
                     contexts = CabacContexts::init(sh.slice_qp_y, sh.slice_type, false);
-                } else if let Some(saved) = saved_state.as_ref() {
-                    contexts.state.copy_from_slice(saved);
                 } else {
-                    return Err(DecodeError::InvalidSyntax(
-                        "WPP row start without a saved context state",
-                    ));
+                    // WPP row start: fresh init on single-column pictures,
+                    // otherwise load the state saved after the previous
+                    // row's 2nd CTB.
+                    if pic_width_in_ctbs == 1 {
+                        contexts = CabacContexts::init(sh.slice_qp_y, sh.slice_type, false);
+                    } else if let Some(saved) = saved_state.as_ref() {
+                        contexts.state.copy_from_slice(saved);
+                    } else {
+                        return Err(DecodeError::InvalidSyntax(
+                            "WPP row start without a saved context state",
+                        ));
+                    }
                 }
             }
 
@@ -249,7 +412,7 @@ impl Decoder {
             let ry = (y_ctb >> sps.ctb_log2_size_y) as usize;
             // Record the slice this CTB belongs to BEFORE decoding, so the
             // intra prediction availability check can see the current CTB's
-            // slice address.
+            // slice address. `tab_slice_addr_rs` is indexed by raster.
             state.tab_slice_addr_rs[ctb_addr_rs as usize] = sh.slice_segment_address as i32;
             crate::sao::decode_sao_param(&mut cabac, &mut contexts, state, sps, &sh, rx, ry);
             more_data = decode_coding_quadtree(
@@ -264,15 +427,15 @@ impl Decoder {
                 sps.ctb_log2_size_y,
                 0,
             )?;
-            ctb_addr_rs += 1;
+            ctb_addr_ts += 1;
 
             // Phase 3c-3 (WPP): snapshot the CABAC contexts after the 2nd
-            // CTB of each row so the next row can load them. Mirrors
-            // FFmpeg's `ff_hevc_save_states`: save when `col_after == 2`,
-            // or `col_after == 0` in the special `ctb_width == 2` case
-            // (which still means "after the 2nd CTB of a row").
-            if wpp {
-                let col_after = ctb_addr_rs % pic_width_in_ctbs;
+            // CTB of each row so the next row can load them. Only active in
+            // pure WPP mode — with tiles the per-tile reinit supersedes it.
+            if wpp && !tiles_on {
+                // For single-tile pictures raster and tile-scan agree, so
+                // we can use `ctb_addr_ts` directly as the raster post-index.
+                let col_after = ctb_addr_ts % pic_width_in_ctbs;
                 let should_save = col_after == 2
                     || (pic_width_in_ctbs == 2 && col_after == 0)
                     || pic_width_in_ctbs == 1;
@@ -281,24 +444,23 @@ impl Decoder {
                 }
             }
 
-            // In WPP, `end_of_slice_flag` is decoded at the end of EVERY
-            // row (spec 7.3.8.5). For non-final rows it is 0 → `more_data`
-            // stays true → we fall through to the next row, which triggers
-            // the reinit block above.
+            // `end_of_slice_flag` (terminate bin) is decoded at the end of
+            // every CTB. For non-final rows of a WPP slice / non-final tiles
+            // of a tiled slice it's 0 → `more_data` stays true → we fall
+            // through to the next substream, which triggers the reinit
+            // block above.
         }
 
         // `more_data == false` means we decoded an `end_of_slice_flag = 1`
-        // terminate bin — the slice has finished its CTB range. For the
-        // last slice in the picture this also coincides with `ctb_addr_rs ==
-        // total_ctbs`. Any mid-picture slice must also end on a terminate
-        // bin, otherwise the CABAC state would be out of sync.
+        // terminate bin — the slice has finished its CTB range. Any slice
+        // must end on a terminate bin or the CABAC state is out of sync.
         if more_data {
             return Err(DecodeError::InvalidSyntax(
                 "slice did not end on terminate bin",
             ));
         }
 
-        pic.ctbs_decoded = ctb_addr_rs;
+        pic.ctbs_decoded = ctb_addr_ts;
         pic.last_slice_header = sh;
 
         if pic.ctbs_decoded != total_ctbs {
@@ -1409,6 +1571,181 @@ mod tests {
         if decoded != ref_yuv {
             let w = frame.width as usize;
             let h = frame.height as usize;
+            for (i, (a, b)) in decoded.iter().zip(ref_yuv.iter()).enumerate() {
+                if a != b {
+                    let (plane, idx) = if i < w * h {
+                        ("Y", i)
+                    } else if i < w * h + (w / 2) * (h / 2) {
+                        ("U", i - w * h)
+                    } else {
+                        ("V", i - w * h - (w / 2) * (h / 2))
+                    };
+                    let (px, py) = (idx % w, idx / w);
+                    panic!(
+                        "first mismatch at byte {} (plane {} x={} y={}) ours={} ref={}",
+                        i, plane, px, py, a, b
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Phase 3c-2 byte-exact test**: 128×64 flat-gray intra frame with
+    /// `--tiles 2x1`, encoded by kvazaar (x265 has no tile support). Tests:
+    ///
+    /// - PPS `tiles_enabled_flag = 1` parsing (no longer rejected)
+    /// - `num_tile_columns_minus1` / `num_tile_rows_minus1` / uniform spacing
+    /// - `Pps::resolve_tile_geometry` producing `column_widths_in_ctbs`
+    /// - `TileScanTables::build` building the raster↔tile-scan mapping
+    /// - Per-tile CABAC reinit at the tile boundary (byte offset + state)
+    /// - CTB iteration in tile-scan order
+    /// - `tab_tile_id` population + intra-availability tile boundary check
+    /// - Byte-exact match against FFmpeg
+    ///
+    /// The fixture is generated at runtime by kvazaar. If kvazaar or ffmpeg
+    /// are not on the `PATH` the test silently skips, matching the
+    /// convention of the other dynamic fixtures above.
+    #[test]
+    fn test_decode_tiles_byte_exact() {
+        use std::process::Command;
+
+        let tmp = std::env::temp_dir();
+        let input_yuv = tmp.join("tiles_input.yuv");
+        let h265_path = tmp.join("tiles.h265");
+        let ref_yuv_path = tmp.join("tiles_ref.yuv");
+
+        // 256×256 flat gray input. At kvazaar's default CTU=64 this is
+        // 4×4 CTBs. With a 2×2 tile layout each tile is 2×2 CTBs, which
+        // gives genuine reordering between raster and tile scan (e.g.
+        // raster CTB 2 has tile-scan index 4), exercising the real reorder
+        // path in `decode_slice` (not just the identity mapping of a
+        // 1 CTB per tile picture).
+        //
+        // We keep luma flat gray (not striped) because the upstream decoder
+        // does not yet support chroma residual coding; a striped pattern
+        // would generate non-zero chroma residuals that x265/kvazaar will
+        // happily encode but our decoder can't dequantize yet.
+        let w: usize = 256;
+        let h: usize = 256;
+        let mut yuv_data = Vec::with_capacity(w * h + 2 * (w / 2) * (h / 2));
+        yuv_data.extend(std::iter::repeat_n(0x7Eu8, w * h));
+        yuv_data.extend(std::iter::repeat_n(128u8, (w / 2) * (h / 2) * 2));
+        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
+
+        // kvazaar encode. `--slices tiles` puts each tile in its own slice
+        // segment, but even without it kvazaar produces a single slice with
+        // one entry point per tile boundary. We go with the single-slice
+        // form here because our multi-slice handling is already covered by
+        // `test_decode_multi_slice_byte_exact`.
+        //
+        // Notes:
+        // - `--gop 0` → all-intra (no B/P frames).
+        // - `--period 1` → every frame is a key frame.
+        // - Loop filters disabled to keep the fixture scope minimal.
+        let kvz = Command::new("/opt/homebrew/bin/kvazaar")
+            .args([
+                "--input",
+                input_yuv.to_str().unwrap(),
+                "--input-res",
+                "256x256",
+                "--input-fps",
+                "1",
+                "--frames",
+                "1",
+                "--output",
+                h265_path.to_str().unwrap(),
+                "--preset",
+                "ultrafast",
+                "--tiles",
+                "2x2",
+                "--no-wpp",
+                "--no-sao",
+                "--no-deblock",
+                "--no-signhide",
+                "--gop",
+                "0",
+                "--period",
+                "1",
+                "--qp",
+                "25",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let kvz = match kvz {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("kvazaar not found, skipping tiles fixture test");
+                return;
+            }
+        };
+        assert!(kvz.success(), "kvazaar encoding failed");
+
+        let ffmpeg_status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-i",
+                h265_path.to_str().unwrap(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                ref_yuv_path.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let ffmpeg_status = match ffmpeg_status {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("ffmpeg not found, skipping tiles fixture test");
+                return;
+            }
+        };
+        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
+
+        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
+        let nals = parse_annex_b(&h265);
+
+        // Sanity-check: the PPS really has tiles_enabled_flag = 1.
+        let pps_nal = nals
+            .iter()
+            .find(|n| n.nal_unit_type == NalUnitType::Pps)
+            .expect("fixture must contain a PPS");
+        let pps = parse_pps(&pps_nal.rbsp).expect("parse tiled PPS");
+        assert!(
+            pps.tiles_enabled_flag,
+            "tiles fixture must have tiles_enabled_flag = 1"
+        );
+        assert_eq!(pps.num_tile_columns, 2);
+        assert_eq!(pps.num_tile_rows, 2);
+
+        let mut decoder = Decoder::new();
+        let mut frame: Option<Frame> = None;
+        for nal in &nals {
+            if let Some(f) = decoder.decode_nal(nal).expect("decode_nal") {
+                assert!(frame.is_none(), "fixture has only one frame");
+                frame = Some(f);
+            }
+        }
+        let frame = frame.expect("expected one decoded frame");
+        assert_eq!(frame.width as usize, w);
+        assert_eq!(frame.height as usize, h);
+
+        let mut decoded = Vec::with_capacity(ref_yuv.len());
+        decoded.extend_from_slice(&frame.y);
+        decoded.extend_from_slice(&frame.u);
+        decoded.extend_from_slice(&frame.v);
+
+        assert_eq!(
+            decoded.len(),
+            ref_yuv.len(),
+            "size mismatch: {} vs {}",
+            decoded.len(),
+            ref_yuv.len()
+        );
+        if decoded != ref_yuv {
             for (i, (a, b)) in decoded.iter().zip(ref_yuv.iter()).enumerate() {
                 if a != b {
                     let (plane, idx) = if i < w * h {

@@ -102,6 +102,11 @@ pub struct PictureState {
     /// of the slice the CTB belongs to), indexed by CTB raster address.
     /// `-1` means the CTB has not been decoded yet (not part of any slice).
     pub tab_slice_addr_rs: Vec<i32>,
+    /// Phase 3c-2 tiles: per-CTB tile id (0-based), indexed by CTB raster
+    /// address. For `tiles_enabled_flag = 0` pictures this is all zeros.
+    /// Consulted by `compute_luma_avail` to treat cross-tile neighbor
+    /// samples as unavailable for intra prediction (spec 6.4.4 / 8.4.2).
+    pub tab_tile_id: Vec<u32>,
 }
 
 impl PictureState {
@@ -160,6 +165,12 @@ impl PictureState {
                 let pw = w.div_ceil(ctb_size) as usize;
                 let ph = h.div_ceil(ctb_size) as usize;
                 vec![-1i32; pw * ph]
+            },
+            tab_tile_id: {
+                let ctb_size = 1u32 << log2_ctb_size;
+                let pw = w.div_ceil(ctb_size) as usize;
+                let ph = h.div_ceil(ctb_size) as usize;
+                vec![0u32; pw * ph]
             },
         }
     }
@@ -1030,7 +1041,8 @@ fn compute_luma_avail(state: &PictureState, x0: u32, y0: u32, size: u32) -> Refe
     // Raster index of the current TU's top-left.
     let cur_idx = (y0 as u64) * (pic_w as u64) + (x0 as u64);
 
-    // CTB raster address + slice address of the current TU's containing CTB.
+    // CTB raster address + slice address + tile id of the current TU's
+    // containing CTB.
     let log2_ctb = state.log2_ctb_size;
     let ctb_size = 1u32 << log2_ctb;
     let pic_w_in_ctbs = pic_w.div_ceil(ctb_size);
@@ -1040,6 +1052,11 @@ fn compute_luma_avail(state: &PictureState, x0: u32, y0: u32, size: u32) -> Refe
         .get(cur_ctb_rs as usize)
         .copied()
         .unwrap_or(-1);
+    let cur_tile_id = state
+        .tab_tile_id
+        .get(cur_ctb_rs as usize)
+        .copied()
+        .unwrap_or(0);
 
     let pixel_decoded = |x: u32, y: u32| -> bool {
         if x >= pic_w || y >= pic_h {
@@ -1048,16 +1065,28 @@ fn compute_luma_avail(state: &PictureState, x0: u32, y0: u32, size: u32) -> Refe
         if ((y as u64) * (pic_w as u64) + (x as u64)) >= cur_idx {
             return false;
         }
-        // Slice-boundary check: if the neighbor pixel is in a different CTB
-        // AND that CTB belongs to a different slice, treat as unavailable.
         let n_ctb_rs = (y >> log2_ctb) * pic_w_in_ctbs + (x >> log2_ctb);
         if n_ctb_rs != cur_ctb_rs {
+            // Slice-boundary check: neighbor in a different slice →
+            // unavailable (spec 6.4.4 / 8.4.2).
             let neighbor_slice_addr = state
                 .tab_slice_addr_rs
                 .get(n_ctb_rs as usize)
                 .copied()
                 .unwrap_or(-1);
             if neighbor_slice_addr < 0 || neighbor_slice_addr != cur_slice_addr {
+                return false;
+            }
+            // Phase 3c-2 tile-boundary check: intra prediction MUST NOT use
+            // samples from a different tile regardless of the loop filter
+            // flag (spec 6.4.4). `tab_tile_id` is 0 everywhere for
+            // single-tile pictures, so this is a no-op there.
+            let neighbor_tile_id = state
+                .tab_tile_id
+                .get(n_ctb_rs as usize)
+                .copied()
+                .unwrap_or(0);
+            if neighbor_tile_id != cur_tile_id {
                 return false;
             }
         }
