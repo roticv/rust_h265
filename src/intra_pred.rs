@@ -34,35 +34,151 @@ pub struct ReferenceAvailability {
 /// of size `size = 1 << log2_size`. Returns `(top, left)` each of length
 /// `2 * size + 1`, where index 0 is the corner.
 ///
-/// For our Phase 2c-5 fixture all neighbors are unavailable, so the
-/// substitution rule fills both arrays with `default_ref_sample(bit_depth)`.
-/// More elaborate substitution (partial neighbor availability, constrained
-/// intra) is gated for later phases.
+/// `plane` is the picture plane (luma or chroma) the TU lives in, indexed
+/// in raster order with row stride `stride`. `pic_w` / `pic_h` are the
+/// dimensions of `plane`.
+///
+/// `avail` reflects which directional neighbors have been **decoded already**
+/// (per spec 8.4.4.2.2). For each unavailable group, the substitution rule
+/// fills it from the nearest available sample.
+#[allow(clippy::too_many_arguments)]
 pub fn build_reference_samples(
-    avail: ReferenceAvailability,
+    plane: &[u8],
+    stride: usize,
+    pic_w: usize,
+    pic_h: usize,
+    x0: usize,
+    y0: usize,
     log2_size: u8,
     bit_depth: u8,
+    avail: ReferenceAvailability,
 ) -> (Vec<u8>, Vec<u8>) {
     let size = 1usize << log2_size;
     let len = 2 * size + 1;
+    let mut top = vec![0u8; len];
+    let mut left = vec![0u8; len];
 
-    if !avail.up_left
-        && !avail.up
-        && !avail.up_right
-        && !avail.left
-        && !avail.bottom_left
-    {
-        let fill = default_ref_sample(bit_depth);
-        return (vec![fill; len], vec![fill; len]);
+    // Track per-sample availability so we can substitute the unavailable
+    // ones afterwards. `top_avail[i]` covers `top[i]` (i = 0 is the corner).
+    let mut top_avail = vec![false; len];
+    let mut left_avail = vec![false; len];
+
+    // Corner (p[-1][-1]).
+    if avail.up_left && x0 > 0 && y0 > 0 {
+        let v = plane[(y0 - 1) * stride + (x0 - 1)];
+        top[0] = v;
+        left[0] = v;
+        top_avail[0] = true;
+        left_avail[0] = true;
     }
 
-    // Partial-availability substitution is per spec 8.4.4.2.2 / FFmpeg's
-    // `intra_pred` body — not yet needed for our fixture, so be loud about it.
-    panic!(
-        "build_reference_samples: partial reference availability not yet implemented \
-         (avail = {:?})",
-        avail
-    );
+    // Top row (p[0..size-1][-1]).
+    if avail.up && y0 > 0 {
+        for i in 0..size {
+            top[1 + i] = plane[(y0 - 1) * stride + (x0 + i)];
+            top_avail[1 + i] = true;
+        }
+    }
+
+    // Top-right extension (p[size..2*size-1][-1]).
+    if avail.up_right && y0 > 0 {
+        let avail_x = pic_w.saturating_sub(x0 + size);
+        let count = avail_x.min(size);
+        for i in 0..count {
+            top[1 + size + i] = plane[(y0 - 1) * stride + (x0 + size + i)];
+            top_avail[1 + size + i] = true;
+        }
+    }
+
+    // Left column (p[-1][0..size-1]).
+    if avail.left && x0 > 0 {
+        for i in 0..size {
+            left[1 + i] = plane[(y0 + i) * stride + (x0 - 1)];
+            left_avail[1 + i] = true;
+        }
+    }
+
+    // Bottom-left extension (p[-1][size..2*size-1]).
+    if avail.bottom_left && x0 > 0 {
+        let avail_y = pic_h.saturating_sub(y0 + size);
+        let count = avail_y.min(size);
+        for i in 0..count {
+            left[1 + size + i] = plane[(y0 + size + i) * stride + (x0 - 1)];
+            left_avail[1 + size + i] = true;
+        }
+    }
+
+    // ---- Substitution per spec 8.4.4.2.2 ----
+    // If everything is unavailable, fill with the default value.
+    let any_top_avail = top_avail.iter().any(|&a| a);
+    let any_left_avail = left_avail.iter().any(|&a| a);
+    if !any_top_avail && !any_left_avail {
+        let fill = default_ref_sample(bit_depth);
+        for v in top.iter_mut() {
+            *v = fill;
+        }
+        for v in left.iter_mut() {
+            *v = fill;
+        }
+        return (top, left);
+    }
+
+    // Concatenate top and left into a single 4*size+1 array, scan from the
+    // bottom-left corner upward to find the first available sample, then
+    // fill leftward (along the left column upward) and rightward (along the
+    // top row) using the nearest available value. This matches the spec's
+    // unified substitution loop.
+    //
+    // Index layout in the unified array:
+    //   [0..2*size]       = left[2*size..0]  (bottom-left to top-left, reversed)
+    //   [2*size]          = corner
+    //   [2*size+1..4*size+1] = top[1..2*size+1]
+    let total = 4 * size + 1;
+    let mut ref_array = vec![0u8; total];
+    let mut ref_avail = vec![false; total];
+    // left, reversed: index 0 = left[2*size], index 2*size-1 = left[1]
+    for i in 0..2 * size {
+        ref_array[i] = left[2 * size - i];
+        ref_avail[i] = left_avail[2 * size - i];
+    }
+    // corner
+    ref_array[2 * size] = top[0];
+    ref_avail[2 * size] = top_avail[0];
+    // top: index 2*size+1..4*size+1 = top[1..2*size+1]
+    for i in 0..2 * size {
+        ref_array[2 * size + 1 + i] = top[1 + i];
+        ref_avail[2 * size + 1 + i] = top_avail[1 + i];
+    }
+
+    // Find the first available sample (lowest index).
+    let first = ref_avail.iter().position(|&a| a).unwrap();
+    let first_val = ref_array[first];
+    // Fill everything before `first` with first_val.
+    for v in ref_array.iter_mut().take(first) {
+        *v = first_val;
+    }
+    for a in ref_avail.iter_mut().take(first) {
+        *a = true;
+    }
+    // Fill forward: any unavailable sample takes the value of the previous one.
+    for i in (first + 1)..total {
+        if !ref_avail[i] {
+            ref_array[i] = ref_array[i - 1];
+            ref_avail[i] = true;
+        }
+    }
+
+    // Unpack back into top/left.
+    for i in 0..2 * size {
+        left[2 * size - i] = ref_array[i];
+    }
+    top[0] = ref_array[2 * size];
+    left[0] = ref_array[2 * size];
+    for i in 0..2 * size {
+        top[1 + i] = ref_array[2 * size + 1 + i];
+    }
+
+    (top, left)
 }
 
 /// PLANAR intra prediction (spec 8.4.4.2.5 / FFmpeg `pred_planar`).
@@ -182,12 +298,49 @@ mod tests {
     /// the bit-depth midpoint (128 for 8-bit).
     #[test]
     fn test_no_neighbors_fills_with_midpoint() {
+        let plane = vec![0u8; 0];
         let avail = ReferenceAvailability::default();
-        let (top, left) = build_reference_samples(avail, 4, 8);
+        let (top, left) = build_reference_samples(&plane, 0, 0, 0, 0, 0, 4, 8, avail);
         assert_eq!(top.len(), 33); // 2 * 16 + 1
         assert_eq!(left.len(), 33);
         assert!(top.iter().all(|&p| p == 128));
         assert!(left.iter().all(|&p| p == 128));
+    }
+
+    /// With only the left column available (e.g., CTU 2 of a 32×32 picture
+    /// with --ctu 16, where CTU 1 has been decoded), the substitution rule
+    /// extends the bottom-most available left sample upward into the
+    /// corner and across the top row.
+    #[test]
+    fn test_left_only_substitution() {
+        // 32-wide picture with CTU 1 (cols 0..15) decoded as all 0x7E.
+        let stride = 32;
+        let plane: Vec<u8> = (0..32 * 16).map(|_| 0x7E).collect();
+        let avail = ReferenceAvailability {
+            up_left: false,
+            up: false,
+            up_right: false,
+            left: true,
+            bottom_left: false,
+        };
+        // Building refs for CTU 2 at (16, 0), size 16x16. The left column
+        // pulls from plane[(0..15) * stride + 15], all 0x7E.
+        let (top, left) = build_reference_samples(&plane, stride, 32, 16, 16, 0, 4, 8, avail);
+        // The 16 immediate left neighbors should be 0x7E.
+        for i in 0..16 {
+            assert_eq!(left[1 + i], 0x7E, "left[{}]", 1 + i);
+        }
+        // Substitution: corner and top row inherit the topmost available
+        // left value (which is 0x7E since the entire left column is 0x7E).
+        assert_eq!(top[0], 0x7E, "corner");
+        for i in 0..32 {
+            assert_eq!(top[1 + i], 0x7E, "top[{}]", 1 + i);
+        }
+        // Bottom-left extension: filled by forward propagation from the
+        // last available left sample (still 0x7E).
+        for i in 16..32 {
+            assert_eq!(left[1 + i], 0x7E, "left ext[{}]", 1 + i);
+        }
     }
 
     /// PLANAR with all-128 reference samples must produce all-128 prediction.
@@ -231,8 +384,9 @@ mod tests {
     /// all 0x7E (the reference YUV).
     #[test]
     fn test_fixture_luma_reconstruction() {
+        let plane = vec![0u8; 0];
         let avail = ReferenceAvailability::default();
-        let (top, left) = build_reference_samples(avail, 4, 8);
+        let (top, left) = build_reference_samples(&plane, 0, 0, 0, 0, 0, 4, 8, avail);
         let mut block = vec![0u8; 256];
         predict_planar(&mut block, 16, &top, &left, 4);
         let residual = vec![-2i16; 256];
@@ -248,8 +402,9 @@ mod tests {
     /// no neighbors gives all-128, no chroma residual → all 0x80.
     #[test]
     fn test_fixture_chroma_reconstruction() {
+        let plane = vec![0u8; 0];
         let avail = ReferenceAvailability::default();
-        let (top, left) = build_reference_samples(avail, 3, 8);
+        let (top, left) = build_reference_samples(&plane, 0, 0, 0, 0, 0, 3, 8, avail);
         let mut block = vec![0u8; 64];
         predict_planar(&mut block, 8, &top, &left, 3);
         // No chroma residual in our fixture (cbf_cb = cbf_cr = 0).

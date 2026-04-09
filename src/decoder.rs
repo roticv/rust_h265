@@ -113,34 +113,35 @@ impl Decoder {
         let cabac_byte_offset = sh.header_size_bits / 8;
         let mut cabac = CabacReader::new(&nal.rbsp, cabac_byte_offset);
 
-        // Phase 2c-6 limitation: single CTU per picture. The Phase 1 fixture
-        // is 16×16 with `--ctu 16`, so this is exactly right; multi-CTU
-        // pictures will need a CTU loop here in Phase 3+.
-        if sps.pic_width_in_ctbs_y() != 1 || sps.pic_height_in_ctbs_y() != 1 {
-            return Err(DecodeError::Unsupported(
-                "multi-CTU slices not yet supported",
-            ));
+        let mut state = PictureState::new(sps);
+        let ctb_size = 1u32 << sps.ctb_log2_size_y;
+        let pic_width_in_ctbs = sps.pic_width_in_ctbs_y();
+        let pic_height_in_ctbs = sps.pic_height_in_ctbs_y();
+        let mut more_data = true;
+        let mut ctb_addr_rs: u32 = 0;
+        let total_ctbs = pic_width_in_ctbs * pic_height_in_ctbs;
+
+        while more_data && ctb_addr_rs < total_ctbs {
+            let x_ctb = (ctb_addr_rs % pic_width_in_ctbs) * ctb_size;
+            let y_ctb = (ctb_addr_rs / pic_width_in_ctbs) * ctb_size;
+            more_data = decode_coding_quadtree(
+                &mut cabac,
+                &mut contexts,
+                &mut state,
+                sps,
+                pps,
+                sh.slice_qp_y,
+                x_ctb,
+                y_ctb,
+                sps.ctb_log2_size_y,
+                0,
+            )?;
+            ctb_addr_rs += 1;
         }
 
-        let mut state = PictureState::new(sps);
-        decode_coding_quadtree(
-            &mut cabac,
-            &mut contexts,
-            &mut state,
-            sps,
-            pps,
-            sh.slice_qp_y,
-            0,
-            0,
-            sps.ctb_log2_size_y,
-            0,
-        )?;
-
-        // After the CU tree, the slice should be at end-of-data.
-        let term = cabac.decode_terminate();
-        if term != 1 {
+        if more_data || ctb_addr_rs != total_ctbs {
             return Err(DecodeError::InvalidSyntax(
-                "CABAC stream did not terminate at end of slice",
+                "slice did not consume the expected number of CTUs",
             ));
         }
 
@@ -212,6 +213,52 @@ mod tests {
             decoded.len(),
             ref_yuv.len()
         );
+        assert_eq!(
+            decoded, ref_yuv,
+            "decoded planes do not match reference YUV byte-for-byte"
+        );
+    }
+
+    /// **Phase 3a-1 byte-exact test**: 32×32 flat-gray frame, `--ctu 16` →
+    /// 4 CTUs in raster order. Tests:
+    ///
+    /// - Multi-CTU loop in `Decoder::decode_slice`
+    /// - `end_of_slice_flag` (terminate bin) decoded at each CTB boundary
+    /// - `decode_coding_quadtree` returning a `more_data` flag
+    /// - Partial-availability reference samples (CTUs 2/3/4 have decoded
+    ///   neighbors from the earlier CTUs)
+    ///
+    /// Reference YUV is 1536 bytes: 1024 luma (all 0x7E) + 256 Cb (0x80) +
+    /// 256 Cr (0x80).
+    #[test]
+    fn test_decode_multi_ctu_byte_exact() {
+        let h265_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/multi_ctu.h265");
+        let yuv_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/multi_ctu_ref.yuv");
+
+        let h265 = std::fs::read(h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(yuv_path).expect("read reference yuv");
+
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+        let mut frame: Option<Frame> = None;
+        for nal in &nals {
+            if let Some(f) = decoder.decode_nal(nal).expect("decode_nal") {
+                assert!(frame.is_none(), "fixture has only one frame");
+                frame = Some(f);
+            }
+        }
+        let frame = frame.expect("expected one decoded frame");
+
+        assert_eq!(frame.width, 32);
+        assert_eq!(frame.height, 32);
+        assert_eq!(frame.y.len(), 1024);
+        assert_eq!(frame.u.len(), 256);
+        assert_eq!(frame.v.len(), 256);
+
+        let mut decoded = Vec::with_capacity(1536);
+        decoded.extend_from_slice(&frame.y);
+        decoded.extend_from_slice(&frame.u);
+        decoded.extend_from_slice(&frame.v);
         assert_eq!(
             decoded, ref_yuv,
             "decoded planes do not match reference YUV byte-for-byte"

@@ -139,6 +139,10 @@ impl PictureState {
 ///
 /// `slice_qp_y` is needed to compute the per-CU effective QP for dequant
 /// (`qp_y = slice_qp_y + cu_qp_delta`).
+///
+/// Returns `Ok(true)` if there is more data in the slice (= `end_of_slice_flag`
+/// was 0 at the CTB boundary, OR we haven't reached one yet), or `Ok(false)`
+/// if we've consumed the slice's terminate bin and the slice is done.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_coding_quadtree(
     cabac: &mut CabacReader,
@@ -151,7 +155,7 @@ pub fn decode_coding_quadtree(
     y0: u32,
     log2_cb_size: u8,
     cb_depth: u8,
-) -> Result<(), DecodeError> {
+) -> Result<bool, DecodeError> {
     let cb_size = 1u32 << log2_cb_size;
 
     // Implicit-no-split when we're at min CB size or when the CU would
@@ -165,11 +169,12 @@ pub fn decode_coding_quadtree(
         log2_cb_size > state.log2_min_cb_size
     };
 
+    let more_data;
     if split_cu {
         let cb_size_split = cb_size >> 1;
         let x1 = x0 + cb_size_split;
         let y1 = y0 + cb_size_split;
-        decode_coding_quadtree(
+        let mut md = decode_coding_quadtree(
             cabac,
             contexts,
             state,
@@ -181,8 +186,8 @@ pub fn decode_coding_quadtree(
             log2_cb_size - 1,
             cb_depth + 1,
         )?;
-        if x1 < state.width {
-            decode_coding_quadtree(
+        if md && x1 < state.width {
+            md = decode_coding_quadtree(
                 cabac,
                 contexts,
                 state,
@@ -195,8 +200,8 @@ pub fn decode_coding_quadtree(
                 cb_depth + 1,
             )?;
         }
-        if y1 < state.height {
-            decode_coding_quadtree(
+        if md && y1 < state.height {
+            md = decode_coding_quadtree(
                 cabac,
                 contexts,
                 state,
@@ -209,8 +214,8 @@ pub fn decode_coding_quadtree(
                 cb_depth + 1,
             )?;
         }
-        if x1 < state.width && y1 < state.height {
-            decode_coding_quadtree(
+        if md && x1 < state.width && y1 < state.height {
+            md = decode_coding_quadtree(
                 cabac,
                 contexts,
                 state,
@@ -223,6 +228,7 @@ pub fn decode_coding_quadtree(
                 cb_depth + 1,
             )?;
         }
+        more_data = md;
     } else {
         decode_coding_unit(
             cabac,
@@ -235,10 +241,24 @@ pub fn decode_coding_quadtree(
             y0,
             log2_cb_size,
         )?;
+
+        // After a leaf CU, decode end_of_slice_flag if we're at a CTB
+        // boundary (or picture edge). Spec 7.3.8.5.
+        let ctb_size = 1u32 << state.log2_ctb_size;
+        let at_ctb_x_edge =
+            (x0 + cb_size).is_multiple_of(ctb_size) || (x0 + cb_size >= state.width);
+        let at_ctb_y_edge =
+            (y0 + cb_size).is_multiple_of(ctb_size) || (y0 + cb_size >= state.height);
+        if at_ctb_x_edge && at_ctb_y_edge {
+            let end_of_slice = cabac.decode_terminate();
+            more_data = end_of_slice == 0;
+        } else {
+            more_data = true;
+        }
     }
 
     set_ct_depth(state, x0, y0, log2_cb_size, cb_depth);
-    Ok(())
+    Ok(more_data)
 }
 
 /// `split_cu_flag` neighbor context derivation (HEVC spec 9.3.4.2.2).
@@ -683,13 +703,22 @@ fn predict_intra_luma(
     log2_size: u8,
     mode: u8,
 ) -> Result<(), DecodeError> {
-    // For the Phase 2c-6 fixture (single CTU with no neighbors), all
-    // reference samples are unavailable. Phase 3+ will derive availability
-    // from previously-decoded neighboring TUs.
-    let avail = ReferenceAvailability::default();
-    let (top, left) = build_reference_samples(avail, log2_size, state.bit_depth);
-
     let size = 1usize << log2_size;
+    let pic_w = state.width as usize;
+    let pic_h = state.height as usize;
+    let avail = compute_luma_avail(state, x0, y0, size as u32);
+    let (top, left) = build_reference_samples(
+        &state.y_plane,
+        state.y_stride,
+        pic_w,
+        pic_h,
+        x0 as usize,
+        y0 as usize,
+        log2_size,
+        state.bit_depth,
+        avail,
+    );
+
     let dst_stride = state.y_stride;
     let dst_offset = (y0 as usize) * dst_stride + (x0 as usize);
     let dst = &mut state.y_plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
@@ -708,6 +737,57 @@ fn predict_intra_luma(
     Ok(())
 }
 
+/// Decide which reference-sample directions are available for a luma TU at
+/// `(x0, y0)` of size `size`. For Phase 3a-1 we use a simple raster-scan
+/// availability rule: a neighbor is available iff its bottom-right pixel
+/// has a strictly smaller raster index than `(x0, y0)` AND lies within the
+/// picture. This works for single-slice intra-only pictures with raster
+/// CTU order — multi-slice / tiles / WPP will need a more elaborate check.
+fn compute_luma_avail(state: &PictureState, x0: u32, y0: u32, size: u32) -> ReferenceAvailability {
+    let pic_w = state.width;
+    let pic_h = state.height;
+
+    // Raster index of the current TU's top-left.
+    let cur_idx = (y0 as u64) * (pic_w as u64) + (x0 as u64);
+
+    let pixel_decoded = |x: u32, y: u32| -> bool {
+        if x >= pic_w || y >= pic_h {
+            return false;
+        }
+        ((y as u64) * (pic_w as u64) + (x as u64)) < cur_idx
+    };
+
+    // Up-left: pixel at (x0 - 1, y0 - 1)
+    let up_left = x0 > 0 && y0 > 0 && pixel_decoded(x0 - 1, y0 - 1);
+
+    // Up row exists iff the row above is decoded for x in [x0..x0+size).
+    // For raster scan in a single slice, that's true iff y0 > 0.
+    let up = y0 > 0 && pixel_decoded(x0, y0 - 1);
+
+    // Up-right: pixels at (x0 + size .. x0 + 2*size, y0 - 1).
+    // Strict: any of them must be decoded. Simplification: require the
+    // FIRST one to be decoded (raster scan means later columns weren't yet
+    // decoded at the same y).
+    let up_right = y0 > 0 && pixel_decoded(x0 + size, y0 - 1);
+
+    // Left column exists iff the column to the left is decoded.
+    let left = x0 > 0 && pixel_decoded(x0 - 1, y0);
+
+    // Bottom-left: pixels at (x0 - 1, y0 + size .. y0 + 2*size). For raster
+    // scan these are NEVER decoded yet (they're in a row strictly below us).
+    // Be conservative and report unavailable.
+    let _ = pixel_decoded; // silence unused warning if we add more
+    let bottom_left = false;
+
+    ReferenceAvailability {
+        up_left,
+        up,
+        up_right,
+        left,
+        bottom_left,
+    }
+}
+
 /// Same as `predict_intra_luma` but for one chroma plane (Cb and Cr both
 /// use the same logic — different planes, same prediction). The chroma
 /// position `(x0, y0)` here is in **luma sample coordinates**; we right-shift
@@ -719,14 +799,33 @@ fn predict_intra_chroma(
     log2_size: u8,
     mode: u8,
 ) -> Result<(), DecodeError> {
-    let avail = ReferenceAvailability::default();
-    let (top, left) = build_reference_samples(avail, log2_size, state.bit_depth);
     let size = 1usize << log2_size;
-    let dst_stride = state.uv_stride;
+    let pic_w_c = (state.width / 2) as usize;
+    let pic_h_c = (state.height / 2) as usize;
     let x_c = (x0_luma >> 1) as usize;
     let y_c = (y0_luma >> 1) as usize;
+    let avail = compute_chroma_avail(state, x0_luma, y0_luma, (size as u32) * 2);
+    let dst_stride = state.uv_stride;
 
     for plane_idx in 0..2 {
+        let (top, left) = {
+            let src_plane = if plane_idx == 0 {
+                &state.u_plane
+            } else {
+                &state.v_plane
+            };
+            build_reference_samples(
+                src_plane,
+                state.uv_stride,
+                pic_w_c,
+                pic_h_c,
+                x_c,
+                y_c,
+                log2_size,
+                state.bit_depth,
+                avail,
+            )
+        };
         let plane = if plane_idx == 0 {
             &mut state.u_plane
         } else {
@@ -747,6 +846,18 @@ fn predict_intra_chroma(
         }
     }
     Ok(())
+}
+
+/// Chroma availability mirrors luma availability — derived from the
+/// luma-coordinate position. For 4:2:0 the chroma TU's neighbors are
+/// available iff the corresponding luma neighbors were decoded.
+fn compute_chroma_avail(
+    state: &PictureState,
+    x0_luma: u32,
+    y0_luma: u32,
+    luma_size: u32,
+) -> ReferenceAvailability {
+    compute_luma_avail(state, x0_luma, y0_luma, luma_size)
 }
 
 /// Apply the inverse transform to a luma residual block and add it to the
