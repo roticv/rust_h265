@@ -12,6 +12,8 @@ mod cabac;
 mod cabac_tables;
 #[allow(dead_code)]
 mod cu_tree;
+#[allow(dead_code)]
+mod deblock;
 pub mod decoder;
 pub mod error;
 #[allow(dead_code)]

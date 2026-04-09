@@ -145,6 +145,11 @@ impl Decoder {
             ));
         }
 
+        // Phase 3b-1: in-loop deblocking filter.
+        if !sh.slice_deblocking_filter_disabled_flag {
+            crate::deblock::deblock_picture(&mut state, sps, pps, &sh);
+        }
+
         Ok(Some(Frame {
             y: state.y_plane,
             u: state.u_plane,
@@ -213,6 +218,39 @@ mod tests {
             decoded.len(),
             ref_yuv.len()
         );
+        assert_eq!(
+            decoded, ref_yuv,
+            "decoded planes do not match reference YUV byte-for-byte"
+        );
+    }
+
+    /// **Phase 3b-1 byte-exact test**: 32×32 horizontal gradient with
+    /// deblocking enabled (no `--no-deblock`). Tests:
+    ///
+    /// - `slice_deblocking_filter_disabled_flag` plumbing through the slice header
+    /// - Per-TU boundary strength marking (intra → bS=2)
+    /// - Per-min-CB QP table population
+    /// - Luma and chroma deblock filters running over the picture
+    #[test]
+    fn test_decode_deblock_grad_byte_exact() {
+        let h265_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/deblock_grad.h265");
+        let yuv_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/deblock_grad_ref.yuv");
+        let h265 = std::fs::read(h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(yuv_path).expect("read reference yuv");
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+        let mut frame: Option<Frame> = None;
+        for nal in &nals {
+            if let Some(f) = decoder.decode_nal(nal).expect("decode_nal") {
+                assert!(frame.is_none(), "fixture has only one frame");
+                frame = Some(f);
+            }
+        }
+        let frame = frame.expect("expected one decoded frame");
+        let mut decoded = Vec::with_capacity(ref_yuv.len());
+        decoded.extend_from_slice(&frame.y);
+        decoded.extend_from_slice(&frame.u);
+        decoded.extend_from_slice(&frame.v);
         assert_eq!(
             decoded, ref_yuv,
             "decoded planes do not match reference YUV byte-for-byte"

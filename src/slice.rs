@@ -35,6 +35,13 @@ pub struct SliceHeader {
     pub slice_qp_delta: i32,
     /// Effective slice QP: `pps.init_qp + slice_qp_delta`. Spec eq. 7-54.
     pub slice_qp_y: i32,
+    /// Slice-level deblocking disable flag. Inherits from PPS unless an
+    /// override is signaled (Phase 3b-1 only supports the inherited path).
+    pub slice_deblocking_filter_disabled_flag: bool,
+    /// Slice-level β offset (per spec, in `2 *` units when applied).
+    pub slice_beta_offset_div2: i32,
+    /// Slice-level tc offset (per spec, in `2 *` units when applied).
+    pub slice_tc_offset_div2: i32,
     /// Number of bits consumed by the slice header so we know where the
     /// slice data (CABAC bytestream) begins.
     pub header_size_bits: usize,
@@ -145,13 +152,19 @@ pub fn parse_slice_segment_header(
         let _slice_cr_qp_offset = r.read_se()?;
     }
 
+    let mut slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
+    let mut slice_beta_offset_div2 = 0i32;
+    let mut slice_tc_offset_div2 = 0i32;
     if pps.deblocking_filter_override_enabled_flag {
-        // Disabled in our fixture; would override pps_deblocking_filter_*.
-        return Err(DecodeError::Unsupported(
-            "deblocking_filter_override not yet supported",
-        ));
+        let deblocking_filter_override_flag = r.read_bit()? == 1;
+        if deblocking_filter_override_flag {
+            slice_deblocking_filter_disabled_flag = r.read_bit()? == 1;
+            if !slice_deblocking_filter_disabled_flag {
+                slice_beta_offset_div2 = r.read_se()?;
+                slice_tc_offset_div2 = r.read_se()?;
+            }
+        }
     }
-    let slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
 
     if pps.pps_loop_filter_across_slices_enabled_flag
         && (slice_sao_luma_flag || slice_sao_chroma_flag || !slice_deblocking_filter_disabled_flag)
@@ -202,6 +215,9 @@ pub fn parse_slice_segment_header(
         slice_sao_chroma_flag,
         slice_qp_delta,
         slice_qp_y,
+        slice_deblocking_filter_disabled_flag,
+        slice_beta_offset_div2,
+        slice_tc_offset_div2,
         header_size_bits,
     })
 }

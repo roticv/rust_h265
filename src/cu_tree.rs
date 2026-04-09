@@ -88,6 +88,14 @@ pub struct PictureState {
 
     /// Phase 2c-3 sentinel — most recently decoded luma residual block.
     pub last_luma_residual: Option<ResidualBlock>,
+
+    /// Phase 3b-1 deblocking: per-min-CB QP for deblock filter strength.
+    pub tab_qp_y: Vec<u8>,
+    /// Phase 3b-1 deblocking: per-4×4 boundary strength for vertical edges.
+    /// Indexed by `(y/4) * (width/4) + (x/4)` (matches FFmpeg's `vertical_bs`).
+    pub bs_vertical: Vec<u8>,
+    /// Phase 3b-1 deblocking: per-4×4 boundary strength for horizontal edges.
+    pub bs_horizontal: Vec<u8>,
 }
 
 impl PictureState {
@@ -132,6 +140,9 @@ impl PictureState {
             last_cu_qp_delta: 0,
             last_qp_y: 0,
             last_luma_residual: None,
+            tab_qp_y: vec![0u8; min_cb_width * min_cb_height],
+            bs_vertical: vec![0u8; ((w / 4) * (h / 4)) as usize],
+            bs_horizontal: vec![0u8; ((w / 4) * (h / 4)) as usize],
         }
     }
 }
@@ -869,7 +880,68 @@ fn decode_transform_unit(
         predict_intra_chroma(state, sps, x_base, y_base, log2_trafo_size, chroma_mode)?;
     }
 
+    // ---- Step 5: deblocking bookkeeping (Phase 3b-1).
+    //
+    // For the I-slice intra path, every internal TU edge gets bS = 2.
+    // We mark the top and left edges of this TU on the per-4×4 BS grids.
+    // The picture's outer borders (x0 == 0, y0 == 0) are skipped because
+    // there's nothing to filter against. We also write the per-min-CB QP
+    // so the deblock pass can read the right tc/beta indices.
+    let qp_y = if cbf_luma || inherited.cbf_cb || inherited.cbf_cr {
+        state.last_qp_y
+    } else {
+        // No CBFs → no cu_qp_delta this CU; the running qp from previous TUs
+        // (or slice_qp_y if first TU) still applies.
+        slice_qp_y + state.last_cu_qp_delta
+    };
+    write_qp_y_table(state, x0, y0, log2_trafo_size, qp_y);
+    mark_intra_tu_boundaries(state, x0, y0, log2_trafo_size);
+
     Ok(new_cbf)
+}
+
+/// Write `qp_y` into the per-min-CB QP table for all min-CB positions
+/// covered by the TU at `(x0, y0)` of size `1 << log2_size`. Used by
+/// the deblock pass to look up tc/β.
+fn write_qp_y_table(state: &mut PictureState, x0: u32, y0: u32, log2_size: u8, qp_y: i32) {
+    let length = ((1u32 << log2_size) >> state.log2_min_cb_size).max(1) as usize;
+    let x_cb = (x0 >> state.log2_min_cb_size) as usize;
+    let y_cb = (y0 >> state.log2_min_cb_size) as usize;
+    let v = qp_y.clamp(0, 51) as u8;
+    for j in 0..length {
+        let row = (y_cb + j) * state.min_cb_width;
+        for i in 0..length {
+            state.tab_qp_y[row + x_cb + i] = v;
+        }
+    }
+}
+
+/// Mark the top and left edges of an intra TU at `(x0, y0)` of size
+/// `1 << log2_size` with boundary strength 2 in the per-4×4 BS grid.
+/// Skips picture borders.
+fn mark_intra_tu_boundaries(state: &mut PictureState, x0: u32, y0: u32, log2_size: u8) {
+    let size = 1u32 << log2_size;
+    let pic_w = state.width as usize;
+    let bs_w = pic_w >> 2; // entries per row in the BS grid
+
+    // Top edge: only mark if y0 > 0 (there's a TU above to deblock against).
+    if y0 > 0 {
+        let yy = (y0 >> 2) as usize;
+        let xx_start = (x0 >> 2) as usize;
+        let xx_end = ((x0 + size) >> 2) as usize;
+        for xx in xx_start..xx_end {
+            state.bs_horizontal[yy * bs_w + xx] = 2;
+        }
+    }
+    // Left edge: only mark if x0 > 0.
+    if x0 > 0 {
+        let xx = (x0 >> 2) as usize;
+        let yy_start = (y0 >> 2) as usize;
+        let yy_end = ((y0 + size) >> 2) as usize;
+        for yy in yy_start..yy_end {
+            state.bs_vertical[yy * bs_w + xx] = 2;
+        }
+    }
 }
 
 /// Build the reference samples and call PLANAR/DC/angular for a luma TU.
