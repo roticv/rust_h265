@@ -337,7 +337,10 @@ mod tests {
         b[0] = -204;
         idct_dc(&mut a, 4, 8);
         idct_16x16(&mut b, 8);
-        assert_eq!(a, b, "full 16x16 IDCT should match DC fast path on DC-only input");
+        assert_eq!(
+            a, b,
+            "full 16x16 IDCT should match DC fast path on DC-only input"
+        );
     }
 
     /// Verify 4x4 DST against direct matrix multiplication.

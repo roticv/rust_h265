@@ -10,13 +10,13 @@
 //! subset is rejected via `Unsupported` from the underlying parsers.
 
 use crate::cabac::{CabacContexts, CabacReader};
-use crate::cu_tree::{decode_coding_quadtree, PictureState};
+use crate::cu_tree::{PictureState, decode_coding_quadtree};
 use crate::error::DecodeError;
 use crate::nal::{NalUnit, NalUnitType};
-use crate::pps::{parse_pps, Pps};
-use crate::slice::{parse_slice_segment_header, SliceType};
-use crate::sps::{parse_sps, Sps};
-use crate::vps::{parse_vps, Vps};
+use crate::pps::{Pps, parse_pps};
+use crate::slice::{SliceType, parse_slice_segment_header};
+use crate::sps::{Sps, parse_sps};
+use crate::vps::{Vps, parse_vps};
 
 /// A reconstructed video frame in YUV420 8-bit planar layout.
 ///
@@ -376,22 +376,32 @@ mod tests {
         // Step 2: Encode with x265 (intra-only, no sign-hiding, max-tu-size 4).
         let x265_status = Command::new("x265")
             .args([
-                "--input", input_yuv.to_str().unwrap(),
-                "--input-res", "16x16",
-                "--fps", "1",
-                "--frames", "1",
-                "--output", h265_path.to_str().unwrap(),
-                "--preset", "ultrafast",
+                "--input",
+                input_yuv.to_str().unwrap(),
+                "--input-res",
+                "16x16",
+                "--fps",
+                "1",
+                "--frames",
+                "1",
+                "--output",
+                h265_path.to_str().unwrap(),
+                "--preset",
+                "ultrafast",
                 "--no-wpp",
                 "--no-signhide",
-                "--ctu", "16",
-                "--max-tu-size", "4",
+                "--ctu",
+                "16",
+                "--max-tu-size",
+                "4",
                 "--no-open-gop",
-                "--keyint", "1",
+                "--keyint",
+                "1",
                 "--no-scenecut",
                 "--no-sao",
                 "--no-deblock",
-                "--qp", "25",
+                "--qp",
+                "25",
                 "--no-psnr",
                 "--no-ssim",
                 "--no-info",
@@ -412,9 +422,12 @@ mod tests {
         let ffmpeg_status = Command::new("ffmpeg")
             .args([
                 "-y",
-                "-i", h265_path.to_str().unwrap(),
-                "-f", "rawvideo",
-                "-pix_fmt", "yuv420p",
+                "-i",
+                h265_path.to_str().unwrap(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
                 ref_yuv_path.to_str().unwrap(),
             ])
             .stdout(std::process::Stdio::null())
@@ -507,22 +520,32 @@ mod tests {
 
         let x265_status = Command::new("x265")
             .args([
-                "--input", input_yuv.to_str().unwrap(),
-                "--input-res", "16x16",
-                "--fps", "1",
-                "--frames", "1",
-                "--output", h265_path.to_str().unwrap(),
-                "--preset", "ultrafast",
+                "--input",
+                input_yuv.to_str().unwrap(),
+                "--input-res",
+                "16x16",
+                "--fps",
+                "1",
+                "--frames",
+                "1",
+                "--output",
+                h265_path.to_str().unwrap(),
+                "--preset",
+                "ultrafast",
                 "--no-wpp",
                 "--no-signhide",
-                "--ctu", "16",
-                "--max-tu-size", "4",
+                "--ctu",
+                "16",
+                "--max-tu-size",
+                "4",
                 "--no-open-gop",
-                "--keyint", "1",
+                "--keyint",
+                "1",
                 "--no-scenecut",
                 "--no-sao",
                 "--no-deblock",
-                "--qp", "30",
+                "--qp",
+                "30",
                 "--no-psnr",
                 "--no-ssim",
                 "--no-info",
@@ -542,9 +565,12 @@ mod tests {
         let ffmpeg_status = Command::new("ffmpeg")
             .args([
                 "-y",
-                "-i", h265_path.to_str().unwrap(),
-                "-f", "rawvideo",
-                "-pix_fmt", "yuv420p",
+                "-i",
+                h265_path.to_str().unwrap(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
                 ref_yuv_path.to_str().unwrap(),
             ])
             .stdout(std::process::Stdio::null())

@@ -20,11 +20,11 @@ mod intra_pred;
 mod inverse_transform;
 pub mod nal;
 #[allow(dead_code)]
-mod residual_coding;
-#[allow(dead_code)]
 mod pps;
 #[allow(dead_code)]
 mod profile_tier_level;
+#[allow(dead_code)]
+mod residual_coding;
 #[allow(dead_code)]
 mod slice;
 #[allow(dead_code)]
@@ -35,7 +35,7 @@ mod vps;
 #[cfg(test)]
 mod parameter_set_tests {
     use super::*;
-    use crate::nal::{parse_annex_b, NalUnitType};
+    use crate::nal::{NalUnitType, parse_annex_b};
 
     /// Decode VPS+SPS+PPS from a real x265-encoded fixture and assert the
     /// fields a downstream slice/CTU loop will need.

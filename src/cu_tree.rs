@@ -13,12 +13,12 @@ use crate::cabac::{CabacContexts, CabacReader};
 use crate::cabac_tables::ctx;
 use crate::error::DecodeError;
 use crate::intra_pred::{
-    add_residual, build_reference_samples, filter_reference_samples, predict_angular, predict_dc,
-    predict_planar, ReferenceAvailability,
+    ReferenceAvailability, add_residual, build_reference_samples, filter_reference_samples,
+    predict_angular, predict_dc, predict_planar,
 };
 use crate::inverse_transform::apply_inverse_transform;
 use crate::pps::Pps;
-use crate::residual_coding::{decode_residual_coding, ResidualBlock, ResidualPlane, ScanOrder};
+use crate::residual_coding::{ResidualBlock, ResidualPlane, ScanOrder, decode_residual_coding};
 use crate::sps::Sps;
 
 /// HEVC luma intra prediction mode constants (spec table 8-1).
@@ -362,8 +362,7 @@ fn decode_coding_unit(
     // sps.max_transform_hierarchy_depth_intra. The PART_NxN case adds 1 to
     // max_trafo_depth and sets intra_split, but our fixture doesn't hit it.
     let intra_split = part_mode == PartMode::PartNxN;
-    let max_trafo_depth =
-        sps.max_transform_hierarchy_depth_intra + if intra_split { 1 } else { 0 };
+    let max_trafo_depth = sps.max_transform_hierarchy_depth_intra + if intra_split { 1 } else { 0 };
 
     decode_transform_tree(
         cabac,
@@ -467,35 +466,98 @@ fn decode_transform_tree(
         let y1 = y0 + trafo_size_split;
         let mut child_cbf = inherited;
         child_cbf = decode_transform_tree(
-            cabac, contexts, state, sps, pps, slice_qp_y,
-            x0, y0, x0, y0,
-            log2_cb_size, log2_trafo_size - 1, trafo_depth + 1,
-            max_trafo_depth, intra_split, 0, child_cbf,
+            cabac,
+            contexts,
+            state,
+            sps,
+            pps,
+            slice_qp_y,
+            x0,
+            y0,
+            x0,
+            y0,
+            log2_cb_size,
+            log2_trafo_size - 1,
+            trafo_depth + 1,
+            max_trafo_depth,
+            intra_split,
+            0,
+            child_cbf,
         )?;
         child_cbf = decode_transform_tree(
-            cabac, contexts, state, sps, pps, slice_qp_y,
-            x1, y0, x0, y0,
-            log2_cb_size, log2_trafo_size - 1, trafo_depth + 1,
-            max_trafo_depth, intra_split, 1, child_cbf,
+            cabac,
+            contexts,
+            state,
+            sps,
+            pps,
+            slice_qp_y,
+            x1,
+            y0,
+            x0,
+            y0,
+            log2_cb_size,
+            log2_trafo_size - 1,
+            trafo_depth + 1,
+            max_trafo_depth,
+            intra_split,
+            1,
+            child_cbf,
         )?;
         child_cbf = decode_transform_tree(
-            cabac, contexts, state, sps, pps, slice_qp_y,
-            x0, y1, x0, y0,
-            log2_cb_size, log2_trafo_size - 1, trafo_depth + 1,
-            max_trafo_depth, intra_split, 2, child_cbf,
+            cabac,
+            contexts,
+            state,
+            sps,
+            pps,
+            slice_qp_y,
+            x0,
+            y1,
+            x0,
+            y0,
+            log2_cb_size,
+            log2_trafo_size - 1,
+            trafo_depth + 1,
+            max_trafo_depth,
+            intra_split,
+            2,
+            child_cbf,
         )?;
         let final_cbf = decode_transform_tree(
-            cabac, contexts, state, sps, pps, slice_qp_y,
-            x1, y1, x0, y0,
-            log2_cb_size, log2_trafo_size - 1, trafo_depth + 1,
-            max_trafo_depth, intra_split, 3, child_cbf,
+            cabac,
+            contexts,
+            state,
+            sps,
+            pps,
+            slice_qp_y,
+            x1,
+            y1,
+            x0,
+            y0,
+            log2_cb_size,
+            log2_trafo_size - 1,
+            trafo_depth + 1,
+            max_trafo_depth,
+            intra_split,
+            3,
+            child_cbf,
         )?;
         Ok(final_cbf)
     } else {
         decode_transform_unit(
-            cabac, contexts, state, sps, pps, slice_qp_y,
-            x0, y0, x_base, y_base,
-            log2_trafo_size, trafo_depth, blk_idx, inherited,
+            cabac,
+            contexts,
+            state,
+            sps,
+            pps,
+            slice_qp_y,
+            x0,
+            y0,
+            x_base,
+            y_base,
+            log2_trafo_size,
+            trafo_depth,
+            blk_idx,
+            inherited,
         )
     }
 }
@@ -594,9 +656,7 @@ fn decode_transform_unit(
     // == 2 (4x4 luma TUs), chroma is deferred to blk_idx==3 where it's handled
     // at the parent TU size (xBase, yBase, log2_trafo_size == parent's log2-1).
     let do_chroma_inline = sps.chroma_format_idc == 1 && log2_trafo_size > 2;
-    let do_chroma_deferred = sps.chroma_format_idc == 1
-        && log2_trafo_size == 2
-        && blk_idx == 3;
+    let do_chroma_deferred = sps.chroma_format_idc == 1 && log2_trafo_size == 2 && blk_idx == 3;
 
     if cbf_luma || inherited.cbf_cb || inherited.cbf_cr {
         // cu_qp_delta is decoded once per CU, the first time we see a TU
@@ -605,11 +665,7 @@ fn decode_transform_unit(
             let abs = decode_cu_qp_delta_abs(cabac, contexts) as i32;
             let signed = if abs != 0 {
                 let sign = decode_cu_qp_delta_sign_flag(cabac);
-                if sign != 0 {
-                    -abs
-                } else {
-                    abs
-                }
+                if sign != 0 { -abs } else { abs }
             } else {
                 0
             };
@@ -1098,9 +1154,9 @@ fn compute_luma_intra_pred_mode(
 mod tests {
     use super::*;
     use crate::cabac::CabacContexts;
-    use crate::nal::{parse_annex_b, NalUnitType};
+    use crate::nal::{NalUnitType, parse_annex_b};
     use crate::pps::parse_pps;
-    use crate::slice::{parse_slice_segment_header, SliceType};
+    use crate::slice::{SliceType, parse_slice_segment_header};
     use crate::sps::parse_sps;
 
     /// End-to-end Phase 2c-1/2c-2 test: parse `testdata/tiny_intra.h265`,
@@ -1145,7 +1201,10 @@ mod tests {
         // CABAC bytestream begins immediately after the slice header
         // (header is byte-aligned for our fixture).
         let cabac_byte_offset = sh.header_size_bits / 8;
-        assert_eq!(cabac_byte_offset, 2, "fixture slice header is exactly 2 bytes");
+        assert_eq!(
+            cabac_byte_offset, 2,
+            "fixture slice header is exactly 2 bytes"
+        );
         let mut cabac = CabacReader::new(&slice_nal.rbsp, cabac_byte_offset);
 
         let mut state = PictureState::new(&sps);
@@ -1187,14 +1246,12 @@ mod tests {
         // breaks because x265 picked a different mode, regenerate the
         // expected value from an FFmpeg trace.
         assert_eq!(
-            state.last_luma_pred_mode,
-            INTRA_PLANAR,
+            state.last_luma_pred_mode, INTRA_PLANAR,
             "expected PLANAR luma intra for flat-gray fixture, got {}",
             state.last_luma_pred_mode
         );
         assert_eq!(
-            state.last_chroma_pred_mode,
-            INTRA_PLANAR,
+            state.last_chroma_pred_mode, INTRA_PLANAR,
             "expected DM chroma (= PLANAR) for flat-gray fixture, got {}",
             state.last_chroma_pred_mode
         );

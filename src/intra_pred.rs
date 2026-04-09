@@ -189,13 +189,7 @@ pub fn build_reference_samples(
 ///
 /// `dst` is the destination buffer of `size * size` samples in row-major
 /// order with row stride `dst_stride`.
-pub fn predict_planar(
-    dst: &mut [u8],
-    dst_stride: usize,
-    top: &[u8],
-    left: &[u8],
-    log2_size: u8,
-) {
+pub fn predict_planar(dst: &mut [u8], dst_stride: usize, top: &[u8], left: &[u8], log2_size: u8) {
     let size = 1usize << log2_size;
     // Spec eq 8-26:
     //   predSamples[x][y] = ((nT - 1 - x) * p[-1][y] + (x+1) * p[nT][-1]
@@ -299,14 +293,14 @@ pub fn predict_angular(
 
     // Angle tables — indexed by (mode - 2).
     static INTRA_PRED_ANGLE: [i32; 33] = [
-        32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26, -32,
-        -26, -21, -17, -13, -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32,
+        32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26, -32, -26, -21, -17, -13,
+        -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32,
     ];
     // Inverse angle table — indexed by (mode - 11) for modes 11..25 (the 15
     // modes with negative angles).
     static INV_ANGLE: [i32; 15] = [
-        -4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390, -482,
-        -630, -910, -1638, -4096,
+        -4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390, -482, -630, -910, -1638,
+        -4096,
     ];
 
     let angle = INTRA_PRED_ANGLE[(mode - 2) as usize];
@@ -337,10 +331,8 @@ pub fn predict_angular(
         if angle < 0 && last < -1 {
             // Project left samples into negative ref positions.
             for x in last..=-1 {
-                let left_idx =
-                    -1 + ((x * INV_ANGLE[(mode - 11) as usize] + 128) >> 8);
-                ref_buf[(ref_origin as i32 + x) as usize] =
-                    left_p[left_idx as usize];
+                let left_idx = -1 + ((x * INV_ANGLE[(mode - 11) as usize] + 128) >> 8);
+                ref_buf[(ref_origin as i32 + x) as usize] = left_p[left_idx as usize];
             }
         }
 
@@ -350,10 +342,9 @@ pub fn predict_angular(
             if fact != 0 {
                 for x in 0..size {
                     let ri = (ref_origin as i32 + x as i32 + idx + 1) as usize;
-                    dst[y * dst_stride + x] = (((32 - fact) * ref_buf[ri] as i32
-                        + fact * ref_buf[ri + 1] as i32
-                        + 16)
-                        >> 5) as u8;
+                    dst[y * dst_stride + x] =
+                        (((32 - fact) * ref_buf[ri] as i32 + fact * ref_buf[ri + 1] as i32 + 16)
+                            >> 5) as u8;
                 }
             } else {
                 for x in 0..size {
@@ -366,8 +357,7 @@ pub fn predict_angular(
         // Mode 26 (pure vertical) luma boundary filter.
         if mode == 26 && c_idx == 0 && size < 32 {
             for y in 0..size {
-                let val =
-                    top_p[0] as i32 + ((left_p[y] as i32 - corner as i32) >> 1);
+                let val = top_p[0] as i32 + ((left_p[y] as i32 - corner as i32) >> 1);
                 dst[y * dst_stride] = val.clamp(0, 255) as u8;
             }
         }
@@ -385,10 +375,8 @@ pub fn predict_angular(
 
         if angle < 0 && last < -1 {
             for x in last..=-1 {
-                let top_idx =
-                    -1 + ((x * INV_ANGLE[(mode - 11) as usize] + 128) >> 8);
-                ref_buf[(ref_origin as i32 + x) as usize] =
-                    top_p[top_idx as usize];
+                let top_idx = -1 + ((x * INV_ANGLE[(mode - 11) as usize] + 128) >> 8);
+                ref_buf[(ref_origin as i32 + x) as usize] = top_p[top_idx as usize];
             }
         }
 
@@ -398,10 +386,9 @@ pub fn predict_angular(
             if fact != 0 {
                 for y in 0..size {
                     let ri = (ref_origin as i32 + y as i32 + idx + 1) as usize;
-                    dst[y * dst_stride + x] = (((32 - fact) * ref_buf[ri] as i32
-                        + fact * ref_buf[ri + 1] as i32
-                        + 16)
-                        >> 5) as u8;
+                    dst[y * dst_stride + x] =
+                        (((32 - fact) * ref_buf[ri] as i32 + fact * ref_buf[ri + 1] as i32 + 16)
+                            >> 5) as u8;
                 }
             } else {
                 for y in 0..size {
@@ -414,8 +401,7 @@ pub fn predict_angular(
         // Mode 10 (pure horizontal) luma boundary filter.
         if mode == 10 && c_idx == 0 && size < 32 {
             for x in 0..size {
-                let val =
-                    left_p[0] as i32 + ((top_p[x] as i32 - corner as i32) >> 1);
+                let val = left_p[0] as i32 + ((top_p[x] as i32 - corner as i32) >> 1);
                 dst[x] = val.clamp(0, 255) as u8;
             }
         }
@@ -479,14 +465,10 @@ pub fn filter_reference_samples(
     if strong_intra_smoothing_enabled && c_idx == 0 && log2_size == 5 {
         // threshold = 1 << (BitDepth - 5) = 1 << 3 = 8 for 8-bit
         let threshold = 1i32 << 3; // 8-bit only for now
-        let top_smooth = (top[0] as i32 + top[2 * size] as i32
-            - 2 * top[size] as i32)
-            .abs()
-            < threshold;
-        let left_smooth = (left[0] as i32 + left[2 * size] as i32
-            - 2 * left[size] as i32)
-            .abs()
-            < threshold;
+        let top_smooth =
+            (top[0] as i32 + top[2 * size] as i32 - 2 * top[size] as i32).abs() < threshold;
+        let left_smooth =
+            (left[0] as i32 + left[2 * size] as i32 - 2 * left[size] as i32).abs() < threshold;
         if top_smooth && left_smooth {
             // Strong smoothing: linear interpolation between corner and edge.
             let mut filtered_top = vec![0u8; 2 * size + 1];
@@ -529,21 +511,16 @@ pub fn filter_reference_samples(
     // So for our arrays, we filter indices 1..=(2*size-1):
     //   filtered_top[k] = (top[k+1] + 2*top[k] + top[k-1] + 2) >> 2  for k = 1..2*size-1
     for k in (1..2 * size).rev() {
-        filtered_top[k] = ((top[k + 1] as i32 + 2 * top[k] as i32
-            + top[k - 1] as i32
-            + 2)
-            >> 2) as u8;
-        filtered_left[k] = ((left[k + 1] as i32 + 2 * left[k] as i32
-            + left[k - 1] as i32
-            + 2)
-            >> 2) as u8;
+        filtered_top[k] =
+            ((top[k + 1] as i32 + 2 * top[k] as i32 + top[k - 1] as i32 + 2) >> 2) as u8;
+        filtered_left[k] =
+            ((left[k + 1] as i32 + 2 * left[k] as i32 + left[k - 1] as i32 + 2) >> 2) as u8;
     }
 
     // Corner: (left[1] + 2*corner + top[1] + 2) >> 2
     // In our layout: left[0] is corner, left[1] is first left neighbor,
     // top[1] is first top neighbor.
-    let new_corner =
-        ((left[1] as i32 + 2 * left[0] as i32 + top[1] as i32 + 2) >> 2) as u8;
+    let new_corner = ((left[1] as i32 + 2 * left[0] as i32 + top[1] as i32 + 2) >> 2) as u8;
     filtered_top[0] = new_corner;
     filtered_left[0] = new_corner;
 

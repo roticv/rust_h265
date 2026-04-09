@@ -100,11 +100,7 @@ impl BitstreamReader {
     pub fn read_se(&mut self) -> Result<i32, &'static str> {
         let code = self.read_ue()?;
         let val = code.div_ceil(2) as i32;
-        if code % 2 == 0 {
-            Ok(-val)
-        } else {
-            Ok(val)
-        }
+        if code % 2 == 0 { Ok(-val) } else { Ok(val) }
     }
 
     /// Returns true if there is more RBSP data before the trailing bits.

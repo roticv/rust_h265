@@ -21,22 +21,22 @@ use std::borrow::Cow;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NalUnitType {
     // VCL (slice) NAL units
-    TrailN,    // 0
-    TrailR,    // 1
-    TsaN,      // 2
-    TsaR,      // 3
-    StsaN,     // 4
-    StsaR,     // 5
-    RadlN,     // 6
-    RadlR,     // 7
-    RaslN,     // 8
-    RaslR,     // 9
-    BlaWLp,    // 16
-    BlaWRadl,  // 17
-    BlaNLp,    // 18
-    IdrWRadl,  // 19
-    IdrNLp,    // 20
-    Cra,       // 21
+    TrailN,   // 0
+    TrailR,   // 1
+    TsaN,     // 2
+    TsaR,     // 3
+    StsaN,    // 4
+    StsaR,    // 5
+    RadlN,    // 6
+    RadlR,    // 7
+    RaslN,    // 8
+    RaslR,    // 9
+    BlaWLp,   // 16
+    BlaWRadl, // 17
+    BlaNLp,   // 18
+    IdrWRadl, // 19
+    IdrNLp,   // 20
+    Cra,      // 21
     // Non-VCL NAL units
     Vps,       // 32
     Sps,       // 33

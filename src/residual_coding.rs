@@ -230,9 +230,8 @@ fn decode_last_significant_coeff_xy_prefix(
     let mut x_prefix = 0u32;
     while x_prefix < max {
         let inc = (x_prefix >> ctx_shift) + ctx_offset;
-        let bit = cabac.decode_bin(
-            &mut contexts.state[ctx::LAST_SIGNIFICANT_COEFF_X_PREFIX + inc as usize],
-        );
+        let bit = cabac
+            .decode_bin(&mut contexts.state[ctx::LAST_SIGNIFICANT_COEFF_X_PREFIX + inc as usize]);
         if bit == 0 {
             break;
         }
@@ -242,9 +241,8 @@ fn decode_last_significant_coeff_xy_prefix(
     let mut y_prefix = 0u32;
     while y_prefix < max {
         let inc = (y_prefix >> ctx_shift) + ctx_offset;
-        let bit = cabac.decode_bin(
-            &mut contexts.state[ctx::LAST_SIGNIFICANT_COEFF_Y_PREFIX + inc as usize],
-        );
+        let bit = cabac
+            .decode_bin(&mut contexts.state[ctx::LAST_SIGNIFICANT_COEFF_Y_PREFIX + inc as usize]);
         if bit == 0 {
             break;
         }
@@ -505,25 +503,23 @@ pub fn decode_residual_coding(
                 scan_x_cg = &SCAN_1X1[..];
                 scan_y_cg = &SCAN_1X1[..];
             }
-            8 => {
-                match scan_idx {
-                    ScanOrder::Diag => {
-                        num_coeff += (DIAG_SCAN_2X2_INV[y_cg_last][x_cg_last] as u32) << 4;
-                        scan_x_cg = &DIAG_SCAN_2X2_X[..];
-                        scan_y_cg = &DIAG_SCAN_2X2_Y[..];
-                    }
-                    ScanOrder::Horiz => {
-                        num_coeff += (HORIZ_SCAN_2X2_INV[y_cg_last][x_cg_last] as u32) << 4;
-                        scan_x_cg = &HORIZ_SCAN_2X2_X[..];
-                        scan_y_cg = &HORIZ_SCAN_2X2_Y[..];
-                    }
-                    ScanOrder::Vert => {
-                        num_coeff += (VERT_SCAN_2X2_INV[y_cg_last][x_cg_last] as u32) << 4;
-                        scan_x_cg = &VERT_SCAN_2X2_X[..];
-                        scan_y_cg = &VERT_SCAN_2X2_Y[..];
-                    }
+            8 => match scan_idx {
+                ScanOrder::Diag => {
+                    num_coeff += (DIAG_SCAN_2X2_INV[y_cg_last][x_cg_last] as u32) << 4;
+                    scan_x_cg = &DIAG_SCAN_2X2_X[..];
+                    scan_y_cg = &DIAG_SCAN_2X2_Y[..];
                 }
-            }
+                ScanOrder::Horiz => {
+                    num_coeff += (HORIZ_SCAN_2X2_INV[y_cg_last][x_cg_last] as u32) << 4;
+                    scan_x_cg = &HORIZ_SCAN_2X2_X[..];
+                    scan_y_cg = &HORIZ_SCAN_2X2_Y[..];
+                }
+                ScanOrder::Vert => {
+                    num_coeff += (VERT_SCAN_2X2_INV[y_cg_last][x_cg_last] as u32) << 4;
+                    scan_x_cg = &VERT_SCAN_2X2_X[..];
+                    scan_y_cg = &VERT_SCAN_2X2_Y[..];
+                }
+            },
             16 => {
                 num_coeff += (DIAG_SCAN_4X4_INV[y_cg_last][x_cg_last] as u32) << 4;
                 scan_x_cg = &DIAG_SCAN_4X4_X[..];
@@ -642,8 +638,7 @@ pub fn decode_residual_coding(
             while n > 0 {
                 let x_c = scan_x_off[n as usize];
                 let y_c = scan_y_off[n as usize];
-                if decode_sig_coeff_flag(cabac, contexts, x_c, y_c, scf_offset, ctx_idx_map_p)
-                    != 0
+                if decode_sig_coeff_flag(cabac, contexts, x_c, y_c, scf_offset, ctx_idx_map_p) != 0
                 {
                     significant_coeff_flag_idx[nb_significant_coeff_flag as usize] = n as u8;
                     nb_significant_coeff_flag += 1;
@@ -656,11 +651,7 @@ pub fn decode_residual_coding(
             if !implicit_non_zero_coeff {
                 // Re-derive scf_offset for position 0.
                 let scf_offset_0 = if i == 0 {
-                    if c_idx == 0 {
-                        0
-                    } else {
-                        27
-                    }
+                    if c_idx == 0 { 0 } else { 27 }
                 } else {
                     2 + scf_offset
                 };
@@ -728,11 +719,7 @@ pub fn decode_residual_coding(
 
             if m < 8 {
                 trans_coeff_level = 1 + coeff_abs_level_greater1_flag[m] as i64;
-                let needed_for_remaining = if m as i32 == first_greater1_idx {
-                    3
-                } else {
-                    2
-                };
+                let needed_for_remaining = if m as i32 == first_greater1_idx { 3 } else { 2 };
                 if trans_coeff_level == needed_for_remaining {
                     let last = decode_coeff_abs_level_remaining(cabac, c_rice_param) as i64;
                     trans_coeff_level += last;

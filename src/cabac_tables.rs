@@ -566,12 +566,18 @@ mod tests {
             (ctx::SAO_MERGE_FLAG, ctx::SAO_MERGE_FLAG_LEN),
             (ctx::SAO_TYPE_IDX, ctx::SAO_TYPE_IDX_LEN),
             (ctx::SPLIT_CODING_UNIT_FLAG, ctx::SPLIT_CODING_UNIT_FLAG_LEN),
-            (ctx::CU_TRANSQUANT_BYPASS_FLAG, ctx::CU_TRANSQUANT_BYPASS_FLAG_LEN),
+            (
+                ctx::CU_TRANSQUANT_BYPASS_FLAG,
+                ctx::CU_TRANSQUANT_BYPASS_FLAG_LEN,
+            ),
             (ctx::SKIP_FLAG, ctx::SKIP_FLAG_LEN),
             (ctx::CU_QP_DELTA, ctx::CU_QP_DELTA_LEN),
             (ctx::PRED_MODE_FLAG, ctx::PRED_MODE_FLAG_LEN),
             (ctx::PART_MODE, ctx::PART_MODE_LEN),
-            (ctx::PREV_INTRA_LUMA_PRED_FLAG, ctx::PREV_INTRA_LUMA_PRED_FLAG_LEN),
+            (
+                ctx::PREV_INTRA_LUMA_PRED_FLAG,
+                ctx::PREV_INTRA_LUMA_PRED_FLAG_LEN,
+            ),
             (ctx::INTRA_CHROMA_PRED_MODE, ctx::INTRA_CHROMA_PRED_MODE_LEN),
             (ctx::MERGE_FLAG, ctx::MERGE_FLAG_LEN),
             (ctx::MERGE_IDX, ctx::MERGE_IDX_LEN),
@@ -587,17 +593,41 @@ mod tests {
             (ctx::CBF_CB_CR, ctx::CBF_CB_CR_LEN),
             (ctx::TRANSFORM_SKIP_FLAG, ctx::TRANSFORM_SKIP_FLAG_LEN),
             (ctx::EXPLICIT_RDPCM_FLAG, ctx::EXPLICIT_RDPCM_FLAG_LEN),
-            (ctx::EXPLICIT_RDPCM_DIR_FLAG, ctx::EXPLICIT_RDPCM_DIR_FLAG_LEN),
-            (ctx::LAST_SIGNIFICANT_COEFF_X_PREFIX, ctx::LAST_SIGNIFICANT_COEFF_X_PREFIX_LEN),
-            (ctx::LAST_SIGNIFICANT_COEFF_Y_PREFIX, ctx::LAST_SIGNIFICANT_COEFF_Y_PREFIX_LEN),
-            (ctx::SIGNIFICANT_COEFF_GROUP_FLAG, ctx::SIGNIFICANT_COEFF_GROUP_FLAG_LEN),
+            (
+                ctx::EXPLICIT_RDPCM_DIR_FLAG,
+                ctx::EXPLICIT_RDPCM_DIR_FLAG_LEN,
+            ),
+            (
+                ctx::LAST_SIGNIFICANT_COEFF_X_PREFIX,
+                ctx::LAST_SIGNIFICANT_COEFF_X_PREFIX_LEN,
+            ),
+            (
+                ctx::LAST_SIGNIFICANT_COEFF_Y_PREFIX,
+                ctx::LAST_SIGNIFICANT_COEFF_Y_PREFIX_LEN,
+            ),
+            (
+                ctx::SIGNIFICANT_COEFF_GROUP_FLAG,
+                ctx::SIGNIFICANT_COEFF_GROUP_FLAG_LEN,
+            ),
             (ctx::SIGNIFICANT_COEFF_FLAG, ctx::SIGNIFICANT_COEFF_FLAG_LEN),
-            (ctx::COEFF_ABS_LEVEL_GREATER1_FLAG, ctx::COEFF_ABS_LEVEL_GREATER1_FLAG_LEN),
-            (ctx::COEFF_ABS_LEVEL_GREATER2_FLAG, ctx::COEFF_ABS_LEVEL_GREATER2_FLAG_LEN),
+            (
+                ctx::COEFF_ABS_LEVEL_GREATER1_FLAG,
+                ctx::COEFF_ABS_LEVEL_GREATER1_FLAG_LEN,
+            ),
+            (
+                ctx::COEFF_ABS_LEVEL_GREATER2_FLAG,
+                ctx::COEFF_ABS_LEVEL_GREATER2_FLAG_LEN,
+            ),
             (ctx::LOG2_RES_SCALE_ABS, ctx::LOG2_RES_SCALE_ABS_LEN),
             (ctx::RES_SCALE_SIGN_FLAG, ctx::RES_SCALE_SIGN_FLAG_LEN),
-            (ctx::CU_CHROMA_QP_OFFSET_FLAG, ctx::CU_CHROMA_QP_OFFSET_FLAG_LEN),
-            (ctx::CU_CHROMA_QP_OFFSET_IDX, ctx::CU_CHROMA_QP_OFFSET_IDX_LEN),
+            (
+                ctx::CU_CHROMA_QP_OFFSET_FLAG,
+                ctx::CU_CHROMA_QP_OFFSET_FLAG_LEN,
+            ),
+            (
+                ctx::CU_CHROMA_QP_OFFSET_IDX,
+                ctx::CU_CHROMA_QP_OFFSET_IDX_LEN,
+            ),
         ];
         let mut expected = 0usize;
         for &(offset, len) in elements {

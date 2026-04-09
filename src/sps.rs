@@ -8,7 +8,7 @@
 
 use crate::bitstream::BitstreamReader;
 use crate::error::DecodeError;
-use crate::profile_tier_level::{parse_profile_tier_level, ProfileTierLevel};
+use crate::profile_tier_level::{ProfileTierLevel, parse_profile_tier_level};
 
 #[derive(Debug, Clone)]
 pub struct Sps {

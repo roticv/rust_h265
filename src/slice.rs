@@ -154,9 +154,7 @@ pub fn parse_slice_segment_header(
     let slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
 
     if pps.pps_loop_filter_across_slices_enabled_flag
-        && (slice_sao_luma_flag
-            || slice_sao_chroma_flag
-            || !slice_deblocking_filter_disabled_flag)
+        && (slice_sao_luma_flag || slice_sao_chroma_flag || !slice_deblocking_filter_disabled_flag)
     {
         let _slice_loop_filter_across_slices_enabled_flag = r.read_bit()?;
     }
@@ -178,16 +176,12 @@ pub fn parse_slice_segment_header(
     // Spec 7.3.2.11.
     let one_bit = r.read_bit()?;
     if one_bit != 1 {
-        return Err(DecodeError::InvalidSyntax(
-            "byte_alignment: expected 1 bit",
-        ));
+        return Err(DecodeError::InvalidSyntax("byte_alignment: expected 1 bit"));
     }
     while !at_byte_boundary(&r) {
         let zero_bit = r.read_bit()?;
         if zero_bit != 0 {
-            return Err(DecodeError::InvalidSyntax(
-                "byte_alignment: expected 0 bit",
-            ));
+            return Err(DecodeError::InvalidSyntax("byte_alignment: expected 0 bit"));
         }
     }
 
@@ -304,8 +298,9 @@ mod tests {
         // Slice RBSP from testdata/tiny_intra.h265 — 0xAD 0xC0 is the full
         // slice header (16 bits), the rest is the CABAC byte stream.
         let rbsp = [0xAD, 0xC0, 0xCE, 0x1F, 0xBF, 0x0B, 0x80];
-        let sh = parse_slice_segment_header(&rbsp, NalUnitType::IdrNLp, &minimal_sps(), &minimal_pps())
-            .expect("parse slice header");
+        let sh =
+            parse_slice_segment_header(&rbsp, NalUnitType::IdrNLp, &minimal_sps(), &minimal_pps())
+                .expect("parse slice header");
 
         assert!(sh.first_slice_segment_in_pic_flag);
         assert!(!sh.no_output_of_prior_pics_flag);
