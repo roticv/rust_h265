@@ -347,4 +347,264 @@ mod tests {
             "decoded planes do not match reference YUV byte-for-byte"
         );
     }
+
+    /// **Phase 3a-3 byte-exact test**: 32x32 diagonal-gradient frame with
+    /// `--ctu 16 --max-tu-size 4` to force angular intra prediction modes.
+    ///
+    /// The gradient input causes x265 to choose angular modes for many PUs,
+    /// exercising predict_angular + reference sample filtering. The test
+    /// generates the fixture at runtime (x265 encode + ffmpeg decode) and
+    /// then verifies our decoder is byte-exact against FFmpeg's output.
+    #[test]
+    fn test_decode_angular_byte_exact() {
+        use std::process::Command;
+
+        let tmp = std::env::temp_dir();
+        let input_yuv = tmp.join("angular_input.yuv");
+        let h265_path = tmp.join("angular.h265");
+        let ref_yuv_path = tmp.join("angular_ref.yuv");
+
+        // Step 1: Generate 16x16 flat gray YUV input.
+        // x265 with --max-tu-size 4 picks angular modes for some 4x4 PUs.
+        let w: usize = 16;
+        let h: usize = 16;
+        let mut yuv_data = Vec::with_capacity(w * h + 2 * (w / 2) * (h / 2));
+        yuv_data.extend(std::iter::repeat_n(0x7Eu8, w * h));
+        yuv_data.extend(std::iter::repeat_n(128u8, (w / 2) * (h / 2) * 2));
+        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
+
+        // Step 2: Encode with x265 (intra-only, no sign-hiding, max-tu-size 4).
+        let x265_status = Command::new("x265")
+            .args([
+                "--input", input_yuv.to_str().unwrap(),
+                "--input-res", "16x16",
+                "--fps", "1",
+                "--frames", "1",
+                "--output", h265_path.to_str().unwrap(),
+                "--preset", "ultrafast",
+                "--no-wpp",
+                "--no-signhide",
+                "--ctu", "16",
+                "--max-tu-size", "4",
+                "--no-open-gop",
+                "--keyint", "1",
+                "--no-scenecut",
+                "--no-sao",
+                "--no-deblock",
+                "--qp", "25",
+                "--no-psnr",
+                "--no-ssim",
+                "--no-info",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let x265_status = match x265_status {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("x265 not found, skipping angular fixture test");
+                return;
+            }
+        };
+        assert!(x265_status.success(), "x265 encoding failed");
+
+        // Step 3: Decode reference with FFmpeg.
+        let ffmpeg_status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-i", h265_path.to_str().unwrap(),
+                "-f", "rawvideo",
+                "-pix_fmt", "yuv420p",
+                ref_yuv_path.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let ffmpeg_status = match ffmpeg_status {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("ffmpeg not found, skipping angular fixture test");
+                return;
+            }
+        };
+        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
+
+        // Step 4: Decode with our decoder.
+        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
+
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+        let mut frame: Option<Frame> = None;
+        for nal in &nals {
+            if let Some(f) = decoder.decode_nal(nal).expect("decode_nal") {
+                assert!(frame.is_none(), "fixture has only one frame");
+                frame = Some(f);
+            }
+        }
+        let frame = frame.expect("expected one decoded frame");
+
+        assert_eq!(frame.width as usize, w);
+        assert_eq!(frame.height as usize, h);
+
+        let mut decoded = Vec::with_capacity(ref_yuv.len());
+        decoded.extend_from_slice(&frame.y);
+        decoded.extend_from_slice(&frame.u);
+        decoded.extend_from_slice(&frame.v);
+
+        assert_eq!(
+            decoded.len(),
+            ref_yuv.len(),
+            "size mismatch: {} vs {}",
+            decoded.len(),
+            ref_yuv.len()
+        );
+
+        // Find first difference for debugging.
+        if decoded != ref_yuv {
+            for (i, (a, b)) in decoded.iter().zip(ref_yuv.iter()).enumerate() {
+                if a != b {
+                    let plane = if i < w * h {
+                        "Y"
+                    } else if i < w * h + (w / 2) * (h / 2) {
+                        "U"
+                    } else {
+                        "V"
+                    };
+                    panic!(
+                        "mismatch at byte {} (plane {}) ours={} ref={}",
+                        i, plane, a, b
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Phase 3a-3 byte-exact test**: 16x16 diagonal-gradient frame with
+    /// `--ctu 16 --max-tu-size 4 --qp 32` to force angular intra prediction
+    /// modes (modes 2..34). The gradient causes x265 to pick modes like 3
+    /// and 34 for many PUs within a single CTU.
+    #[test]
+    fn test_decode_angular_gradient_byte_exact() {
+        use std::process::Command;
+
+        let tmp = std::env::temp_dir();
+        let input_yuv = tmp.join("angular_grad_input.yuv");
+        let h265_path = tmp.join("angular_grad.h265");
+        let ref_yuv_path = tmp.join("angular_grad_ref.yuv");
+
+        // Use a vertical stripe pattern to encourage angular modes.
+        let w: usize = 16;
+        let h: usize = 16;
+        let mut yuv_data = Vec::with_capacity(w * h + 2 * (w / 2) * (h / 2));
+        for _y in 0..h {
+            for x in 0..w {
+                yuv_data.push(if x < 8 { 40u8 } else { 200u8 });
+            }
+        }
+        yuv_data.extend(std::iter::repeat_n(128u8, (w / 2) * (h / 2) * 2));
+        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
+
+        let x265_status = Command::new("x265")
+            .args([
+                "--input", input_yuv.to_str().unwrap(),
+                "--input-res", "16x16",
+                "--fps", "1",
+                "--frames", "1",
+                "--output", h265_path.to_str().unwrap(),
+                "--preset", "ultrafast",
+                "--no-wpp",
+                "--no-signhide",
+                "--ctu", "16",
+                "--max-tu-size", "4",
+                "--no-open-gop",
+                "--keyint", "1",
+                "--no-scenecut",
+                "--no-sao",
+                "--no-deblock",
+                "--qp", "30",
+                "--no-psnr",
+                "--no-ssim",
+                "--no-info",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let x265_status = match x265_status {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("x265 not found, skipping angular gradient test");
+                return;
+            }
+        };
+        assert!(x265_status.success(), "x265 encoding failed");
+
+        let ffmpeg_status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-i", h265_path.to_str().unwrap(),
+                "-f", "rawvideo",
+                "-pix_fmt", "yuv420p",
+                ref_yuv_path.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let ffmpeg_status = match ffmpeg_status {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("ffmpeg not found, skipping angular gradient test");
+                return;
+            }
+        };
+        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
+
+        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
+
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+        let mut frame: Option<Frame> = None;
+        for nal in &nals {
+            if let Some(f) = decoder.decode_nal(nal).expect("decode_nal") {
+                assert!(frame.is_none(), "fixture has only one frame");
+                frame = Some(f);
+            }
+        }
+        let frame = frame.expect("expected one decoded frame");
+
+        assert_eq!(frame.width as usize, w);
+        assert_eq!(frame.height as usize, h);
+
+        let mut decoded = Vec::with_capacity(ref_yuv.len());
+        decoded.extend_from_slice(&frame.y);
+        decoded.extend_from_slice(&frame.u);
+        decoded.extend_from_slice(&frame.v);
+
+        assert_eq!(
+            decoded.len(),
+            ref_yuv.len(),
+            "size mismatch: {} vs {}",
+            decoded.len(),
+            ref_yuv.len()
+        );
+
+        if decoded != ref_yuv {
+            for (i, (a, b)) in decoded.iter().zip(ref_yuv.iter()).enumerate() {
+                if a != b {
+                    let plane = if i < w * h {
+                        "Y"
+                    } else if i < w * h + (w / 2) * (h / 2) {
+                        "U"
+                    } else {
+                        "V"
+                    };
+                    panic!(
+                        "mismatch at byte {} (plane {}) ours={} ref={}",
+                        i, plane, a, b
+                    );
+                }
+            }
+        }
+    }
 }

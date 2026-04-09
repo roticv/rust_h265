@@ -13,7 +13,8 @@ use crate::cabac::{CabacContexts, CabacReader};
 use crate::cabac_tables::ctx;
 use crate::error::DecodeError;
 use crate::intra_pred::{
-    add_residual, build_reference_samples, predict_dc, predict_planar, ReferenceAvailability,
+    add_residual, build_reference_samples, filter_reference_samples, predict_angular, predict_dc,
+    predict_planar, ReferenceAvailability,
 };
 use crate::inverse_transform::apply_inverse_transform;
 use crate::pps::Pps;
@@ -373,11 +374,14 @@ fn decode_coding_unit(
         slice_qp_y,
         x0,
         y0,
+        x0,
+        y0,
         log2_cb_size,
         log2_cb_size,
         0,
         max_trafo_depth,
         intra_split,
+        0,
         TransformTreeCbf::default(),
     )?;
 
@@ -409,11 +413,14 @@ fn decode_transform_tree(
     slice_qp_y: i32,
     x0: u32,
     y0: u32,
+    x_base: u32,
+    y_base: u32,
     log2_cb_size: u8,
     log2_trafo_size: u8,
     trafo_depth: u8,
     max_trafo_depth: u32,
     intra_split: bool,
+    blk_idx: u8,
     parent_cbf: TransformTreeCbf,
 ) -> Result<TransformTreeCbf, DecodeError> {
     // 1) Decide split_transform_flag (FFmpeg `hls_transform_tree` lines 1566-1580).
@@ -460,83 +467,35 @@ fn decode_transform_tree(
         let y1 = y0 + trafo_size_split;
         let mut child_cbf = inherited;
         child_cbf = decode_transform_tree(
-            cabac,
-            contexts,
-            state,
-            sps,
-            pps,
-            slice_qp_y,
-            x0,
-            y0,
-            log2_cb_size,
-            log2_trafo_size - 1,
-            trafo_depth + 1,
-            max_trafo_depth,
-            intra_split,
-            child_cbf,
+            cabac, contexts, state, sps, pps, slice_qp_y,
+            x0, y0, x0, y0,
+            log2_cb_size, log2_trafo_size - 1, trafo_depth + 1,
+            max_trafo_depth, intra_split, 0, child_cbf,
         )?;
         child_cbf = decode_transform_tree(
-            cabac,
-            contexts,
-            state,
-            sps,
-            pps,
-            slice_qp_y,
-            x1,
-            y0,
-            log2_cb_size,
-            log2_trafo_size - 1,
-            trafo_depth + 1,
-            max_trafo_depth,
-            intra_split,
-            child_cbf,
+            cabac, contexts, state, sps, pps, slice_qp_y,
+            x1, y0, x0, y0,
+            log2_cb_size, log2_trafo_size - 1, trafo_depth + 1,
+            max_trafo_depth, intra_split, 1, child_cbf,
         )?;
         child_cbf = decode_transform_tree(
-            cabac,
-            contexts,
-            state,
-            sps,
-            pps,
-            slice_qp_y,
-            x0,
-            y1,
-            log2_cb_size,
-            log2_trafo_size - 1,
-            trafo_depth + 1,
-            max_trafo_depth,
-            intra_split,
-            child_cbf,
+            cabac, contexts, state, sps, pps, slice_qp_y,
+            x0, y1, x0, y0,
+            log2_cb_size, log2_trafo_size - 1, trafo_depth + 1,
+            max_trafo_depth, intra_split, 2, child_cbf,
         )?;
         let final_cbf = decode_transform_tree(
-            cabac,
-            contexts,
-            state,
-            sps,
-            pps,
-            slice_qp_y,
-            x1,
-            y1,
-            log2_cb_size,
-            log2_trafo_size - 1,
-            trafo_depth + 1,
-            max_trafo_depth,
-            intra_split,
-            child_cbf,
+            cabac, contexts, state, sps, pps, slice_qp_y,
+            x1, y1, x0, y0,
+            log2_cb_size, log2_trafo_size - 1, trafo_depth + 1,
+            max_trafo_depth, intra_split, 3, child_cbf,
         )?;
         Ok(final_cbf)
     } else {
         decode_transform_unit(
-            cabac,
-            contexts,
-            state,
-            sps,
-            pps,
-            slice_qp_y,
-            x0,
-            y0,
-            log2_trafo_size,
-            trafo_depth,
-            inherited,
+            cabac, contexts, state, sps, pps, slice_qp_y,
+            x0, y0, x_base, y_base,
+            log2_trafo_size, trafo_depth, blk_idx, inherited,
         )
     }
 }
@@ -612,13 +571,16 @@ fn decode_transform_unit(
     slice_qp_y: i32,
     x0: u32,
     y0: u32,
+    x_base: u32,
+    y_base: u32,
     log2_trafo_size: u8,
     trafo_depth: u8,
+    blk_idx: u8,
     inherited: TransformTreeCbf,
 ) -> Result<TransformTreeCbf, DecodeError> {
     // ---- Step 1: luma intra prediction (always for the I-slice intra path).
     let luma_mode = state.last_luma_pred_mode;
-    predict_intra_luma(state, x0, y0, log2_trafo_size, luma_mode)?;
+    predict_intra_luma(state, sps, x0, y0, log2_trafo_size, luma_mode)?;
 
     // ---- Step 2: cbf_luma decode.
     // FFmpeg gates cbf_luma decoding behind:
@@ -628,7 +590,13 @@ fn decode_transform_unit(
     state.last_cbf_luma = cbf_luma;
 
     let mut new_cbf = inherited;
-    let do_chroma = sps.chroma_format_idc == 1 && log2_trafo_size > 2;
+    // For 4:2:0, chroma is handled at log2_trafo_size > 2. When log2_trafo_size
+    // == 2 (4x4 luma TUs), chroma is deferred to blk_idx==3 where it's handled
+    // at the parent TU size (xBase, yBase, log2_trafo_size == parent's log2-1).
+    let do_chroma_inline = sps.chroma_format_idc == 1 && log2_trafo_size > 2;
+    let do_chroma_deferred = sps.chroma_format_idc == 1
+        && log2_trafo_size == 2
+        && blk_idx == 3;
 
     if cbf_luma || inherited.cbf_cb || inherited.cbf_cr {
         // cu_qp_delta is decoded once per CU, the first time we see a TU
@@ -676,19 +644,32 @@ fn decode_transform_unit(
         }
 
         // ---- Step 4: chroma intra prediction + (optional) residual.
-        if do_chroma {
+        if do_chroma_inline {
             let chroma_mode = state.last_chroma_pred_mode;
-            predict_intra_chroma(state, x0, y0, log2_trafo_size - 1, chroma_mode)?;
+            predict_intra_chroma(state, sps, x0, y0, log2_trafo_size - 1, chroma_mode)?;
+            if inherited.cbf_cb || inherited.cbf_cr {
+                return Err(DecodeError::Unsupported(
+                    "chroma residual_coding not yet implemented",
+                ));
+            }
+        } else if do_chroma_deferred {
+            // For 4:2:0 with 4x4 luma TUs, chroma prediction happens at blk_idx==3
+            // using the parent TU coordinates (xBase, yBase) at log2_trafo_size.
+            let chroma_mode = state.last_chroma_pred_mode;
+            predict_intra_chroma(state, sps, x_base, y_base, log2_trafo_size, chroma_mode)?;
             if inherited.cbf_cb || inherited.cbf_cr {
                 return Err(DecodeError::Unsupported(
                     "chroma residual_coding not yet implemented",
                 ));
             }
         }
-    } else if do_chroma {
+    } else if do_chroma_inline {
         // Intra CU with no CBFs at all — still need chroma prediction.
         let chroma_mode = state.last_chroma_pred_mode;
-        predict_intra_chroma(state, x0, y0, log2_trafo_size - 1, chroma_mode)?;
+        predict_intra_chroma(state, sps, x0, y0, log2_trafo_size - 1, chroma_mode)?;
+    } else if do_chroma_deferred {
+        let chroma_mode = state.last_chroma_pred_mode;
+        predict_intra_chroma(state, sps, x_base, y_base, log2_trafo_size, chroma_mode)?;
     }
 
     Ok(new_cbf)
@@ -698,6 +679,7 @@ fn decode_transform_unit(
 /// Writes the prediction into `state.y_plane` at `(x0, y0)`.
 fn predict_intra_luma(
     state: &mut PictureState,
+    sps: &Sps,
     x0: u32,
     y0: u32,
     log2_size: u8,
@@ -707,7 +689,7 @@ fn predict_intra_luma(
     let pic_w = state.width as usize;
     let pic_h = state.height as usize;
     let avail = compute_luma_avail(state, x0, y0, size as u32);
-    let (top, left) = build_reference_samples(
+    let (mut top, mut left) = build_reference_samples(
         &state.y_plane,
         state.y_stride,
         pic_w,
@@ -719,6 +701,19 @@ fn predict_intra_luma(
         avail,
     );
 
+    // Reference sample filtering for angular modes (not needed for PLANAR/DC).
+    if (2..=34).contains(&mode) {
+        filter_reference_samples(
+            &mut top,
+            &mut left,
+            log2_size,
+            mode,
+            sps.strong_intra_smoothing_enabled_flag,
+            0, // c_idx = 0 (luma)
+            sps.chroma_format_idc,
+        );
+    }
+
     let dst_stride = state.y_stride;
     let dst_offset = (y0 as usize) * dst_stride + (x0 as usize);
     let dst = &mut state.y_plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
@@ -726,12 +721,9 @@ fn predict_intra_luma(
     match mode {
         0 => predict_planar(dst, dst_stride, &top, &left, log2_size),
         1 => predict_dc(dst, dst_stride, &top, &left, log2_size, true),
-        m => {
-            return Err(DecodeError::Unsupported(if m < 35 {
-                "angular intra prediction not yet implemented"
-            } else {
-                "invalid intra prediction mode"
-            }));
+        2..=34 => predict_angular(dst, dst_stride, &top, &left, log2_size, mode, 0),
+        _ => {
+            return Err(DecodeError::Unsupported("invalid intra prediction mode"));
         }
     }
     Ok(())
@@ -794,6 +786,7 @@ fn compute_luma_avail(state: &PictureState, x0: u32, y0: u32, size: u32) -> Refe
 /// by `hshift = vshift = 1` for 4:2:0.
 fn predict_intra_chroma(
     state: &mut PictureState,
+    sps: &Sps,
     x0_luma: u32,
     y0_luma: u32,
     log2_size: u8,
@@ -808,7 +801,8 @@ fn predict_intra_chroma(
     let dst_stride = state.uv_stride;
 
     for plane_idx in 0..2 {
-        let (top, left) = {
+        let c_idx = (plane_idx + 1) as u8; // 1 = Cb, 2 = Cr
+        let (mut top, mut left) = {
             let src_plane = if plane_idx == 0 {
                 &state.u_plane
             } else {
@@ -826,6 +820,20 @@ fn predict_intra_chroma(
                 avail,
             )
         };
+
+        // Reference sample filtering for angular chroma modes.
+        if (2..=34).contains(&mode) {
+            filter_reference_samples(
+                &mut top,
+                &mut left,
+                log2_size,
+                mode,
+                sps.strong_intra_smoothing_enabled_flag,
+                c_idx,
+                sps.chroma_format_idc,
+            );
+        }
+
         let plane = if plane_idx == 0 {
             &mut state.u_plane
         } else {
@@ -836,12 +844,9 @@ fn predict_intra_chroma(
         match mode {
             0 => predict_planar(dst, dst_stride, &top, &left, log2_size),
             1 => predict_dc(dst, dst_stride, &top, &left, log2_size, false),
-            m => {
-                return Err(DecodeError::Unsupported(if m < 35 {
-                    "angular intra prediction not yet implemented"
-                } else {
-                    "invalid intra prediction mode"
-                }));
+            2..=34 => predict_angular(dst, dst_stride, &top, &left, log2_size, mode, c_idx),
+            _ => {
+                return Err(DecodeError::Unsupported("invalid intra prediction mode"));
             }
         }
     }

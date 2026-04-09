@@ -339,4 +339,96 @@ mod tests {
         idct_16x16(&mut b, 8);
         assert_eq!(a, b, "full 16x16 IDCT should match DC fast path on DC-only input");
     }
+
+    /// Verify 4x4 DST against direct matrix multiplication.
+    /// The HEVC 4x4 DST matrix (spec 8.6.4.2) is:
+    ///   { 29, 55, 74, 84 }
+    ///   { 74, 74,  0,-74 }
+    ///   { 84,-29,-74, 55 }
+    ///   { 55,-84, 74,-29 }
+    /// The inverse DST: x = M^T * C * M (with appropriate scaling).
+    #[test]
+    fn test_dst_4x4_matrix_verify() {
+        // DST matrix rows
+        let m: [[i32; 4]; 4] = [
+            [29, 55, 74, 84],
+            [74, 74, 0, -74],
+            [84, -29, -74, 55],
+            [55, -84, 74, -29],
+        ];
+
+        // Input: single coefficient at (0,0)
+        let input_coeff: i16 = 100;
+        let mut coeffs = vec![0i16; 16];
+        coeffs[0] = input_coeff;
+
+        // Our DST
+        let mut our_result = coeffs.clone();
+        transform_4x4_luma(&mut our_result, 8);
+
+        // Matrix multiplication: inverse = M^T * C * M / (128 * 4096)
+        // Actually, the two-pass inverse DST with shifts 7 and 12 is:
+        // Pass 1 (cols): tmp[i][j] = (sum_k M[k][i]*C[k][j] + 64) >> 7
+        //   (M transposed applied to columns)
+        // Pass 2 (rows): out[i][j] = (sum_k M[k][j]*tmp[i][k] + 2048) >> 12
+        //   (M transposed applied to rows)
+        let mut tmp = [[0i32; 4]; 4];
+        for j in 0..4 {
+            for i in 0..4 {
+                let mut s = 0i32;
+                for k in 0..4 {
+                    s += m[k][i] * coeffs[k * 4 + j] as i32;
+                }
+                tmp[i][j] = (s + 64) >> 7;
+            }
+        }
+        let mut expected = vec![0i16; 16];
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut s = 0i32;
+                for k in 0..4 {
+                    s += m[k][j] * tmp[i][k];
+                }
+                expected[i * 4 + j] = ((s + 2048) >> 12).clamp(-32768, 32767) as i16;
+            }
+        }
+
+        assert_eq!(
+            our_result, expected,
+            "DST butterfly output doesn't match matrix multiplication\nOurs: {:?}\nExpected: {:?}",
+            our_result, expected
+        );
+
+        // Also test with coefficient at (1,2) = row 2, col 1
+        let mut coeffs2 = vec![0i16; 16];
+        coeffs2[2 * 4 + 1] = 200;
+        let mut our_result2 = coeffs2.clone();
+        transform_4x4_luma(&mut our_result2, 8);
+
+        let mut tmp2 = [[0i32; 4]; 4];
+        for j in 0..4 {
+            for i in 0..4 {
+                let mut s = 0i32;
+                for k in 0..4 {
+                    s += m[k][i] * coeffs2[k * 4 + j] as i32;
+                }
+                tmp2[i][j] = (s + 64) >> 7;
+            }
+        }
+        let mut expected2 = vec![0i16; 16];
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut s = 0i32;
+                for k in 0..4 {
+                    s += m[k][j] * tmp2[i][k];
+                }
+                expected2[i * 4 + j] = ((s + 2048) >> 12).clamp(-32768, 32767) as i16;
+            }
+        }
+        assert_eq!(
+            our_result2, expected2,
+            "DST non-DC test failed\nOurs: {:?}\nExpected: {:?}",
+            our_result2, expected2
+        );
+    }
 }

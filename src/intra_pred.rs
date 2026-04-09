@@ -276,6 +276,281 @@ pub fn predict_dc(
     }
 }
 
+/// Angular intra prediction (modes 2..34) (spec 8.4.4.2.6 / FFmpeg
+/// `pred_angular`).
+///
+/// `top` / `left` use the same layout as `predict_planar`: index 0 = corner
+/// sample p[-1][-1], indices 1..=2*size = neighbors / extensions.
+///
+/// `c_idx` is 0 for luma (needed for the boundary smoothing of pure
+/// horizontal/vertical modes).
+pub fn predict_angular(
+    dst: &mut [u8],
+    dst_stride: usize,
+    top: &[u8],
+    left: &[u8],
+    log2_size: u8,
+    mode: u8,
+    c_idx: u8,
+) {
+    debug_assert!((2..=34).contains(&mode));
+
+    let size = 1usize << log2_size;
+
+    // Angle tables — indexed by (mode - 2).
+    static INTRA_PRED_ANGLE: [i32; 33] = [
+        32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26, -32,
+        -26, -21, -17, -13, -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32,
+    ];
+    // Inverse angle table — indexed by (mode - 11) for modes 11..25 (the 15
+    // modes with negative angles).
+    static INV_ANGLE: [i32; 15] = [
+        -4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390, -482,
+        -630, -910, -1638, -4096,
+    ];
+
+    let angle = INTRA_PRED_ANGLE[(mode - 2) as usize];
+    let last = ((size as i32) * angle) >> 5;
+
+    // FFmpeg's `top` pointer starts at p[0..], i.e. one past the corner.
+    // Our arrays have index 0 = corner, so top_p / left_p skip index 0.
+    let top_p = &top[1..]; // top_p[i] = p[i][-1], top_p[-1] conceptually = top[0] = corner
+    let left_p = &left[1..]; // left_p[i] = p[-1][i]
+    let corner = top[0]; // p[-1][-1]
+
+    if mode >= 18 {
+        // ---- Horizontal-like: iterate y (rows), index into top ref ----
+        // Build ref array. In FFmpeg: ref = top - 1, so ref[0] = corner,
+        // ref[1] = top[0], ..., ref[size] = top[size-1].
+        // For negative angles, left samples are projected into negative indices.
+        // For positive angles, max access = ref[size-1 + last + 2], so we
+        // need ref[0..=2*size] (i.e., corner + 2*size top samples).
+        let mut ref_buf = vec![0u8; 3 * size + 4];
+        let ref_origin = size; // ref_buf[ref_origin] corresponds to ref[0]
+
+        // Copy: ref[0] = corner, ref[1..=2*size] = top[0..2*size-1]
+        ref_buf[ref_origin] = corner;
+        for i in 0..2 * size {
+            ref_buf[ref_origin + 1 + i] = top_p[i];
+        }
+
+        if angle < 0 && last < -1 {
+            // Project left samples into negative ref positions.
+            for x in last..=-1 {
+                let left_idx =
+                    -1 + ((x * INV_ANGLE[(mode - 11) as usize] + 128) >> 8);
+                ref_buf[(ref_origin as i32 + x) as usize] =
+                    left_p[left_idx as usize];
+            }
+        }
+
+        for y in 0..size {
+            let idx = (((y + 1) as i32) * angle) >> 5;
+            let fact = (((y + 1) as i32) * angle) & 31;
+            if fact != 0 {
+                for x in 0..size {
+                    let ri = (ref_origin as i32 + x as i32 + idx + 1) as usize;
+                    dst[y * dst_stride + x] = (((32 - fact) * ref_buf[ri] as i32
+                        + fact * ref_buf[ri + 1] as i32
+                        + 16)
+                        >> 5) as u8;
+                }
+            } else {
+                for x in 0..size {
+                    let ri = (ref_origin as i32 + x as i32 + idx + 1) as usize;
+                    dst[y * dst_stride + x] = ref_buf[ri];
+                }
+            }
+        }
+
+        // Mode 26 (pure vertical) luma boundary filter.
+        if mode == 26 && c_idx == 0 && size < 32 {
+            for y in 0..size {
+                let val =
+                    top_p[0] as i32 + ((left_p[y] as i32 - corner as i32) >> 1);
+                dst[y * dst_stride] = val.clamp(0, 255) as u8;
+            }
+        }
+    } else {
+        // ---- Vertical-like (modes 2..17): iterate x (cols), index into left ref ----
+        // Same sizing as above: need ref[0..=2*size] elements.
+        let mut ref_buf = vec![0u8; 3 * size + 4];
+        let ref_origin = size;
+
+        // ref[0] = corner, ref[1..=2*size] = left[0..2*size-1]
+        ref_buf[ref_origin] = corner;
+        for i in 0..2 * size {
+            ref_buf[ref_origin + 1 + i] = left_p[i];
+        }
+
+        if angle < 0 && last < -1 {
+            for x in last..=-1 {
+                let top_idx =
+                    -1 + ((x * INV_ANGLE[(mode - 11) as usize] + 128) >> 8);
+                ref_buf[(ref_origin as i32 + x) as usize] =
+                    top_p[top_idx as usize];
+            }
+        }
+
+        for x in 0..size {
+            let idx = (((x + 1) as i32) * angle) >> 5;
+            let fact = (((x + 1) as i32) * angle) & 31;
+            if fact != 0 {
+                for y in 0..size {
+                    let ri = (ref_origin as i32 + y as i32 + idx + 1) as usize;
+                    dst[y * dst_stride + x] = (((32 - fact) * ref_buf[ri] as i32
+                        + fact * ref_buf[ri + 1] as i32
+                        + 16)
+                        >> 5) as u8;
+                }
+            } else {
+                for y in 0..size {
+                    let ri = (ref_origin as i32 + y as i32 + idx + 1) as usize;
+                    dst[y * dst_stride + x] = ref_buf[ri];
+                }
+            }
+        }
+
+        // Mode 10 (pure horizontal) luma boundary filter.
+        if mode == 10 && c_idx == 0 && size < 32 {
+            for x in 0..size {
+                let val =
+                    left_p[0] as i32 + ((top_p[x] as i32 - corner as i32) >> 1);
+                dst[x] = val.clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+/// Reference sample filtering for angular modes (spec 8.4.4.2.3 /
+/// FFmpeg `intra_pred` lines 291-329).
+///
+/// Applies the [1,2,1]/4 smoothing filter (or strong intra smoothing for
+/// 32x32 luma) to `top` and `left` **in place** when the mode / size /
+/// distance criteria are met. Must be called BEFORE the prediction function
+/// for modes 2..34. Not needed for PLANAR (mode 0) or DC (mode 1).
+///
+/// `c_idx` = 0 for luma. `strong_intra_smoothing_enabled` comes from SPS.
+/// `chroma_format_idc` comes from SPS (1 = 4:2:0, 3 = 4:4:4).
+///
+/// Note: intra_smoothing_disabled is always false for our supported streams
+/// (it's not even exposed in the SPS we parse).
+#[allow(clippy::too_many_arguments)]
+pub fn filter_reference_samples(
+    top: &mut Vec<u8>,
+    left: &mut Vec<u8>,
+    log2_size: u8,
+    mode: u8,
+    strong_intra_smoothing_enabled: bool,
+    c_idx: u8,
+    chroma_format_idc: u32,
+) {
+    let size = 1usize << log2_size;
+
+    // Only filter for non-DC modes and sizes > 4.
+    if mode == 1 || size == 4 {
+        return;
+    }
+
+    // Only filter luma (c_idx == 0) or 4:4:4 chroma (chroma_format_idc == 3).
+    if c_idx != 0 && chroma_format_idc != 3 {
+        return;
+    }
+
+    // Distance threshold check.
+    static INTRA_HOR_VER_DIST_THRESH: [i32; 3] = [7, 1, 0];
+    let thresh_idx = (log2_size as usize).saturating_sub(3);
+    if thresh_idx >= INTRA_HOR_VER_DIST_THRESH.len() {
+        return; // shouldn't happen for valid log2_size
+    }
+    let min_dist_vert_hor = ((mode as i32) - 26).abs().min(((mode as i32) - 10).abs());
+    if min_dist_vert_hor <= INTRA_HOR_VER_DIST_THRESH[thresh_idx] {
+        return;
+    }
+
+    // Index convention: top[0] = left[0] = corner (p[-1][-1]).
+    // top[1..=2*size] = p[0..2*size-1][-1]
+    // left[1..=2*size] = p[-1][0..2*size-1]
+    //
+    // FFmpeg's pointers are offset by 1, so FFmpeg's top[-1] = our top[0],
+    // FFmpeg's top[i] = our top[i+1], etc.
+
+    // Strong intra smoothing for 32x32 luma.
+    if strong_intra_smoothing_enabled && c_idx == 0 && log2_size == 5 {
+        // threshold = 1 << (BitDepth - 5) = 1 << 3 = 8 for 8-bit
+        let threshold = 1i32 << 3; // 8-bit only for now
+        let top_smooth = (top[0] as i32 + top[2 * size] as i32
+            - 2 * top[size] as i32)
+            .abs()
+            < threshold;
+        let left_smooth = (left[0] as i32 + left[2 * size] as i32
+            - 2 * left[size] as i32)
+            .abs()
+            < threshold;
+        if top_smooth && left_smooth {
+            // Strong smoothing: linear interpolation between corner and edge.
+            let mut filtered_top = vec![0u8; 2 * size + 1];
+            filtered_top[0] = top[0]; // corner
+            filtered_top[2 * size] = top[2 * size]; // far end
+            for i in 0..(2 * size - 1) {
+                // FFmpeg: filtered_top[i] = ((64 - (i+1)) * top[-1] + (i+1) * top[63] + 32) >> 6
+                // Our top[-1] = top[0], top[63] = top[2*size] = top[64]
+                filtered_top[i + 1] = (((64 - (i + 1) as i32) * top[0] as i32
+                    + (i + 1) as i32 * top[2 * size] as i32
+                    + 32)
+                    >> 6) as u8;
+            }
+            // Left: done in place (FFmpeg writes to left[] directly for strong smoothing).
+            let left_corner = left[0];
+            let left_end = left[2 * size];
+            for i in 0..(2 * size - 1) {
+                left[i + 1] = (((64 - (i + 1) as i32) * left_corner as i32
+                    + (i + 1) as i32 * left_end as i32
+                    + 32)
+                    >> 6) as u8;
+            }
+            // Replace top with filtered version.
+            *top = filtered_top;
+            return;
+        }
+    }
+
+    // Normal [1,2,1]/4 smoothing.
+    let mut filtered_top = vec![0u8; 2 * size + 1];
+    let mut filtered_left = vec![0u8; 2 * size + 1];
+
+    // Last element stays unchanged.
+    filtered_top[2 * size] = top[2 * size];
+    filtered_left[2 * size] = left[2 * size];
+
+    // Interior samples (FFmpeg iterates from 2*size-2 down to 0).
+    // filtered_top[i] = (top[i+1] + 2*top[i] + top[i-1] + 2) >> 2
+    // But our indexing is shifted: FFmpeg's top[i] = our top[i+1].
+    // So for our arrays, we filter indices 1..=(2*size-1):
+    //   filtered_top[k] = (top[k+1] + 2*top[k] + top[k-1] + 2) >> 2  for k = 1..2*size-1
+    for k in (1..2 * size).rev() {
+        filtered_top[k] = ((top[k + 1] as i32 + 2 * top[k] as i32
+            + top[k - 1] as i32
+            + 2)
+            >> 2) as u8;
+        filtered_left[k] = ((left[k + 1] as i32 + 2 * left[k] as i32
+            + left[k - 1] as i32
+            + 2)
+            >> 2) as u8;
+    }
+
+    // Corner: (left[1] + 2*corner + top[1] + 2) >> 2
+    // In our layout: left[0] is corner, left[1] is first left neighbor,
+    // top[1] is first top neighbor.
+    let new_corner =
+        ((left[1] as i32 + 2 * left[0] as i32 + top[1] as i32 + 2) >> 2) as u8;
+    filtered_top[0] = new_corner;
+    filtered_left[0] = new_corner;
+
+    *top = filtered_top;
+    *left = filtered_left;
+}
+
 /// Add a residual block to a prediction in place, clipping to `[0, 255]`.
 /// `residual` and `dst` are the same shape (`size * size`); `dst_stride` is
 /// the row stride of `dst`. Used by callers to combine the intra prediction

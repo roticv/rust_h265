@@ -78,12 +78,74 @@ const DIAG_SCAN_4X4_INV: [[u8; 4]; 4] = [
     [ 6, 10, 13, 15],
 ];
 
+/// 4×4 horizontal scan order: x coordinates (row by row).
+#[rustfmt::skip]
+const HORIZ_SCAN_4X4_X: [u8; 16] = [
+    0, 1, 2, 3,
+    0, 1, 2, 3,
+    0, 1, 2, 3,
+    0, 1, 2, 3,
+];
+/// 4×4 horizontal scan order: y coordinates.
+#[rustfmt::skip]
+const HORIZ_SCAN_4X4_Y: [u8; 16] = [
+    0, 0, 0, 0,
+    1, 1, 1, 1,
+    2, 2, 2, 2,
+    3, 3, 3, 3,
+];
+/// 4×4 horizontal scan inverse: `(y, x) → scan_pos`.
+#[rustfmt::skip]
+const HORIZ_SCAN_4X4_INV: [[u8; 4]; 4] = [
+    [ 0,  1,  2,  3],
+    [ 4,  5,  6,  7],
+    [ 8,  9, 10, 11],
+    [12, 13, 14, 15],
+];
+
+/// 4×4 vertical scan order: x coordinates (column by column).
+#[rustfmt::skip]
+const VERT_SCAN_4X4_X: [u8; 16] = [
+    0, 0, 0, 0,
+    1, 1, 1, 1,
+    2, 2, 2, 2,
+    3, 3, 3, 3,
+];
+/// 4×4 vertical scan order: y coordinates.
+#[rustfmt::skip]
+const VERT_SCAN_4X4_Y: [u8; 16] = [
+    0, 1, 2, 3,
+    0, 1, 2, 3,
+    0, 1, 2, 3,
+    0, 1, 2, 3,
+];
+/// 4×4 vertical scan inverse: `(y, x) → scan_pos`.
+#[rustfmt::skip]
+const VERT_SCAN_4X4_INV: [[u8; 4]; 4] = [
+    [ 0,  4,  8, 12],
+    [ 1,  5,  9, 13],
+    [ 2,  6, 10, 14],
+    [ 3,  7, 11, 15],
+];
+
 /// 2×2 diagonal scan order: x coordinates.
 const DIAG_SCAN_2X2_X: [u8; 4] = [0, 0, 1, 1];
 /// 2×2 diagonal scan order: y coordinates.
 const DIAG_SCAN_2X2_Y: [u8; 4] = [0, 1, 0, 1];
 /// 2×2 diagonal scan inverse: `(y, x) → scan_pos`.
 const DIAG_SCAN_2X2_INV: [[u8; 2]; 2] = [[0, 2], [1, 3]];
+/// 2×2 horizontal scan order: x coordinates.
+const HORIZ_SCAN_2X2_X: [u8; 4] = [0, 1, 0, 1];
+/// 2×2 horizontal scan order: y coordinates.
+const HORIZ_SCAN_2X2_Y: [u8; 4] = [0, 0, 1, 1];
+/// 2×2 horizontal scan inverse: `(y, x) → scan_pos`.
+const HORIZ_SCAN_2X2_INV: [[u8; 2]; 2] = [[0, 1], [2, 3]];
+/// 2×2 vertical scan order: x coordinates.
+const VERT_SCAN_2X2_X: [u8; 4] = [0, 0, 1, 1];
+/// 2×2 vertical scan order: y coordinates.
+const VERT_SCAN_2X2_Y: [u8; 4] = [0, 1, 0, 1];
+/// 2×2 vertical scan inverse: `(y, x) → scan_pos`.
+const VERT_SCAN_2X2_INV: [[u8; 2]; 2] = [[0, 2], [1, 3]];
 
 /// 8×8 diagonal scan inverse: `(y, x) → scan_pos`.
 #[rustfmt::skip]
@@ -391,11 +453,8 @@ pub fn decode_residual_coding(
             "sign_data_hiding in residual_coding not supported",
         ));
     }
-    if scan_idx != ScanOrder::Diag {
-        return Err(DecodeError::Unsupported(
-            "non-diagonal scan in residual_coding not yet supported",
-        ));
-    }
+    // Horizontal and vertical scan orders are used for angular intra modes
+    // 6..14 (vert) and 22..30 (horiz) at log2_trafo_size <= 3.
 
     let trafo_size = 1usize << log2_trafo_size;
     let c_idx = plane.c_idx();
@@ -421,19 +480,49 @@ pub fn decode_residual_coding(
     {
         let last_x_c = (last_sig_x & 3) as usize;
         let last_y_c = (last_sig_y & 3) as usize;
-        scan_x_off = &DIAG_SCAN_4X4_X[..];
-        scan_y_off = &DIAG_SCAN_4X4_Y[..];
-        num_coeff = DIAG_SCAN_4X4_INV[last_y_c][last_x_c] as u32;
+        // Select 4x4 within-block scan based on scan_idx.
+        match scan_idx {
+            ScanOrder::Diag => {
+                scan_x_off = &DIAG_SCAN_4X4_X[..];
+                scan_y_off = &DIAG_SCAN_4X4_Y[..];
+                num_coeff = DIAG_SCAN_4X4_INV[last_y_c][last_x_c] as u32;
+            }
+            ScanOrder::Horiz => {
+                scan_x_off = &HORIZ_SCAN_4X4_X[..];
+                scan_y_off = &HORIZ_SCAN_4X4_Y[..];
+                num_coeff = HORIZ_SCAN_4X4_INV[last_y_c][last_x_c] as u32;
+            }
+            ScanOrder::Vert => {
+                scan_x_off = &VERT_SCAN_4X4_X[..];
+                scan_y_off = &VERT_SCAN_4X4_Y[..];
+                num_coeff = VERT_SCAN_4X4_INV[last_y_c][last_x_c] as u32;
+            }
+        }
+        // Select CG-level scan based on scan_idx and TU size.
         match trafo_size {
             4 => {
-                // 1×1 sub-block scan
+                // 1×1 sub-block scan — no CG scan needed.
                 scan_x_cg = &SCAN_1X1[..];
                 scan_y_cg = &SCAN_1X1[..];
             }
             8 => {
-                num_coeff += (DIAG_SCAN_2X2_INV[y_cg_last][x_cg_last] as u32) << 4;
-                scan_x_cg = &DIAG_SCAN_2X2_X[..];
-                scan_y_cg = &DIAG_SCAN_2X2_Y[..];
+                match scan_idx {
+                    ScanOrder::Diag => {
+                        num_coeff += (DIAG_SCAN_2X2_INV[y_cg_last][x_cg_last] as u32) << 4;
+                        scan_x_cg = &DIAG_SCAN_2X2_X[..];
+                        scan_y_cg = &DIAG_SCAN_2X2_Y[..];
+                    }
+                    ScanOrder::Horiz => {
+                        num_coeff += (HORIZ_SCAN_2X2_INV[y_cg_last][x_cg_last] as u32) << 4;
+                        scan_x_cg = &HORIZ_SCAN_2X2_X[..];
+                        scan_y_cg = &HORIZ_SCAN_2X2_Y[..];
+                    }
+                    ScanOrder::Vert => {
+                        num_coeff += (VERT_SCAN_2X2_INV[y_cg_last][x_cg_last] as u32) << 4;
+                        scan_x_cg = &VERT_SCAN_2X2_X[..];
+                        scan_y_cg = &VERT_SCAN_2X2_Y[..];
+                    }
+                }
             }
             16 => {
                 num_coeff += (DIAG_SCAN_4X4_INV[y_cg_last][x_cg_last] as u32) << 4;
