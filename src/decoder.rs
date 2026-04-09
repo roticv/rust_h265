@@ -778,4 +778,173 @@ mod tests {
             }
         }
     }
+
+    /// **Phase 3a-5 byte-exact test**: attempt to produce a PCM-bearing
+    /// bitstream via x265 `--pcm`. x265 is notoriously reluctant to choose
+    /// PCM over intra; on a flat-gray frame with a very high QP it *may*
+    /// decide the PCM cost is lower. If the resulting file ends up without
+    /// any `pcm_flag = 1` CUs we still get a useful byte-exact regression
+    /// test against FFmpeg for the non-PCM path with `pcm_enabled_flag = 1`
+    /// in the SPS — verifying that our updated SPS parser handles the flag
+    /// correctly. If x265 or ffmpeg isn't installed the test silently skips,
+    /// matching the convention of the other dynamic fixtures in this file.
+    ///
+    /// TODO: this doesn't guarantee the PCM *decode* path runs. The unit
+    /// tests in `cu_tree.rs` for `decode_pcm_block` and
+    /// `CabacReader::pcm_byte_position` cover that path synthetically
+    /// without needing a PCM-bearing fixture.
+    #[test]
+    fn test_decode_pcm_byte_exact() {
+        use std::process::Command;
+
+        let tmp = std::env::temp_dir();
+        let input_yuv = tmp.join("pcm_input.yuv");
+        let h265_path = tmp.join("pcm.h265");
+        let ref_yuv_path = tmp.join("pcm_ref.yuv");
+
+        // 16x16 "noise" pattern. Pure random data frustrates x265's RDO
+        // harder than a flat frame — making the PCM escape hatch more
+        // attractive. We use a deterministic xorshift so the fixture is
+        // reproducible across runs.
+        let w: usize = 16;
+        let h: usize = 16;
+        let mut yuv_data = Vec::with_capacity(w * h + 2 * (w / 2) * (h / 2));
+        let mut s: u32 = 0xdead_beef;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s as u8
+        };
+        for _ in 0..(w * h) {
+            yuv_data.push(next());
+        }
+        for _ in 0..(2 * (w / 2) * (h / 2)) {
+            yuv_data.push(next());
+        }
+        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
+
+        let x265_status = Command::new("x265")
+            .args([
+                "--input",
+                input_yuv.to_str().unwrap(),
+                "--input-res",
+                "16x16",
+                "--fps",
+                "1",
+                "--frames",
+                "1",
+                "--output",
+                h265_path.to_str().unwrap(),
+                "--preset",
+                "ultrafast",
+                "--no-wpp",
+                "--no-signhide",
+                "--ctu",
+                "16",
+                "--no-open-gop",
+                "--keyint",
+                "1",
+                "--no-scenecut",
+                "--no-sao",
+                "--no-deblock",
+                // Very high QP + --pcm nudges x265 into picking PCM for
+                // hard-to-predict blocks.
+                "--qp",
+                "51",
+                "--pcm",
+                "--no-psnr",
+                "--no-ssim",
+                "--no-info",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let x265_status = match x265_status {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("x265 not found, skipping PCM fixture test");
+                return;
+            }
+        };
+        if !x265_status.success() {
+            eprintln!("x265 encoding failed (perhaps the build lacks --pcm); skipping");
+            return;
+        }
+
+        let ffmpeg_status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-i",
+                h265_path.to_str().unwrap(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                ref_yuv_path.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let ffmpeg_status = match ffmpeg_status {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("ffmpeg not found, skipping PCM fixture test");
+                return;
+            }
+        };
+        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
+
+        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
+
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+        let mut frame: Option<Frame> = None;
+        for nal in &nals {
+            match decoder.decode_nal(nal) {
+                Ok(Some(f)) => {
+                    assert!(frame.is_none(), "fixture has only one frame");
+                    frame = Some(f);
+                }
+                Ok(None) => {}
+                Err(e) => panic!("decode_nal error: {e}"),
+            }
+        }
+        let frame = frame.expect("expected one decoded frame");
+
+        assert_eq!(frame.width as usize, w);
+        assert_eq!(frame.height as usize, h);
+
+        let mut decoded = Vec::with_capacity(ref_yuv.len());
+        decoded.extend_from_slice(&frame.y);
+        decoded.extend_from_slice(&frame.u);
+        decoded.extend_from_slice(&frame.v);
+
+        assert_eq!(
+            decoded.len(),
+            ref_yuv.len(),
+            "size mismatch: {} vs {}",
+            decoded.len(),
+            ref_yuv.len()
+        );
+
+        if decoded != ref_yuv {
+            for (i, (a, b)) in decoded.iter().zip(ref_yuv.iter()).enumerate() {
+                if a != b {
+                    let plane = if i < w * h {
+                        "Y"
+                    } else if i < w * h + (w / 2) * (h / 2) {
+                        "U"
+                    } else {
+                        "V"
+                    };
+                    panic!(
+                        "mismatch at byte {} (plane {}) ours={} ref={}",
+                        i, plane, a, b
+                    );
+                }
+            }
+        }
+    }
 }

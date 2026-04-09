@@ -192,6 +192,53 @@ impl<'a> CabacReader<'a> {
     pub fn position(&self) -> usize {
         self.pos
     }
+
+    /// Borrow the underlying RBSP byte slice (used by PCM sample decoding
+    /// after `pcm_byte_position` identifies where the raw bytes start).
+    pub fn rbsp(&self) -> &[u8] {
+        self.data
+    }
+
+    /// After decoding a `pcm_flag = 1` terminate bin, compute the byte offset
+    /// in the underlying RBSP where the first raw PCM byte lives. Mirrors
+    /// FFmpeg's `skip_bytes` (`libavcodec/cabac_functions.h`) which walks the
+    /// `bytestream` pointer back by up to two bytes based on the current
+    /// renormalization state (`low & 0x1` / `low & 0x1FF`).
+    ///
+    /// Background: `self.pos` is the byte CABAC would next refill from. But
+    /// because of the 16-bit buffered window and the post-decode
+    /// renormalization, anywhere from zero to two of those "already-consumed"
+    /// bytes are still sitting in `low` unused when the terminate bin fires.
+    /// Those unused bytes become the PCM byte stream; subtracting them from
+    /// `self.pos` gives the address of the first PCM byte.
+    pub fn pcm_byte_position(&self) -> usize {
+        let mut ptr = self.pos;
+        if self.low & 0x1 != 0 {
+            ptr -= 1;
+        }
+        // CABAC_BITS == 16 in our implementation, so the second check always
+        // applies (see FFmpeg's `#if CABAC_BITS == 16`).
+        if self.low & 0x1FF != 0 {
+            ptr -= 1;
+        }
+        ptr
+    }
+
+    /// Re-initialize the CABAC engine at a new byte offset. Used after the
+    /// PCM block's raw bytes have been consumed, to resume CABAC decoding at
+    /// the next byte boundary (HEVC spec 7.3.8.5 / FFmpeg `ff_init_cabac_decoder`).
+    pub fn reinit_at(&mut self, byte_offset: usize) {
+        assert!(
+            byte_offset + 2 <= self.data.len(),
+            "CABAC reinit needs at least 2 bytes"
+        );
+        let mut low: u32 = (self.data[byte_offset] as u32) << 18;
+        low = low.wrapping_add((self.data[byte_offset + 1] as u32) << 10);
+        low = low.wrapping_add(1 << 9);
+        self.low = low;
+        self.range = 0x1FE;
+        self.pos = byte_offset + 2;
+    }
 }
 
 /// Initialize a single CABAC context from a HEVC packed init value
@@ -402,5 +449,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `reinit_at` should reset the arithmetic engine to a fresh state,
+    /// equivalent to constructing a new `CabacReader` at the same offset.
+    #[test]
+    fn test_reinit_at_matches_fresh_new() {
+        let data = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67];
+        let mut a = CabacReader::new(&data, 0);
+        // Consume a few bypass bins to advance state.
+        let _ = a.decode_bypass_bits(4);
+        a.reinit_at(4);
+        let b = CabacReader::new(&data, 4);
+        assert_eq!(a.low, b.low);
+        assert_eq!(a.range, b.range);
+        assert_eq!(a.pos, b.pos);
     }
 }

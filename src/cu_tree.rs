@@ -349,10 +349,22 @@ fn decode_coding_unit(
         PartMode::Part2Nx2N
     };
 
-    if sps.pcm_enabled_flag {
-        // PCM is gated by SPS — we already rejected this in sps.rs, so
-        // hitting this branch means a programming error.
-        return Err(DecodeError::Unsupported("pcm_enabled_flag not supported"));
+    // PCM decode gate (spec 7.3.8.5 / FFmpeg `hls_coding_unit`). `pcm_flag`
+    // is signaled as a terminate bin only when:
+    //   - part_mode == PART_2Nx2N
+    //   - sps.pcm_enabled_flag
+    //   - log2_min_pcm_cb_size <= log2_cb_size <= log2_max_pcm_cb_size
+    let pcm_allowed = sps.pcm_enabled_flag
+        && part_mode == PartMode::Part2Nx2N
+        && log2_cb_size >= sps.log2_min_pcm_cb_size
+        && log2_cb_size <= sps.log2_max_pcm_cb_size;
+    if pcm_allowed && cabac.decode_terminate() != 0 {
+        // PCM block: skip intra prediction signaling, prediction, residual,
+        // and transform entirely. The raw PCM bytes follow `pcm_flag` at the
+        // next byte boundary; after consuming them CABAC is reinitialized.
+        decode_pcm_block(cabac, state, sps, x0, y0, log2_cb_size)?;
+        state.cu_count += 1;
+        return Ok(());
     }
 
     decode_intra_mode_signaling(cabac, contexts, state, x0, y0, log2_cb_size, part_mode)?;
@@ -386,6 +398,134 @@ fn decode_coding_unit(
 
     state.cu_count += 1;
     Ok(())
+}
+
+/// Decode a PCM (raw pixel) CU (HEVC spec 7.3.8.6 / FFmpeg `hls_pcm_sample`).
+///
+/// The PCM sample payload is bit-packed in the order Y, then Cb, then Cr.
+/// Total length in bits is
+///
+/// ```text
+///     cb_size * cb_size * pcm_bit_depth
+///   + 2 * (cb_size/2) * (cb_size/2) * pcm_bit_depth_chroma
+/// ```
+///
+/// and the CABAC engine is reinitialized at the next byte boundary afterwards.
+///
+/// Samples are stored scaled by `1 << (BitDepth - PcmBitDepth)` — i.e. the
+/// reconstructed picture's bit depth may be larger than the PCM sample bit
+/// depth, in which case PCM samples get left-shifted to match. We only
+/// support 8-bit reconstruction today so the shift is in [0, 7].
+fn decode_pcm_block(
+    cabac: &mut CabacReader,
+    state: &mut PictureState,
+    sps: &Sps,
+    x0: u32,
+    y0: u32,
+    log2_cb_size: u8,
+) -> Result<(), DecodeError> {
+    let cb_size = 1usize << log2_cb_size;
+    let pcm_bd_luma: u8 = sps.pcm_sample_bit_depth_luma;
+    let pcm_bd_chroma: u8 = sps.pcm_sample_bit_depth_chroma;
+    // `pcm_bit_depth` is guaranteed <= `bit_depth_luma/chroma` by sps.rs, so
+    // these shifts are in [0, 7] for 8-bit reconstruction.
+    let luma_shift: u8 = sps.bit_depth_luma - pcm_bd_luma;
+    let chroma_shift: u8 = sps.bit_depth_chroma - pcm_bd_chroma;
+
+    // Byte offset where the raw PCM bytes live.
+    let pcm_start = cabac.pcm_byte_position();
+
+    // Total payload length in bits (spec 7.3.8.6, 4:2:0 only).
+    let cb_chroma = cb_size / 2;
+    let length_bits = cb_size * cb_size * pcm_bd_luma as usize
+        + 2 * cb_chroma * cb_chroma * pcm_bd_chroma as usize;
+    let length_bytes = length_bits.div_ceil(8);
+
+    // Bounds check against the RBSP buffer.
+    if pcm_start + length_bytes > cabac.rbsp().len() {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    // Borrow once so we don't alias `cabac` across the read loop.
+    let pcm_bytes: Vec<u8> = cabac.rbsp()[pcm_start..pcm_start + length_bytes].to_vec();
+
+    let mut reader = PcmBitReader::new(&pcm_bytes);
+
+    // Luma plane write.
+    {
+        let stride = state.y_stride;
+        let dst_off = (y0 as usize) * stride + (x0 as usize);
+        for j in 0..cb_size {
+            for i in 0..cb_size {
+                let sample = reader.read_bits(pcm_bd_luma) as u8;
+                state.y_plane[dst_off + j * stride + i] = sample << luma_shift;
+            }
+        }
+    }
+
+    // Chroma planes (Cb, Cr). For 4:2:0 both planes are `cb_size/2` in each
+    // dimension and share the same bit depth.
+    {
+        let stride = state.uv_stride;
+        let x_c = (x0 as usize) >> 1;
+        let y_c = (y0 as usize) >> 1;
+        let dst_off = y_c * stride + x_c;
+        for plane_idx in 0..2 {
+            let plane = if plane_idx == 0 {
+                &mut state.u_plane
+            } else {
+                &mut state.v_plane
+            };
+            for j in 0..cb_chroma {
+                for i in 0..cb_chroma {
+                    let sample = reader.read_bits(pcm_bd_chroma) as u8;
+                    plane[dst_off + j * stride + i] = sample << chroma_shift;
+                }
+            }
+        }
+    }
+
+    // Record the luma mode for subsequent CUs' MPM derivation. PCM CUs
+    // contribute `INTRA_DC` to the IPM table (spec 8.4.2, same as
+    // "not available" — handled by `intra_prediction_unit_default_value`
+    // in FFmpeg).
+    let pb_size = cb_size as u32;
+    write_intra_pred_mode(state, x0, y0, pb_size, INTRA_DC);
+    state.last_luma_pred_mode = INTRA_DC;
+    state.last_chroma_pred_mode = INTRA_DC;
+
+    // Reinit CABAC at the byte boundary immediately after the PCM payload.
+    cabac.reinit_at(pcm_start + length_bytes);
+
+    Ok(())
+}
+
+/// Minimal bit-packed reader for PCM samples (MSB-first within each byte).
+struct PcmBitReader<'a> {
+    data: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> PcmBitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_pos: 0 }
+    }
+
+    fn read_bits(&mut self, n: u8) -> u32 {
+        // Fast path for 8-bit byte-aligned reads (the common case).
+        if n == 8 && self.bit_pos.is_multiple_of(8) {
+            let b = self.data[self.bit_pos / 8] as u32;
+            self.bit_pos += 8;
+            return b;
+        }
+        let mut val: u32 = 0;
+        for _ in 0..n {
+            let byte = self.data[self.bit_pos / 8] as u32;
+            let bit = (byte >> (7 - (self.bit_pos & 7))) & 1;
+            val = (val << 1) | bit;
+            self.bit_pos += 1;
+        }
+        val
+    }
 }
 
 /// Inherited cbf state passed down through `decode_transform_tree` recursion.
@@ -1349,5 +1489,42 @@ mod tests {
             "expected all-(-2) residual after IDCT, got: first 4 = {:?}",
             &residual_pixels[..4]
         );
+    }
+
+    /// PCM bit reader: 8-bit byte-aligned reads return the raw bytes.
+    #[test]
+    fn test_pcm_bit_reader_byte_aligned() {
+        let data = [0x12, 0x34, 0x56, 0x78];
+        let mut r = PcmBitReader::new(&data);
+        assert_eq!(r.read_bits(8), 0x12);
+        assert_eq!(r.read_bits(8), 0x34);
+        assert_eq!(r.read_bits(8), 0x56);
+        assert_eq!(r.read_bits(8), 0x78);
+    }
+
+    /// PCM bit reader: sub-byte reads pack MSB-first.
+    #[test]
+    fn test_pcm_bit_reader_bit_packed() {
+        // 0b1010_1100 0b0011_1001 = read four 4-bit samples: A, C, 3, 9
+        let data = [0xAC, 0x39];
+        let mut r = PcmBitReader::new(&data);
+        assert_eq!(r.read_bits(4), 0xA);
+        assert_eq!(r.read_bits(4), 0xC);
+        assert_eq!(r.read_bits(4), 0x3);
+        assert_eq!(r.read_bits(4), 0x9);
+    }
+
+    /// `PcmBitReader` on a non-trivial alignment: read a 5-bit sample then
+    /// a 3-bit sample, spanning the first byte's boundary.
+    #[test]
+    fn test_pcm_bit_reader_unaligned() {
+        // 0b1_0110_101 | 0b_1011_0001 ...
+        // First read 5 bits (MSB first): 0b10110 = 0x16
+        // Then 3 bits: 0b101 = 0x5
+        let data = [0b1011_0101, 0b1011_0001];
+        let mut r = PcmBitReader::new(&data);
+        assert_eq!(r.read_bits(5), 0b10110);
+        assert_eq!(r.read_bits(3), 0b101);
+        assert_eq!(r.read_bits(8), 0b1011_0001);
     }
 }

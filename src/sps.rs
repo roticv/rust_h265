@@ -42,6 +42,19 @@ pub struct Sps {
     pub amp_enabled_flag: bool,
     pub sample_adaptive_offset_enabled_flag: bool,
     pub pcm_enabled_flag: bool,
+    /// Bit depth of luma PCM samples (`pcm_sample_bit_depth_luma_minus1 + 1`).
+    /// Only meaningful when `pcm_enabled_flag` is true; defaults to
+    /// `bit_depth_luma` otherwise.
+    pub pcm_sample_bit_depth_luma: u8,
+    /// Bit depth of chroma PCM samples.
+    pub pcm_sample_bit_depth_chroma: u8,
+    /// `Log2MinIpcmCbSizeY` (spec eq. 7-35).
+    pub log2_min_pcm_cb_size: u8,
+    /// `Log2MaxIpcmCbSizeY` = `log2_min_pcm_cb_size + log2_diff_max_min_pcm_luma_coding_block_size`.
+    pub log2_max_pcm_cb_size: u8,
+    /// When set, deblocking is disabled across the boundaries of PCM blocks
+    /// in this SPS. We don't have deblocking yet so we just store this.
+    pub pcm_loop_filter_disabled_flag: bool,
     pub num_short_term_ref_pic_sets: u32,
     pub long_term_ref_pics_present_flag: bool,
     pub sps_temporal_mvp_enabled_flag: bool,
@@ -155,15 +168,37 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     let sample_adaptive_offset_enabled_flag = r.read_bit()? == 1;
 
     let pcm_enabled_flag = r.read_bit()? == 1;
-    if pcm_enabled_flag {
-        // Spec 7.3.2.2 — we parse the four PCM fields just to advance position
-        // even though we'll reject IPCM blocks later.
-        let _pcm_sample_bit_depth_luma_minus1 = r.read_bits(4)?;
-        let _pcm_sample_bit_depth_chroma_minus1 = r.read_bits(4)?;
-        let _log2_min_pcm_luma_coding_block_size_minus3 = r.read_ue()?;
-        let _log2_diff_max_min_pcm_luma_coding_block_size = r.read_ue()?;
-        let _pcm_loop_filter_disabled_flag = r.read_bit()?;
-    }
+    let (
+        pcm_sample_bit_depth_luma,
+        pcm_sample_bit_depth_chroma,
+        log2_min_pcm_cb_size,
+        log2_max_pcm_cb_size,
+        pcm_loop_filter_disabled_flag,
+    ) = if pcm_enabled_flag {
+        // Spec 7.3.2.2 + 7.4.3.2.1.
+        let pcm_bd_luma = (r.read_bits(4)? + 1) as u8;
+        let pcm_bd_chroma = (r.read_bits(4)? + 1) as u8;
+        if pcm_bd_luma > bit_depth_luma || pcm_bd_chroma > bit_depth_chroma {
+            return Err(DecodeError::InvalidSyntax(
+                "pcm_sample_bit_depth exceeds bit depth",
+            ));
+        }
+        let log2_min_pcm_cb_size = (r.read_ue()? + 3) as u8;
+        let log2_diff_max_min_pcm = r.read_ue()? as u8;
+        let log2_max_pcm_cb_size = log2_min_pcm_cb_size + log2_diff_max_min_pcm;
+        let pcm_loop_filter_disabled = r.read_bit()? == 1;
+        (
+            pcm_bd_luma,
+            pcm_bd_chroma,
+            log2_min_pcm_cb_size,
+            log2_max_pcm_cb_size,
+            pcm_loop_filter_disabled,
+        )
+    } else {
+        // Defaults when PCM is disabled. `log2_min_pcm_cb_size > log2_max_pcm_cb_size`
+        // ensures the "in range" test in `decode_coding_unit` never fires.
+        (bit_depth_luma, bit_depth_chroma, 8u8, 0u8, false)
+    };
 
     let num_short_term_ref_pic_sets = r.read_ue()?;
     if num_short_term_ref_pic_sets > 0 {
@@ -211,6 +246,11 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         amp_enabled_flag,
         sample_adaptive_offset_enabled_flag,
         pcm_enabled_flag,
+        pcm_sample_bit_depth_luma,
+        pcm_sample_bit_depth_chroma,
+        log2_min_pcm_cb_size,
+        log2_max_pcm_cb_size,
+        pcm_loop_filter_disabled_flag,
         num_short_term_ref_pic_sets,
         long_term_ref_pics_present_flag,
         sps_temporal_mvp_enabled_flag,
