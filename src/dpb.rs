@@ -236,6 +236,128 @@ impl ReferencePictureSets {
     }
 }
 
+/// Phase 3d-2: construct `RefPicListTemp0` per spec 8.3.2.
+///
+/// The temp list is built by concatenating (in order) the POCs in
+/// `st_curr_before`, `st_curr_after`, and `lt_curr`, repeating the
+/// concatenation if necessary until the list is at least
+/// `num_rps_curr_temp_list` entries long. Pure function on POCs so it
+/// can be tested without a real DPB.
+pub fn build_ref_pic_list_temp0(
+    rps: &ReferencePictureSets,
+    num_rps_curr_temp_list: usize,
+) -> Vec<i32> {
+    build_ref_pic_list_temp(
+        &[&rps.st_curr_before, &rps.st_curr_after, &rps.lt_curr],
+        num_rps_curr_temp_list,
+    )
+}
+
+/// Phase 3d-2: construct `RefPicListTemp1` per spec 8.3.2.
+///
+/// Same as `build_ref_pic_list_temp0` but with `st_curr_after` visited
+/// **before** `st_curr_before` — for B-slice L1 construction.
+pub fn build_ref_pic_list_temp1(
+    rps: &ReferencePictureSets,
+    num_rps_curr_temp_list: usize,
+) -> Vec<i32> {
+    build_ref_pic_list_temp(
+        &[&rps.st_curr_after, &rps.st_curr_before, &rps.lt_curr],
+        num_rps_curr_temp_list,
+    )
+}
+
+/// Shared helper for L0 / L1 temp list construction. Takes a list of
+/// sub-lists in visit order and concatenates them (wrapping around) until
+/// the result has at least `target_len` entries.
+fn build_ref_pic_list_temp(sub_lists: &[&Vec<i32>], target_len: usize) -> Vec<i32> {
+    let mut out: Vec<i32> = Vec::with_capacity(target_len);
+    if target_len == 0 {
+        return out;
+    }
+    // Empty concatenation would loop forever; bail to avoid that (callers
+    // should only ever build this list for P/B slices which by spec
+    // require at least one reference).
+    let total_in_sub_lists: usize = sub_lists.iter().map(|s| s.len()).sum();
+    if total_in_sub_lists == 0 {
+        return out;
+    }
+    while out.len() < target_len {
+        for sub in sub_lists {
+            for poc in sub.iter() {
+                if out.len() >= target_len {
+                    break;
+                }
+                out.push(*poc);
+            }
+            if out.len() >= target_len {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Phase 3d-2: apply `ref_pic_list_modification()` to a temp list to
+/// produce `RefPicList{0,1}` (spec 8.3.2 eq. 8-8 / 8-10). When the
+/// modification flag is false, returns the first `num_active` entries of
+/// the temp list unchanged. When true, the i-th output entry is
+/// `temp_list[list_entry[i]]`.
+pub fn apply_ref_pic_list_modification(
+    temp_list: &[i32],
+    modification_flag: bool,
+    list_entry: &[u32],
+    num_active: usize,
+) -> Result<Vec<i32>, crate::error::DecodeError> {
+    let mut out: Vec<i32> = Vec::with_capacity(num_active);
+    if modification_flag {
+        if list_entry.len() < num_active {
+            return Err(crate::error::DecodeError::InvalidSyntax(
+                "ref_pic_list_modification has fewer entries than active ref count",
+            ));
+        }
+        for &idx in list_entry.iter().take(num_active) {
+            let idx = idx as usize;
+            if idx >= temp_list.len() {
+                return Err(crate::error::DecodeError::InvalidSyntax(
+                    "list_entry index out of temp list bounds",
+                ));
+            }
+            out.push(temp_list[idx]);
+        }
+    } else {
+        if temp_list.len() < num_active {
+            return Err(crate::error::DecodeError::InvalidSyntax(
+                "temp list shorter than active ref count",
+            ));
+        }
+        out.extend_from_slice(&temp_list[..num_active]);
+    }
+    Ok(out)
+}
+
+/// Phase 3d-2: resolve a list of reference-picture POCs to actual DPB
+/// entries. Each POC in the list must be present in the DPB; an
+/// unresolved POC is a hard error. Matches FFmpeg's `find_ref_idx`
+/// behavior when no "generate missing ref" fallback is required.
+pub fn resolve_ref_pics(
+    dpb: &DecodedPictureBuffer,
+    pocs: &[i32],
+) -> Result<Vec<Rc<DecodedPicture>>, crate::error::DecodeError> {
+    let mut out: Vec<Rc<DecodedPicture>> = Vec::with_capacity(pocs.len());
+    for poc in pocs {
+        match dpb.find_by_poc(*poc) {
+            Some(pic) => out.push(pic),
+            None => {
+                return Err(crate::error::DecodeError::InvalidSyntax(
+                    "reference picture POC not present in DPB",
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +414,94 @@ mod tests {
             lt_foll: vec![],
         };
         assert_eq!(rps.num_poc_total_curr(), 4);
+    }
+
+    #[test]
+    fn ref_pic_list_temp0_order_before_then_after_then_lt() {
+        // Spec 8.3.2: RefPicListTemp0 concatenates st_curr_before,
+        // st_curr_after, lt_curr — in that order.
+        let rps = ReferencePictureSets {
+            st_curr_before: vec![3, 2],
+            st_curr_after: vec![5, 6],
+            st_foll: vec![],
+            lt_curr: vec![100],
+            lt_foll: vec![],
+        };
+        // NumPocTotalCurr = 5, so with num_rps_curr_temp_list = 5 we expect
+        // exactly the concatenation, no wrap.
+        let temp = build_ref_pic_list_temp0(&rps, 5);
+        assert_eq!(temp, vec![3, 2, 5, 6, 100]);
+    }
+
+    #[test]
+    fn ref_pic_list_temp1_order_after_then_before_then_lt() {
+        // Spec 8.3.2: RefPicListTemp1 concatenates st_curr_after,
+        // st_curr_before, lt_curr — note After comes BEFORE Before.
+        let rps = ReferencePictureSets {
+            st_curr_before: vec![3, 2],
+            st_curr_after: vec![5, 6],
+            st_foll: vec![],
+            lt_curr: vec![100],
+            lt_foll: vec![],
+        };
+        let temp = build_ref_pic_list_temp1(&rps, 5);
+        assert_eq!(temp, vec![5, 6, 3, 2, 100]);
+    }
+
+    #[test]
+    fn ref_pic_list_temp0_wraps_around_when_active_exceeds_rps() {
+        // `num_ref_idx_l0_active > NumPocTotalCurr` → temp list wraps.
+        // RPS = [3, 2], active = 5 → temp = [3, 2, 3, 2, 3].
+        let rps = ReferencePictureSets {
+            st_curr_before: vec![3, 2],
+            st_curr_after: vec![],
+            st_foll: vec![],
+            lt_curr: vec![],
+            lt_foll: vec![],
+        };
+        let temp = build_ref_pic_list_temp0(&rps, 5);
+        assert_eq!(temp, vec![3, 2, 3, 2, 3]);
+    }
+
+    #[test]
+    fn ref_pic_list_modification_reorders_temp_list() {
+        // list_entry_l0 = [1, 0] → result is [temp[1], temp[0]] = [42, 10].
+        let temp = vec![10, 42, 99];
+        let modified = apply_ref_pic_list_modification(&temp, true, &[1, 0], 2).expect("apply mod");
+        assert_eq!(modified, vec![42, 10]);
+    }
+
+    #[test]
+    fn ref_pic_list_modification_disabled_uses_temp_prefix() {
+        let temp = vec![10, 42, 99, 7];
+        let result = apply_ref_pic_list_modification(&temp, false, &[], 3).expect("no mod");
+        assert_eq!(result, vec![10, 42, 99]);
+    }
+
+    #[test]
+    fn ref_pic_list_modification_rejects_out_of_bounds_entry() {
+        let temp = vec![10, 42];
+        let err = apply_ref_pic_list_modification(&temp, true, &[5], 1);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn resolve_ref_pics_looks_up_by_poc() {
+        let mut dpb = DecodedPictureBuffer::new();
+        let p0 = Rc::new(DecodedPicture::new(vec![], vec![], vec![], 0, 0, 2));
+        let p1 = Rc::new(DecodedPicture::new(vec![], vec![], vec![], 0, 0, 5));
+        dpb.insert(p0);
+        dpb.insert(p1);
+        let resolved = resolve_ref_pics(&dpb, &[5, 2]).expect("resolve");
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].poc, 5);
+        assert_eq!(resolved[1].poc, 2);
+    }
+
+    #[test]
+    fn resolve_ref_pics_errors_on_missing_poc() {
+        let dpb = DecodedPictureBuffer::new();
+        let err = resolve_ref_pics(&dpb, &[3]);
+        assert!(err.is_err());
     }
 }

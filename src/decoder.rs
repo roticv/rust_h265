@@ -22,6 +22,8 @@ use crate::cabac::{CabacContexts, CabacReader};
 use crate::cu_tree::{PictureState, decode_coding_quadtree};
 use crate::dpb::{
     DecodedPicture, DecodedPictureBuffer, PictureReferenceStatus, ReferencePictureSets,
+    apply_ref_pic_list_modification, build_ref_pic_list_temp0, build_ref_pic_list_temp1,
+    resolve_ref_pics,
 };
 use crate::error::DecodeError;
 use crate::nal::{NalUnit, NalUnitType};
@@ -231,6 +233,15 @@ pub struct Decoder {
     /// current picture. Populated by `derive_rps_from_slice_header`; no
     /// consumer yet other than the decoder's own bookkeeping.
     current_rps: ReferencePictureSets,
+    /// Phase 3d-2: RefPicList0 for the current P/B slice, built per spec
+    /// 8.3.2 after RPS marking. Empty for I slices. No consumer yet
+    /// (Phase 3d-3 will wire it into the CU tree).
+    #[allow(dead_code)]
+    current_ref_list_l0: Vec<Rc<DecodedPicture>>,
+    /// Phase 3d-2: RefPicList1 for the current B slice. Empty for P and I
+    /// slices. No consumer yet.
+    #[allow(dead_code)]
+    current_ref_list_l1: Vec<Rc<DecodedPicture>>,
 }
 
 impl Decoder {
@@ -340,6 +351,7 @@ impl Decoder {
             sh.collocated_from_l0_flag = parent.collocated_from_l0_flag;
             sh.collocated_ref_idx = parent.collocated_ref_idx;
             sh.max_num_merge_cand = parent.max_num_merge_cand;
+            sh.ref_pic_list_modification = parent.ref_pic_list_modification.clone();
             sh.poc = parent.poc;
         }
 
@@ -740,6 +752,20 @@ impl Decoder {
         // Mark DPB pictures based on the newly derived RPS.
         Self::apply_rps_marking(&self.current_rps, &self.dpb, log2_max_poc_lsb);
 
+        // Phase 3d-2: build RefPicList0 / RefPicList1 per spec 8.3.2.
+        // I slices never reference other pictures → leave both lists empty.
+        // P/B slices are still rejected at decode time (see above), but we
+        // construct the lists here for completeness so Phase 3d-3 can start
+        // consuming them directly.
+        self.current_ref_list_l0.clear();
+        self.current_ref_list_l1.clear();
+        if last_sh_cloned.slice_type != SliceType::I {
+            let (l0, l1) =
+                Self::build_ref_pic_lists(&self.current_rps, &self.dpb, &last_sh_cloned)?;
+            self.current_ref_list_l0 = l0;
+            self.current_ref_list_l1 = l1;
+        }
+
         // Phase 3d-1: update prev_tid0_poc per spec 8.3.1 — done BEFORE
         // the picture is inserted into the DPB, so subsequent non-IDR
         // slice headers will see the current picture's POC as the seed.
@@ -899,6 +925,51 @@ impl Decoder {
         rps
     }
 
+    /// Phase 3d-2: build `RefPicList0` / `RefPicList1` for a P or B slice
+    /// per HEVC spec 8.3.2. Caller must ensure the slice is P or B (I
+    /// slices get empty lists).
+    ///
+    /// Returns `(L0, L1)` where L1 is empty for P slices. Each list has
+    /// exactly `num_ref_idx_l{0,1}_active_minus1 + 1` entries and every
+    /// entry points to a picture already in the DPB.
+    #[allow(clippy::type_complexity)]
+    fn build_ref_pic_lists(
+        rps: &ReferencePictureSets,
+        dpb: &DecodedPictureBuffer,
+        sh: &SliceHeader,
+    ) -> Result<(Vec<Rc<DecodedPicture>>, Vec<Rc<DecodedPicture>>), DecodeError> {
+        let num_poc_total_curr = rps.num_poc_total_curr();
+        let active_l0 = sh.num_ref_idx_l0_active_minus1 as usize + 1;
+        let num_rps_curr_temp_list0 = active_l0.max(num_poc_total_curr);
+        let temp0 = build_ref_pic_list_temp0(rps, num_rps_curr_temp_list0);
+        let l0_pocs = apply_ref_pic_list_modification(
+            &temp0,
+            sh.ref_pic_list_modification
+                .ref_pic_list_modification_flag_l0,
+            &sh.ref_pic_list_modification.list_entry_l0,
+            active_l0,
+        )?;
+        let l0 = resolve_ref_pics(dpb, &l0_pocs)?;
+
+        let l1 = if sh.slice_type == SliceType::B {
+            let active_l1 = sh.num_ref_idx_l1_active_minus1 as usize + 1;
+            let num_rps_curr_temp_list1 = active_l1.max(num_poc_total_curr);
+            let temp1 = build_ref_pic_list_temp1(rps, num_rps_curr_temp_list1);
+            let l1_pocs = apply_ref_pic_list_modification(
+                &temp1,
+                sh.ref_pic_list_modification
+                    .ref_pic_list_modification_flag_l1,
+                &sh.ref_pic_list_modification.list_entry_l1,
+                active_l1,
+            )?;
+            resolve_ref_pics(dpb, &l1_pocs)?
+        } else {
+            Vec::new()
+        };
+
+        Ok((l0, l1))
+    }
+
     /// Phase 3d-1: walk the DPB and mark each picture according to the
     /// current RPS. Pictures referenced by the RPS become ShortTerm /
     /// LongTerm; everything else is flipped to UnusedForReference.
@@ -983,6 +1054,190 @@ mod tests {
     fn poc_compute_equal_lsb_passes_through() {
         // prev_tid0_poc = 32 (MSB=32, LSB=0), cur LSB=0 → poc_msb=32.
         assert_eq!(Decoder::compute_poc(32, 0, 4, NalUnitType::TrailR), 32);
+    }
+
+    // ----- Phase 3d-2: RefPicList0 / RefPicList1 construction tests -----
+
+    use crate::slice::{LongTermRefPicSet, RefPicListModification};
+
+    /// Build a minimal `SliceHeader` for tests that only exercise the
+    /// `build_ref_pic_lists` path. Only the fields the function reads
+    /// need to be valid; the rest take default / placeholder values.
+    fn test_slice_header_for_ref_lists(
+        slice_type: SliceType,
+        num_ref_idx_l0_active_minus1: u32,
+        num_ref_idx_l1_active_minus1: u32,
+        ref_pic_list_modification: RefPicListModification,
+    ) -> SliceHeader {
+        SliceHeader {
+            first_slice_segment_in_pic_flag: true,
+            no_output_of_prior_pics_flag: false,
+            slice_pic_parameter_set_id: 0,
+            dependent_slice_segment_flag: false,
+            slice_segment_address: 0,
+            slice_type,
+            pic_output_flag: true,
+            slice_pic_order_cnt_lsb: 0,
+            slice_sao_luma_flag: false,
+            slice_sao_chroma_flag: false,
+            slice_qp_delta: 0,
+            slice_qp_y: 26,
+            slice_deblocking_filter_disabled_flag: true,
+            slice_beta_offset_div2: 0,
+            slice_tc_offset_div2: 0,
+            entry_point_offsets: Vec::new(),
+            header_size_bits: 0,
+            short_term_ref_pic_set_sps_flag: false,
+            short_term_ref_pic_set_idx: 0,
+            short_term_rps: None,
+            long_term_rps: LongTermRefPicSet::default(),
+            slice_temporal_mvp_enabled_flag: false,
+            num_ref_idx_l0_active_minus1,
+            num_ref_idx_l1_active_minus1,
+            mvd_l1_zero_flag: false,
+            cabac_init_flag: false,
+            collocated_from_l0_flag: true,
+            collocated_ref_idx: 0,
+            max_num_merge_cand: 5,
+            ref_pic_list_modification,
+            nal_unit_type: NalUnitType::TrailR,
+            temporal_id: 0,
+            poc: 10,
+        }
+    }
+
+    fn test_decoded_picture(poc: i32) -> Rc<DecodedPicture> {
+        Rc::new(DecodedPicture::new(vec![], vec![], vec![], 16, 16, poc))
+    }
+
+    #[test]
+    fn build_ref_pic_lists_p_slice_without_modification() {
+        // RPS: st_curr_before = [8, 6], st_curr_after = [], lt_curr = [].
+        // Current POC = 10, 2 L0 refs → L0 = [pic@8, pic@6].
+        let rps = ReferencePictureSets {
+            st_curr_before: vec![8, 6],
+            st_curr_after: vec![],
+            st_foll: vec![],
+            lt_curr: vec![],
+            lt_foll: vec![],
+        };
+        let mut dpb = DecodedPictureBuffer::new();
+        dpb.insert(test_decoded_picture(8));
+        dpb.insert(test_decoded_picture(6));
+
+        let sh = test_slice_header_for_ref_lists(
+            SliceType::P,
+            1, // num_ref_idx_l0_active_minus1 = 1 → 2 active refs
+            0,
+            RefPicListModification::default(),
+        );
+
+        let (l0, l1) = Decoder::build_ref_pic_lists(&rps, &dpb, &sh).expect("build lists");
+        assert_eq!(l0.len(), 2);
+        assert_eq!(l0[0].poc, 8);
+        assert_eq!(l0[1].poc, 6);
+        assert!(l1.is_empty(), "P slice has no L1");
+    }
+
+    #[test]
+    fn build_ref_pic_lists_b_slice_l1_uses_after_before_order() {
+        // RPS: before = [8], after = [12]. For L0 the temp order is
+        // [before, after] → [8, 12]; for L1 it's [after, before] → [12, 8].
+        let rps = ReferencePictureSets {
+            st_curr_before: vec![8],
+            st_curr_after: vec![12],
+            st_foll: vec![],
+            lt_curr: vec![],
+            lt_foll: vec![],
+        };
+        let mut dpb = DecodedPictureBuffer::new();
+        dpb.insert(test_decoded_picture(8));
+        dpb.insert(test_decoded_picture(12));
+
+        let sh = test_slice_header_for_ref_lists(
+            SliceType::B,
+            1, // 2 L0 refs
+            1, // 2 L1 refs
+            RefPicListModification::default(),
+        );
+
+        let (l0, l1) = Decoder::build_ref_pic_lists(&rps, &dpb, &sh).expect("build lists");
+        assert_eq!(l0.len(), 2);
+        assert_eq!(l0[0].poc, 8);
+        assert_eq!(l0[1].poc, 12);
+        assert_eq!(l1.len(), 2);
+        assert_eq!(l1[0].poc, 12);
+        assert_eq!(l1[1].poc, 8);
+    }
+
+    #[test]
+    fn build_ref_pic_lists_applies_modification() {
+        let rps = ReferencePictureSets {
+            st_curr_before: vec![8, 6],
+            st_curr_after: vec![],
+            st_foll: vec![],
+            lt_curr: vec![],
+            lt_foll: vec![],
+        };
+        let mut dpb = DecodedPictureBuffer::new();
+        dpb.insert(test_decoded_picture(8));
+        dpb.insert(test_decoded_picture(6));
+
+        // list_entry_l0 = [1, 0] → swap: result = [pic@6, pic@8].
+        let modif = RefPicListModification {
+            ref_pic_list_modification_flag_l0: true,
+            list_entry_l0: vec![1, 0],
+            ..Default::default()
+        };
+
+        let sh = test_slice_header_for_ref_lists(SliceType::P, 1, 0, modif);
+        let (l0, _l1) = Decoder::build_ref_pic_lists(&rps, &dpb, &sh).expect("build lists");
+        assert_eq!(l0.len(), 2);
+        assert_eq!(l0[0].poc, 6);
+        assert_eq!(l0[1].poc, 8);
+    }
+
+    #[test]
+    fn build_ref_pic_lists_temp_list_wraps_for_high_active_count() {
+        // RPS has only 2 pictures but num_ref_idx_l0_active = 5 → the temp
+        // list wraps: [8, 6, 8, 6, 8], then first 5 are taken as-is.
+        let rps = ReferencePictureSets {
+            st_curr_before: vec![8, 6],
+            st_curr_after: vec![],
+            st_foll: vec![],
+            lt_curr: vec![],
+            lt_foll: vec![],
+        };
+        let mut dpb = DecodedPictureBuffer::new();
+        dpb.insert(test_decoded_picture(8));
+        dpb.insert(test_decoded_picture(6));
+
+        let sh = test_slice_header_for_ref_lists(
+            SliceType::P,
+            4, // 5 active L0 refs
+            0,
+            RefPicListModification::default(),
+        );
+        let (l0, _l1) = Decoder::build_ref_pic_lists(&rps, &dpb, &sh).expect("build lists");
+        assert_eq!(l0.len(), 5);
+        let pocs: Vec<i32> = l0.iter().map(|p| p.poc).collect();
+        assert_eq!(pocs, vec![8, 6, 8, 6, 8]);
+    }
+
+    #[test]
+    fn build_ref_pic_lists_errors_when_poc_missing_from_dpb() {
+        let rps = ReferencePictureSets {
+            st_curr_before: vec![8],
+            st_curr_after: vec![],
+            st_foll: vec![],
+            lt_curr: vec![],
+            lt_foll: vec![],
+        };
+        // DPB is empty → the POC=8 lookup fails.
+        let dpb = DecodedPictureBuffer::new();
+        let sh =
+            test_slice_header_for_ref_lists(SliceType::P, 0, 0, RefPicListModification::default());
+        assert!(Decoder::build_ref_pic_lists(&rps, &dpb, &sh).is_err());
     }
 
     /// **Phase 2d byte-exact test**: feed `testdata/tiny_intra.h265` through

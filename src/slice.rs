@@ -45,6 +45,20 @@ pub struct LongTermRefPicSet {
     pub delta_poc_msb_cycle_lt: Vec<u32>,
 }
 
+/// Parsed `ref_pic_list_modification()` syntax (spec 7.3.6.2).
+///
+/// When `ref_pic_list_modification_flag_l{0,1}` is false, the corresponding
+/// `list_entry_l{0,1}` is empty and the temp list is used unchanged. When
+/// the flag is true, the list has exactly `num_ref_idx_l{0,1}_active_minus1
+/// + 1` entries, each an index into the temp list.
+#[derive(Debug, Clone, Default)]
+pub struct RefPicListModification {
+    pub ref_pic_list_modification_flag_l0: bool,
+    pub list_entry_l0: Vec<u32>,
+    pub ref_pic_list_modification_flag_l1: bool,
+    pub list_entry_l1: Vec<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SliceHeader {
     pub first_slice_segment_in_pic_flag: bool,
@@ -119,6 +133,11 @@ pub struct SliceHeader {
     /// `MaxNumMergeCand = 5 - five_minus_max_num_merge_cand`. Defaults to 5
     /// for I slices (where it's not signaled) to avoid any "unset" sentinel.
     pub max_num_merge_cand: u32,
+    /// Parsed `ref_pic_list_modification()` syntax (spec 7.3.6.2). Defaults
+    /// to all-disabled when not coded (I slices, `NumPocTotalCurr <= 1`, or
+    /// `lists_modification_present_flag = 0`), matching the spec's inferred
+    /// values.
+    pub ref_pic_list_modification: RefPicListModification,
     /// NAL unit type copy — needed for POC derivation downstream.
     pub nal_unit_type: NalUnitType,
     /// NAL temporal id — used by the DPB's "prev_tid0" tracking. Always 0
@@ -228,6 +247,7 @@ pub fn parse_slice_segment_header(
     let mut collocated_from_l0_flag = true;
     let mut collocated_ref_idx: u32 = 0;
     let mut max_num_merge_cand: u32 = 5;
+    let mut ref_pic_list_modification = RefPicListModification::default();
 
     if !dependent_slice_segment_flag {
         let slice_type_raw = r.read_ue()?;
@@ -315,16 +335,88 @@ pub fn parse_slice_segment_header(
                 ));
             }
 
-            // ref_pic_lists_modification(): we skip-parse this conservatively.
-            // For Phase 3d-1 we only reject-skip — no real fixture we care
-            // about in this phase toggles it.
+            // Phase 3d-2: `ref_pic_list_modification()` parsing (spec
+            // 7.3.6.2). Only signaled when
+            // `pps.lists_modification_present_flag = 1` AND
+            // `NumPocTotalCurr > 1`. Matches FFmpeg's `hevcdec.c`
+            // `lists_modification_present_flag && nb_refs > 1` guard.
+            //
+            // `NumPocTotalCurr` is the total number of "current" refs in
+            // the resolved RPS = st_curr_before + st_curr_after + lt_curr.
+            // We compute it here from the already-resolved ST RPS (either
+            // SPS-indexed or inline) plus the slice's LT RPS.
             if pps.lists_modification_present_flag {
-                // Spec 7.3.6.2: only signaled when NumPocTotalCurr > 1. Since
-                // we don't compute NumPocTotalCurr yet, reject loudly if a
-                // fixture actually trips this path.
-                return Err(DecodeError::Unsupported(
-                    "ref_pic_lists_modification not yet supported (Phase 3d-3)",
-                ));
+                let st_rps: Option<&ShortTermRps> = if short_term_ref_pic_set_sps_flag {
+                    sps.st_ref_pic_sets.get(short_term_ref_pic_set_idx as usize)
+                } else {
+                    short_term_rps.as_ref()
+                };
+                let mut num_poc_total_curr: u32 = 0;
+                if let Some(st) = st_rps {
+                    for f in &st.used_by_curr_pic_s0_flag {
+                        if *f {
+                            num_poc_total_curr += 1;
+                        }
+                    }
+                    for f in &st.used_by_curr_pic_s1_flag {
+                        if *f {
+                            num_poc_total_curr += 1;
+                        }
+                    }
+                }
+                for f in &long_term_rps.used_by_curr_pic_lt_flag {
+                    if *f {
+                        num_poc_total_curr += 1;
+                    }
+                }
+
+                if num_poc_total_curr > 1 {
+                    let nb_bits = ceil_log2(num_poc_total_curr) as u8;
+                    let flag_l0 = r.read_bit()? == 1;
+                    ref_pic_list_modification.ref_pic_list_modification_flag_l0 = flag_l0;
+                    if flag_l0 {
+                        let count = num_ref_idx_l0_active_minus1 + 1;
+                        ref_pic_list_modification
+                            .list_entry_l0
+                            .reserve(count as usize);
+                        for _ in 0..count {
+                            let entry = if nb_bits > 0 {
+                                r.read_bits(nb_bits)?
+                            } else {
+                                0
+                            };
+                            if entry >= num_poc_total_curr {
+                                return Err(DecodeError::InvalidSyntax(
+                                    "list_entry_l0 out of range",
+                                ));
+                            }
+                            ref_pic_list_modification.list_entry_l0.push(entry);
+                        }
+                    }
+                    if slice_type == SliceType::B {
+                        let flag_l1 = r.read_bit()? == 1;
+                        ref_pic_list_modification.ref_pic_list_modification_flag_l1 = flag_l1;
+                        if flag_l1 {
+                            let count = num_ref_idx_l1_active_minus1 + 1;
+                            ref_pic_list_modification
+                                .list_entry_l1
+                                .reserve(count as usize);
+                            for _ in 0..count {
+                                let entry = if nb_bits > 0 {
+                                    r.read_bits(nb_bits)?
+                                } else {
+                                    0
+                                };
+                                if entry >= num_poc_total_curr {
+                                    return Err(DecodeError::InvalidSyntax(
+                                        "list_entry_l1 out of range",
+                                    ));
+                                }
+                                ref_pic_list_modification.list_entry_l1.push(entry);
+                            }
+                        }
+                    }
+                }
             }
 
             if slice_type == SliceType::B {
@@ -494,6 +586,7 @@ pub fn parse_slice_segment_header(
         collocated_from_l0_flag,
         collocated_ref_idx,
         max_num_merge_cand,
+        ref_pic_list_modification,
         nal_unit_type,
         temporal_id: 0,
         // IDR pictures have POC = 0 regardless of slice_pic_order_cnt_lsb
@@ -769,5 +862,18 @@ mod tests {
 
         // Header is exactly 16 bits → CABAC stream begins at RBSP byte 2.
         assert_eq!(sh.header_size_bits, 16);
+
+        // Phase 3d-2: IDR slice → no ref_pic_list_modification was coded,
+        // so all fields are at their default (disabled / empty) values.
+        assert!(
+            !sh.ref_pic_list_modification
+                .ref_pic_list_modification_flag_l0
+        );
+        assert!(sh.ref_pic_list_modification.list_entry_l0.is_empty());
+        assert!(
+            !sh.ref_pic_list_modification
+                .ref_pic_list_modification_flag_l1
+        );
+        assert!(sh.ref_pic_list_modification.list_entry_l1.is_empty());
     }
 }
