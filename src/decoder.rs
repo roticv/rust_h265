@@ -16,20 +16,26 @@
 //! `PictureState` on the first slice of the picture and finalizes the
 //! picture (deblock + SAO) when the CTB count reaches the picture total.
 
+use std::rc::Rc;
+
 use crate::cabac::{CabacContexts, CabacReader};
 use crate::cu_tree::{PictureState, decode_coding_quadtree};
+use crate::dpb::{
+    DecodedPicture, DecodedPictureBuffer, PictureReferenceStatus, ReferencePictureSets,
+};
 use crate::error::DecodeError;
 use crate::nal::{NalUnit, NalUnitType};
 use crate::pps::{Pps, parse_pps};
 use crate::slice::{SliceHeader, SliceType, parse_slice_segment_header};
-use crate::sps::{Sps, parse_sps};
+use crate::sps::{ShortTermRps, Sps, parse_sps};
 use crate::vps::{Vps, parse_vps};
 
 /// A reconstructed video frame in YUV420 8-bit planar layout.
 ///
 /// Plane lengths are `width * height` for luma and `(width/2) * (height/2)`
-/// for each chroma plane. `pic_order_cnt` is 0 for IDR pictures (we'll add
-/// non-IDR POC computation in Phase 3+).
+/// for each chroma plane. `pic_order_cnt` is the full (signed) POC
+/// computed per spec 8.3.1 — 0 for IDR pictures, and the MSB-extended LSB
+/// for non-IDR pictures.
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub y: Vec<u8>,
@@ -37,7 +43,7 @@ pub struct Frame {
     pub v: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    pub pic_order_cnt: u32,
+    pub pic_order_cnt: i32,
 }
 
 /// Streaming HEVC decoder.
@@ -208,6 +214,23 @@ pub struct Decoder {
     /// Phase 3c-1: created on the first slice segment, finalized and
     /// returned as a `Frame` when all CTBs have been decoded.
     current_picture: Option<PictureInProgress>,
+    /// Phase 3d-1: decoded picture buffer. Holds recently decoded pictures
+    /// for reference lookup. Not yet used for inter decoding (which is the
+    /// reason this infrastructure exists) — every picture currently
+    /// inserted is an IDR intra picture. Output happens immediately after
+    /// decoding; bumping for reorder is a future phase.
+    dpb: DecodedPictureBuffer,
+    /// Phase 3d-1: POC of the most recent decoded picture with
+    /// `temporal_id == 0` (and not a sub-layer non-reference or
+    /// RASL/RADL picture). Per spec 8.3.1 this is the "prevTid0Pic"
+    /// seed for computing a non-IDR picture's POC from its LSB. We
+    /// reset it to 0 at every IDR and update it after every picture
+    /// whose NAL type + temporal_id satisfy the "tid0" condition.
+    prev_tid0_poc: i32,
+    /// Phase 3d-1: most recently derived reference picture sets for the
+    /// current picture. Populated by `derive_rps_from_slice_header`; no
+    /// consumer yet other than the decoder's own bookkeeping.
+    current_rps: ReferencePictureSets,
 }
 
 impl Decoder {
@@ -276,6 +299,7 @@ impl Decoder {
         let tile_tables = self.tile_tables.as_ref().expect("tile tables built above");
 
         let mut sh = parse_slice_segment_header(&nal.rbsp, nut, sps, pps)?;
+        sh.temporal_id = nal.temporal_id;
 
         // Phase 3c-4: a dependent slice segment inherits the slice-header
         // fields that the parser deliberately left at their defaults —
@@ -302,11 +326,56 @@ impl Decoder {
             sh.slice_deblocking_filter_disabled_flag = parent.slice_deblocking_filter_disabled_flag;
             sh.slice_beta_offset_div2 = parent.slice_beta_offset_div2;
             sh.slice_tc_offset_div2 = parent.slice_tc_offset_div2;
+            // Inherit inter bitstream fields too, since a dependent slice
+            // segment shares the logical slice of its parent.
+            sh.short_term_ref_pic_set_sps_flag = parent.short_term_ref_pic_set_sps_flag;
+            sh.short_term_ref_pic_set_idx = parent.short_term_ref_pic_set_idx;
+            sh.short_term_rps = parent.short_term_rps.clone();
+            sh.long_term_rps = parent.long_term_rps.clone();
+            sh.slice_temporal_mvp_enabled_flag = parent.slice_temporal_mvp_enabled_flag;
+            sh.num_ref_idx_l0_active_minus1 = parent.num_ref_idx_l0_active_minus1;
+            sh.num_ref_idx_l1_active_minus1 = parent.num_ref_idx_l1_active_minus1;
+            sh.mvd_l1_zero_flag = parent.mvd_l1_zero_flag;
+            sh.cabac_init_flag = parent.cabac_init_flag;
+            sh.collocated_from_l0_flag = parent.collocated_from_l0_flag;
+            sh.collocated_ref_idx = parent.collocated_ref_idx;
+            sh.max_num_merge_cand = parent.max_num_merge_cand;
+            sh.poc = parent.poc;
+        }
+
+        // Phase 3d-1: compute POC from the slice header's pic_order_cnt_lsb.
+        // IDR pictures always get POC = 0 (and the spec says prev_tid0_poc
+        // is reset too). For non-IDR pictures we use the `compute_poc`
+        // helper with the current `prev_tid0_poc` seed. Dependent slice
+        // segments inherit the POC from the parent independent segment
+        // (populated above) — we only compute it once per picture (on the
+        // first, independent slice).
+        if sh.first_slice_segment_in_pic_flag {
+            if nut.is_idr() {
+                sh.poc = 0;
+            } else {
+                sh.poc = Self::compute_poc(
+                    self.prev_tid0_poc,
+                    sh.slice_pic_order_cnt_lsb,
+                    sps.log2_max_pic_order_cnt_lsb,
+                    nut,
+                );
+            }
+        } else if !sh.dependent_slice_segment_flag {
+            // A non-first independent slice segment must have the same POC
+            // as the rest of the picture; just take it from the current
+            // picture in progress.
+            if let Some(pic) = self.current_picture.as_ref() {
+                sh.poc = pic.last_independent_slice_header.poc;
+            }
         }
 
         if sh.slice_type != SliceType::I {
+            // Phase 3d-1 plumbs the slice header but does not yet decode
+            // the inter CUs — reject at decode time so the test suite
+            // still passes for all intra fixtures.
             return Err(DecodeError::Unsupported(
-                "only I-slices are supported in Phase 2",
+                "P/B slice decoding not yet implemented (Phase 3d-3)",
             ));
         }
 
@@ -629,16 +698,231 @@ impl Decoder {
         // Phase 3b-2: SAO filter (after deblocking).
         crate::sao::apply_sao_picture(&mut pic.state, sps, last_sh);
 
-        Ok(Some(Frame {
-            y: pic.state.y_plane,
-            u: pic.state.u_plane,
-            v: pic.state.v_plane,
-            width: sps.pic_width_in_luma_samples,
-            height: sps.pic_height_in_luma_samples,
-            // IDR pictures always have POC 0; non-IDR POC will be wired in
-            // Phase 3+ when we add slice POC LSB parsing.
-            pic_order_cnt: 0,
-        }))
+        // Phase 3d-1: snapshot everything we need from the SPS and the
+        // completed slice header so we can release the outstanding
+        // `sps` / `pps` / `tile_tables` borrows (they're tied to `self`)
+        // and mutably touch `self.dpb` / `self.prev_tid0_poc` /
+        // `self.current_rps`.
+        let pic_width = sps.pic_width_in_luma_samples;
+        let pic_height = sps.pic_height_in_luma_samples;
+        let log2_max_poc_lsb = sps.log2_max_pic_order_cnt_lsb;
+        let sps_st_ref_pic_sets = sps.st_ref_pic_sets.clone();
+        let last_sh_cloned = last_sh.clone();
+        let picture_poc = last_sh_cloned.poc;
+
+        // Build the output Frame now (while `sps`/etc. are still in
+        // scope) so the `pic` state can be moved into the DPB afterwards.
+        let emitted_frame = Frame {
+            y: pic.state.y_plane.clone(),
+            u: pic.state.u_plane.clone(),
+            v: pic.state.v_plane.clone(),
+            width: pic_width,
+            height: pic_height,
+            pic_order_cnt: picture_poc,
+        };
+
+        // The borrows `sps` / `pps` / `tile_tables` / `last_sh` are no
+        // longer used beyond this point — NLL will release them here so
+        // we can take mutable borrows of `self.*` below.
+
+        // Phase 3d-1: configure DPB from the active SPS (idempotent) and
+        // derive the current picture's reference picture set. The DPB
+        // still isn't used for actual decoding at this phase, but we wire
+        // the bookkeeping so the scaffolding is in place.
+        {
+            // Fresh `&Sps` scoped to this block only.
+            let sps_for_dpb = self.sps.as_ref().expect("sps still present after decode");
+            self.dpb.configure_from_sps(sps_for_dpb);
+        }
+
+        self.current_rps =
+            Self::derive_rps_from_slice_header_parts(&last_sh_cloned, &sps_st_ref_pic_sets);
+        // Mark DPB pictures based on the newly derived RPS.
+        Self::apply_rps_marking(&self.current_rps, &self.dpb, log2_max_poc_lsb);
+
+        // Phase 3d-1: update prev_tid0_poc per spec 8.3.1 — done BEFORE
+        // the picture is inserted into the DPB, so subsequent non-IDR
+        // slice headers will see the current picture's POC as the seed.
+        //
+        // The spec excludes sub-layer non-reference (N-type) NAL types
+        // and RASL/RADL pictures. For Phase 3d-1 we only see IDR pictures
+        // in practice, so we take the simple approximation described in
+        // the phase plan: update on every IDR or temporal_id == 0.
+        let nut_for_tid0 = last_sh_cloned.nal_unit_type;
+        let is_tid0 = last_sh_cloned.temporal_id == 0
+            && !matches!(
+                nut_for_tid0,
+                NalUnitType::TrailN
+                    | NalUnitType::TsaN
+                    | NalUnitType::StsaN
+                    | NalUnitType::RadlN
+                    | NalUnitType::RadlR
+                    | NalUnitType::RaslN
+                    | NalUnitType::RaslR
+            );
+        if nut_for_tid0.is_irap() {
+            self.prev_tid0_poc = 0;
+        } else if is_tid0 {
+            self.prev_tid0_poc = last_sh_cloned.poc;
+        }
+
+        // Insert the fresh picture into the DPB so later frames can look
+        // it up by POC. Also clean up any unreferenced + already-output
+        // pictures (none exist today; this is future-proofing).
+        let decoded_pic = Rc::new(DecodedPicture::new(
+            pic.state.y_plane,
+            pic.state.u_plane,
+            pic.state.v_plane,
+            pic_width,
+            pic_height,
+            picture_poc,
+        ));
+        // Mark as short-term reference initially — a subsequent frame's
+        // RPS will flip it to long-term / unused as needed.
+        decoded_pic.mark(PictureReferenceStatus::ShortTerm);
+        // Mark as output immediately (Phase 3d-1 has no reorder buffer).
+        *decoded_pic.output.borrow_mut() = true;
+        self.dpb.insert(decoded_pic);
+        self.dpb.cleanup_unused();
+
+        Ok(Some(emitted_frame))
+    }
+
+    /// Phase 3d-1: compute a picture's POC from `prev_tid0_poc`, the
+    /// slice header's `pic_order_cnt_lsb`, and the SPS's
+    /// `log2_max_pic_order_cnt_lsb`. Follows HEVC spec 8.3.1 + FFmpeg's
+    /// `ff_hevc_compute_poc2` in `ps.c`.
+    ///
+    /// For BLA pictures the POC MSB is explicitly reset to 0, matching
+    /// FFmpeg's behavior.
+    fn compute_poc(
+        prev_tid0_poc: i32,
+        slice_pic_order_cnt_lsb: u32,
+        log2_max_pic_order_cnt_lsb: u8,
+        nal_unit_type: NalUnitType,
+    ) -> i32 {
+        let max_poc_lsb = 1i32 << log2_max_pic_order_cnt_lsb;
+        let prev_poc_lsb = prev_tid0_poc.rem_euclid(max_poc_lsb);
+        let prev_poc_msb = prev_tid0_poc - prev_poc_lsb;
+        let cur_lsb = slice_pic_order_cnt_lsb as i32;
+        let mut poc_msb = if cur_lsb < prev_poc_lsb && (prev_poc_lsb - cur_lsb) >= max_poc_lsb / 2 {
+            prev_poc_msb + max_poc_lsb
+        } else if cur_lsb > prev_poc_lsb && (cur_lsb - prev_poc_lsb) > max_poc_lsb / 2 {
+            prev_poc_msb - max_poc_lsb
+        } else {
+            prev_poc_msb
+        };
+        // BLA pictures: POC MSB forced to 0 per spec 8.3.1.
+        if matches!(
+            nal_unit_type,
+            NalUnitType::BlaWLp | NalUnitType::BlaWRadl | NalUnitType::BlaNLp
+        ) {
+            poc_msb = 0;
+        }
+        poc_msb + cur_lsb
+    }
+
+    /// Phase 3d-1: derive the reference picture sets for the current
+    /// picture from the slice header and the (cloned) SPS ST-RPS array.
+    /// This follows spec 8.3.2 but simplified — we don't yet track the
+    /// "follow" sets precisely or complain about missing refs, since no
+    /// actual decoding uses them yet. Good enough to have the POC lists
+    /// plumbed so Phase 3d-2 can pick them up.
+    ///
+    /// Takes an owned slice of SPS ST-RPSs rather than `&Sps` so the
+    /// caller can drop its immutable borrow of `self.sps` and mutably
+    /// touch `self.dpb` in the surrounding code. A real
+    /// spec-parity derivation would also consume the DPB to walk the
+    /// existing picture pool, but Phase 3d-1 only needs POC lists.
+    fn derive_rps_from_slice_header_parts(
+        sh: &SliceHeader,
+        sps_st_ref_pic_sets: &[ShortTermRps],
+    ) -> ReferencePictureSets {
+        let mut rps = ReferencePictureSets::default();
+
+        // IDR pictures never reference anything from the DPB.
+        if sh.nal_unit_type.is_idr() {
+            return rps;
+        }
+
+        // Resolve the active short-term RPS.
+        let st_ref: Option<&ShortTermRps> = if sh.short_term_ref_pic_set_sps_flag {
+            sps_st_ref_pic_sets.get(sh.short_term_ref_pic_set_idx as usize)
+        } else {
+            sh.short_term_rps.as_ref()
+        };
+
+        if let Some(st) = st_ref {
+            // Short-term "before current" (negative deltas the current
+            // picture uses).
+            for (i, delta) in st.delta_poc_s0.iter().enumerate() {
+                let ref_poc = sh.poc + delta;
+                if st.used_by_curr_pic_s0_flag.get(i).copied().unwrap_or(false) {
+                    rps.st_curr_before.push(ref_poc);
+                } else {
+                    rps.st_foll.push(ref_poc);
+                }
+            }
+            // Short-term "after current" (positive deltas the current
+            // picture uses).
+            for (i, delta) in st.delta_poc_s1.iter().enumerate() {
+                let ref_poc = sh.poc + delta;
+                if st.used_by_curr_pic_s1_flag.get(i).copied().unwrap_or(false) {
+                    rps.st_curr_after.push(ref_poc);
+                } else {
+                    rps.st_foll.push(ref_poc);
+                }
+            }
+        }
+
+        // Long-term references: lookup by POC LSB. Each entry either goes
+        // into `lt_curr` (used by current picture) or `lt_foll` (not
+        // used).
+        for (i, poc_lsb) in sh.long_term_rps.poc_lsb_lt.iter().enumerate() {
+            // For Phase 3d-1 we just record the LSB as the full POC
+            // (good enough for set membership; real decoding will redo
+            // the MSB computation).
+            let ref_poc = *poc_lsb as i32;
+            if sh
+                .long_term_rps
+                .used_by_curr_pic_lt_flag
+                .get(i)
+                .copied()
+                .unwrap_or(false)
+            {
+                rps.lt_curr.push(ref_poc);
+            } else {
+                rps.lt_foll.push(ref_poc);
+            }
+        }
+
+        rps
+    }
+
+    /// Phase 3d-1: walk the DPB and mark each picture according to the
+    /// current RPS. Pictures referenced by the RPS become ShortTerm /
+    /// LongTerm; everything else is flipped to UnusedForReference.
+    fn apply_rps_marking(
+        rps: &ReferencePictureSets,
+        dpb: &DecodedPictureBuffer,
+        log2_max_pic_order_cnt_lsb: u8,
+    ) {
+        let max_poc_lsb = 1i32 << log2_max_pic_order_cnt_lsb;
+        // Start from "unused" and flip back to ST/LT for any picture
+        // actually in the RPS. This is the spec's derivation order.
+        dpb.unmark_all_references();
+        for pic in dpb.pictures() {
+            let poc = pic.poc;
+            let poc_lsb = poc.rem_euclid(max_poc_lsb);
+            if rps.st_curr_before.contains(&poc)
+                || rps.st_curr_after.contains(&poc)
+                || rps.st_foll.contains(&poc)
+            {
+                pic.mark(PictureReferenceStatus::ShortTerm);
+            } else if rps.lt_curr.contains(&poc_lsb) || rps.lt_foll.contains(&poc_lsb) {
+                pic.mark(PictureReferenceStatus::LongTerm);
+            }
+        }
     }
 }
 
@@ -646,6 +930,60 @@ impl Decoder {
 mod tests {
     use super::*;
     use crate::nal::parse_annex_b;
+
+    /// Phase 3d-1: hand-verify the POC computation against the spec
+    /// formula for a grab-bag of representative cases. Matches FFmpeg's
+    /// `ff_hevc_compute_poc2` (ps.c) line-for-line.
+    #[test]
+    fn poc_compute_monotonic_lsb_no_wrap() {
+        // log2_max_poc_lsb = 4 → max_poc_lsb = 16.
+        // prev_tid0_poc = 4 (MSB=0, LSB=4), cur LSB = 5.
+        // prev_lsb = 4, diff = 1 → neither branch fires, poc_msb = 0.
+        // poc = 0 + 5 = 5.
+        assert_eq!(Decoder::compute_poc(4, 5, 4, NalUnitType::TrailR), 5);
+    }
+
+    #[test]
+    fn poc_compute_wraps_forward_across_msb() {
+        // max_poc_lsb = 16; prev_tid0_poc = 15 (MSB=0, LSB=15), cur LSB=1.
+        // cur_lsb > prev_lsb but (cur_lsb - prev_lsb) = -14 after signed
+        // subtraction... we check the spec condition:
+        //   cur_lsb < prev_lsb (1 < 15) && (prev_lsb - cur_lsb) >= max_poc_lsb/2
+        //   (15 - 1) = 14 >= 8 → yes, so poc_msb = prev_poc_msb + max_poc_lsb = 16.
+        //   poc = 16 + 1 = 17.
+        assert_eq!(Decoder::compute_poc(15, 1, 4, NalUnitType::TrailR), 17);
+    }
+
+    #[test]
+    fn poc_compute_wraps_backward_across_msb() {
+        // Classic "LSB went backwards" case (e.g. B-frame references
+        // the IDR at POC=16 with prev_tid0_poc=17 and cur LSB=0).
+        //
+        // max_poc_lsb = 16, prev_tid0_poc = 17 (MSB=16, LSB=1), cur_lsb = 15.
+        // Neither "cur_lsb < prev_lsb && (prev - cur) >= 8" nor
+        // "cur_lsb > prev_lsb && (cur - prev) > 8" holds:
+        //   15 > 1, 15 - 1 = 14 > 8 → backward wrap branch fires.
+        //   poc_msb = 16 - 16 = 0.
+        //   poc = 0 + 15 = 15.
+        assert_eq!(Decoder::compute_poc(17, 15, 4, NalUnitType::TrailR), 15);
+    }
+
+    #[test]
+    fn poc_compute_bla_forces_msb_zero() {
+        // BLA picture: POC MSB is explicitly reset to 0 regardless of
+        // `prev_tid0_poc`. With prev = 20 (MSB=16, LSB=4) and cur LSB=5,
+        // a non-BLA picture would give poc = 16 + 5 = 21, but a
+        // BLA_W_LP explicitly sets poc_msb to 0 → poc = 5.
+        assert_eq!(Decoder::compute_poc(20, 5, 4, NalUnitType::BlaWLp), 5);
+        // For TrailR the normal path returns 21.
+        assert_eq!(Decoder::compute_poc(20, 5, 4, NalUnitType::TrailR), 21);
+    }
+
+    #[test]
+    fn poc_compute_equal_lsb_passes_through() {
+        // prev_tid0_poc = 32 (MSB=32, LSB=0), cur LSB=0 → poc_msb=32.
+        assert_eq!(Decoder::compute_poc(32, 0, 4, NalUnitType::TrailR), 32);
+    }
 
     /// **Phase 2d byte-exact test**: feed `testdata/tiny_intra.h265` through
     /// `Decoder::decode_nal` and assert the resulting `Frame.y/u/v` matches

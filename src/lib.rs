@@ -15,6 +15,8 @@ mod cu_tree;
 #[allow(dead_code)]
 mod deblock;
 pub mod decoder;
+#[allow(dead_code)]
+pub mod dpb;
 pub mod error;
 #[allow(dead_code)]
 mod intra_pred;

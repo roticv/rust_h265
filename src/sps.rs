@@ -11,6 +11,302 @@ use crate::error::DecodeError;
 use crate::profile_tier_level::{ProfileTierLevel, parse_profile_tier_level};
 use crate::scaling_list::{ScalingList, parse_scaling_list_data};
 
+/// A parsed short-term reference picture set (spec 7.4.7.2).
+///
+/// Each entry references a previous decoded picture by **POC offset relative
+/// to the current picture**. `delta_poc_s0` holds the negative offsets
+/// (pictures before the current one) sorted in *decreasing* order of
+/// magnitude (closest first, i.e. the smallest magnitude entry first, since
+/// the deltas are negative). `delta_poc_s1` holds the positive offsets
+/// (pictures after the current one) sorted in *increasing* order. Matches
+/// the output of FFmpeg's `ff_hevc_decode_short_term_rps` after the sort
+/// passes.
+///
+/// This is Phase 3d-1 bitstream plumbing — the fields are parsed and stored
+/// but no actual inter decoding uses them yet.
+#[derive(Debug, Clone, Default)]
+pub struct ShortTermRps {
+    /// Number of negative (pre-current) references.
+    pub num_negative_pics: usize,
+    /// Number of positive (post-current) references.
+    pub num_positive_pics: usize,
+    /// Signed POC delta for each negative reference (all entries < 0).
+    /// Length `num_negative_pics`, sorted closest-first.
+    pub delta_poc_s0: Vec<i32>,
+    /// Signed POC delta for each positive reference (all entries > 0).
+    /// Length `num_positive_pics`, sorted closest-first.
+    pub delta_poc_s1: Vec<i32>,
+    /// `used_by_curr_pic_s0_flag[i]` — if true, the matching ST-ref is
+    /// "used by the current picture" (goes into RefPicSetStCurrBefore).
+    pub used_by_curr_pic_s0_flag: Vec<bool>,
+    /// `used_by_curr_pic_s1_flag[i]` — if true, the matching ST-ref is
+    /// "used by the current picture" (goes into RefPicSetStCurrAfter).
+    pub used_by_curr_pic_s1_flag: Vec<bool>,
+}
+
+impl ShortTermRps {
+    /// Total number of delta POCs (`NumDeltaPocs = NumNegativePics + NumPositivePics`).
+    pub fn num_delta_pocs(&self) -> usize {
+        self.num_negative_pics + self.num_positive_pics
+    }
+}
+
+/// Maximum allowed number of ST-RPSs in an SPS (spec annex A limit).
+pub const MAX_SHORT_TERM_REF_PIC_SETS: usize = 64;
+
+/// Maximum allowed number of LT reference pictures in an SPS.
+pub const MAX_LONG_TERM_REF_PICS_SPS: usize = 32;
+
+/// Parse a `st_ref_pic_set(stRpsIdx)` structure (spec 7.3.6.2).
+///
+/// `prev_rps_sets` are the ST-RPSs with indices `< stRpsIdx` that are
+/// already parsed. They're needed for the "inter ref pic set prediction"
+/// path (`inter_ref_pic_set_prediction_flag = 1`), which derives the
+/// current RPS from a previously parsed one.
+///
+/// `num_short_term_ref_pic_sets` is the total number of ST-RPSs in the SPS.
+/// For an ST-RPS parsed in the slice header (where this helper reuses the
+/// same logic), `stRpsIdx = num_short_term_ref_pic_sets`, i.e. the slice
+/// header RPS references the RPSs in `prev_rps_sets` by `delta_idx` too.
+pub fn parse_st_ref_pic_set(
+    r: &mut BitstreamReader,
+    st_rps_idx: usize,
+    num_short_term_ref_pic_sets: usize,
+    prev_rps_sets: &[ShortTermRps],
+) -> Result<ShortTermRps, DecodeError> {
+    // `inter_ref_pic_set_prediction_flag` is only signaled when stRpsIdx > 0.
+    // When stRpsIdx == 0 there is no previous RPS to predict from.
+    let inter_ref_pic_set_prediction_flag = if st_rps_idx != 0 {
+        r.read_bit()? == 1
+    } else {
+        false
+    };
+
+    if inter_ref_pic_set_prediction_flag {
+        // Resolve the reference RPS index. Per spec 7.4.7.2:
+        //   if (stRpsIdx == num_short_term_ref_pic_sets)
+        //       delta_idx_minus1 = get_ue()
+        //   else
+        //       delta_idx_minus1 = 0 (inferred)
+        //   RefRpsIdx = stRpsIdx - (delta_idx_minus1 + 1)
+        let delta_idx_minus1 = if st_rps_idx == num_short_term_ref_pic_sets {
+            r.read_ue()?
+        } else {
+            0
+        };
+        let delta_idx = (delta_idx_minus1 + 1) as usize;
+        if delta_idx > st_rps_idx {
+            return Err(DecodeError::InvalidSyntax(
+                "st_ref_pic_set: delta_idx_minus1 too large",
+            ));
+        }
+        let ref_rps_idx = st_rps_idx - delta_idx;
+        // When parsing inside the SPS (st_rps_idx < num_short_term_ref_pic_sets),
+        // we prefix-index prev_rps_sets by st_rps_idx. When parsing in the
+        // slice header (st_rps_idx == num_short_term_ref_pic_sets), the full
+        // SPS RPS array is the "prev" set; in both cases `prev_rps_sets[ref_rps_idx]`
+        // is the correct lookup.
+        let ref_rps = prev_rps_sets
+            .get(ref_rps_idx)
+            .ok_or(DecodeError::InvalidSyntax(
+                "st_ref_pic_set: ref_rps_idx out of range",
+            ))?
+            .clone();
+
+        let delta_rps_sign = r.read_bit()? == 1;
+        let abs_delta_rps_minus1 = r.read_ue()?;
+        if abs_delta_rps_minus1 >= 32768 {
+            return Err(DecodeError::InvalidSyntax(
+                "st_ref_pic_set: abs_delta_rps_minus1 out of range",
+            ));
+        }
+        let delta_rps: i32 = if delta_rps_sign {
+            -((abs_delta_rps_minus1 + 1) as i32)
+        } else {
+            (abs_delta_rps_minus1 + 1) as i32
+        };
+
+        // Read used_by_curr_pic_flag[j] and use_delta_flag[j] for
+        // j = 0..=ref_rps.num_delta_pocs(). Note the <= — the loop is one
+        // iteration longer than the number of delta POCs, to cover the new
+        // "delta_rps" term added to the current picture.
+        let ref_num_delta_pocs = ref_rps.num_delta_pocs();
+        let mut used_by_curr_pic_flag = Vec::with_capacity(ref_num_delta_pocs + 1);
+        let mut use_delta_flag = Vec::with_capacity(ref_num_delta_pocs + 1);
+        for _ in 0..=ref_num_delta_pocs {
+            let used = r.read_bit()? == 1;
+            used_by_curr_pic_flag.push(used);
+            if !used {
+                use_delta_flag.push(r.read_bit()? == 1);
+            } else {
+                use_delta_flag.push(true);
+            }
+        }
+
+        // Spec equations 7-65, 7-66, 7-67, 7-68: derive deltaPocS0/1[] and
+        // usedByCurrPicS0/1[] for the current RPS. Ported from FFmpeg
+        // `ff_hevc_decode_short_term_rps` (ps.c ~lines 103-190).
+        //
+        // We walk the reference RPS's negative pictures in reverse order,
+        // the added delta_rps entry, then the reference RPS's positive
+        // pictures in forward order; each entry that's either used or
+        // includes a use_delta_flag becomes a delta POC in the new RPS.
+        let mut delta_poc_s0: Vec<i32> = Vec::new();
+        let mut delta_poc_s1: Vec<i32> = Vec::new();
+        let mut used_s0: Vec<bool> = Vec::new();
+        let mut used_s1: Vec<bool> = Vec::new();
+
+        // Negative pictures: for j = num_negative_pics - 1 .. 0, the
+        // reference RPS's negative delta[j], plus delta_rps. If the result
+        // is still < 0 (and used_by_curr OR use_delta was set), it's a
+        // negative picture of the new RPS.
+        let ref_num_neg = ref_rps.num_negative_pics;
+        let ref_num_pos = ref_rps.num_positive_pics;
+
+        // Reverse walk over ref_rps negative pictures, then delta_rps on its own.
+        // Using spec indexing: j corresponds to ref_rps.delta_poc_s1[j_pos] for positive,
+        // but we actually iterate ref_rps.delta_poc concatenated. Let's follow the
+        // FFmpeg approach more directly: FFmpeg builds a flat delta_poc list
+        // sorted ascending. Re-order: ref_rps has delta_poc_s0 with magnitudes
+        // sorted closest-first (decreasing abs), delta_poc_s1 closest-first
+        // (increasing).
+        //
+        // Build a flat list [all s0 in ascending order, all s1 in ascending
+        // order] to mirror FFmpeg's layout.
+        let mut ref_flat: Vec<i32> = Vec::with_capacity(ref_num_delta_pocs);
+        // s0 is stored closest-first (e.g. [-1, -3, -5]); we want ascending
+        // (most-negative-first): [-5, -3, -1]. Reverse it.
+        for d in ref_rps.delta_poc_s0.iter().rev() {
+            ref_flat.push(*d);
+        }
+        for d in ref_rps.delta_poc_s1.iter() {
+            ref_flat.push(*d);
+        }
+        // The extra iteration (j == ref_num_delta_pocs) corresponds to delta_rps
+        // alone; it's inserted between s0 and s1 (before positives).
+        //
+        // Spec 7-65 / 7-66 / 7-67 / 7-68:
+        //   for (j = num_positive_pics_ref - 1; j >= 0; j--)
+        //       dPoc = deltaPocS1Ref[j] + deltaRps
+        //       if (dPoc < 0 && use_delta_flag[num_neg_ref + j])
+        //           DeltaPocS0[i++] = dPoc
+        //           UsedByCurrPicS0[i - 1] = used_by_curr_pic_flag[num_neg_ref + j]
+        //   if (deltaRps < 0 && use_delta_flag[num_delta_pocs_ref])
+        //       DeltaPocS0[i++] = deltaRps
+        //       UsedByCurrPicS0[i - 1] = used_by_curr_pic_flag[num_delta_pocs_ref]
+        //   for (j = 0; j < num_neg_ref; j++)
+        //       dPoc = deltaPocS0Ref[j] + deltaRps
+        //       if (dPoc < 0 && use_delta_flag[j])
+        //           DeltaPocS0[i++] = dPoc
+        //           UsedByCurrPicS0[i - 1] = used_by_curr_pic_flag[j]
+        //
+        // And symmetrically for DeltaPocS1.
+        //
+        // Note: ref_rps.delta_poc_s0 is indexed closest-first (j=0 is the
+        // closest negative, i.e. smallest |delta|). "deltaPocS0Ref[j]" in
+        // the spec uses the same convention.
+
+        // DeltaPocS0 (negative refs of the new RPS):
+        for j in (0..ref_num_pos).rev() {
+            let d_poc = ref_rps.delta_poc_s1[j] + delta_rps;
+            if d_poc < 0 && use_delta_flag[ref_num_neg + j] {
+                delta_poc_s0.push(d_poc);
+                used_s0.push(used_by_curr_pic_flag[ref_num_neg + j]);
+            }
+        }
+        if delta_rps < 0 && use_delta_flag[ref_num_delta_pocs] {
+            delta_poc_s0.push(delta_rps);
+            used_s0.push(used_by_curr_pic_flag[ref_num_delta_pocs]);
+        }
+        for j in 0..ref_num_neg {
+            let d_poc = ref_rps.delta_poc_s0[j] + delta_rps;
+            if d_poc < 0 && use_delta_flag[j] {
+                delta_poc_s0.push(d_poc);
+                used_s0.push(used_by_curr_pic_flag[j]);
+            }
+        }
+
+        // DeltaPocS1 (positive refs of the new RPS):
+        for j in (0..ref_num_neg).rev() {
+            let d_poc = ref_rps.delta_poc_s0[j] + delta_rps;
+            if d_poc > 0 && use_delta_flag[j] {
+                delta_poc_s1.push(d_poc);
+                used_s1.push(used_by_curr_pic_flag[j]);
+            }
+        }
+        if delta_rps > 0 && use_delta_flag[ref_num_delta_pocs] {
+            delta_poc_s1.push(delta_rps);
+            used_s1.push(used_by_curr_pic_flag[ref_num_delta_pocs]);
+        }
+        for j in 0..ref_num_pos {
+            let d_poc = ref_rps.delta_poc_s1[j] + delta_rps;
+            if d_poc > 0 && use_delta_flag[ref_num_neg + j] {
+                delta_poc_s1.push(d_poc);
+                used_s1.push(used_by_curr_pic_flag[ref_num_neg + j]);
+            }
+        }
+
+        // `delta_poc_s0` we built above is already in "closest-first"
+        // order thanks to the walk direction. Same for `delta_poc_s1`.
+
+        Ok(ShortTermRps {
+            num_negative_pics: delta_poc_s0.len(),
+            num_positive_pics: delta_poc_s1.len(),
+            delta_poc_s0,
+            delta_poc_s1,
+            used_by_curr_pic_s0_flag: used_s0,
+            used_by_curr_pic_s1_flag: used_s1,
+        })
+    } else {
+        let num_negative_pics = r.read_ue()? as usize;
+        let num_positive_pics = r.read_ue()? as usize;
+        if num_negative_pics > 16 || num_positive_pics > 16 {
+            return Err(DecodeError::InvalidSyntax(
+                "st_ref_pic_set: too many reference pictures",
+            ));
+        }
+
+        let mut delta_poc_s0 = Vec::with_capacity(num_negative_pics);
+        let mut used_by_curr_pic_s0_flag = Vec::with_capacity(num_negative_pics);
+        let mut prev: i32 = 0;
+        for _ in 0..num_negative_pics {
+            let delta_poc_s0_minus1 = r.read_ue()?;
+            if delta_poc_s0_minus1 >= 32768 {
+                return Err(DecodeError::InvalidSyntax(
+                    "st_ref_pic_set: delta_poc_s0_minus1 out of range",
+                ));
+            }
+            prev -= (delta_poc_s0_minus1 + 1) as i32;
+            delta_poc_s0.push(prev);
+            used_by_curr_pic_s0_flag.push(r.read_bit()? == 1);
+        }
+
+        let mut delta_poc_s1 = Vec::with_capacity(num_positive_pics);
+        let mut used_by_curr_pic_s1_flag = Vec::with_capacity(num_positive_pics);
+        let mut prev: i32 = 0;
+        for _ in 0..num_positive_pics {
+            let delta_poc_s1_minus1 = r.read_ue()?;
+            if delta_poc_s1_minus1 >= 32768 {
+                return Err(DecodeError::InvalidSyntax(
+                    "st_ref_pic_set: delta_poc_s1_minus1 out of range",
+                ));
+            }
+            prev += (delta_poc_s1_minus1 + 1) as i32;
+            delta_poc_s1.push(prev);
+            used_by_curr_pic_s1_flag.push(r.read_bit()? == 1);
+        }
+
+        Ok(ShortTermRps {
+            num_negative_pics,
+            num_positive_pics,
+            delta_poc_s0,
+            delta_poc_s1,
+            used_by_curr_pic_s0_flag,
+            used_by_curr_pic_s1_flag,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Sps {
     pub sps_video_parameter_set_id: u8,
@@ -56,9 +352,27 @@ pub struct Sps {
     /// in this SPS. We don't have deblocking yet so we just store this.
     pub pcm_loop_filter_disabled_flag: bool,
     pub num_short_term_ref_pic_sets: u32,
+    /// Phase 3d-1: parsed SPS short-term reference picture sets. Length
+    /// `num_short_term_ref_pic_sets`. Used by slice headers that select an
+    /// RPS by index via `short_term_ref_pic_set_sps_flag`.
+    pub st_ref_pic_sets: Vec<ShortTermRps>,
     pub long_term_ref_pics_present_flag: bool,
+    /// Phase 3d-1: SPS long-term reference picture info
+    /// (`num_long_term_ref_pics_sps`, `lt_ref_pic_poc_lsb_sps[]`,
+    /// `used_by_curr_pic_lt_sps_flag[]`). Empty when
+    /// `long_term_ref_pics_present_flag == false`.
+    pub num_long_term_ref_pics_sps: u32,
+    pub lt_ref_pic_poc_lsb_sps: Vec<u32>,
+    pub used_by_curr_pic_lt_sps_flag: Vec<bool>,
     pub sps_temporal_mvp_enabled_flag: bool,
     pub strong_intra_smoothing_enabled_flag: bool,
+    /// Phase 3d-1: DPB sizing fields parsed from the "sub-layer ordering
+    /// info" in the SPS. Stored at the topmost sublayer
+    /// (`sps_max_sub_layers_minus1`). Used by `DecodedPictureBuffer` to
+    /// decide when to bump pictures out to the display.
+    pub sps_max_dec_pic_buffering_minus1: u32,
+    pub sps_max_num_reorder_pics: u32,
+    pub sps_max_latency_increase_plus1: u32,
 }
 
 impl Sps {
@@ -128,10 +442,18 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     } else {
         sps_max_sub_layers_minus1 as usize
     };
+    // Phase 3d-1: capture the topmost sub-layer's DPB sizing fields.
+    // The spec says fields for sub-layers below `sps_max_sub_layers_minus1`
+    // are only signaled when the present flag is set; otherwise all layers
+    // inherit the topmost layer's values. For our single-sublayer fixtures
+    // we simply capture whatever sublayer is actually signaled.
+    let mut sps_max_dec_pic_buffering_minus1: u32 = 0;
+    let mut sps_max_num_reorder_pics: u32 = 0;
+    let mut sps_max_latency_increase_plus1: u32 = 0;
     for _ in i_start..=sps_max_sub_layers_minus1 as usize {
-        let _max_dec_pic_buffering_minus1 = r.read_ue()?;
-        let _max_num_reorder_pics = r.read_ue()?;
-        let _max_latency_increase_plus1 = r.read_ue()?;
+        sps_max_dec_pic_buffering_minus1 = r.read_ue()?;
+        sps_max_num_reorder_pics = r.read_ue()?;
+        sps_max_latency_increase_plus1 = r.read_ue()?;
     }
 
     let log2_min_luma_coding_block_size_minus3 = r.read_ue()?;
@@ -201,19 +523,44 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     };
 
     let num_short_term_ref_pic_sets = r.read_ue()?;
-    if num_short_term_ref_pic_sets > 0 {
-        // st_ref_pic_set() parsing is required for Phase 2; for Phase 1 we
-        // gate it. The Phase 1 fixture (single intra frame) has zero ST RPSs.
-        return Err(DecodeError::Unsupported(
-            "st_ref_pic_set parsing not yet implemented",
+    if num_short_term_ref_pic_sets as usize > MAX_SHORT_TERM_REF_PIC_SETS {
+        return Err(DecodeError::InvalidSyntax(
+            "num_short_term_ref_pic_sets out of range",
         ));
+    }
+    // Phase 3d-1: parse every SPS short-term RPS. Stored on the SPS for
+    // later slice-header lookup via `short_term_ref_pic_set_sps_flag`.
+    let mut st_ref_pic_sets: Vec<ShortTermRps> =
+        Vec::with_capacity(num_short_term_ref_pic_sets as usize);
+    for i in 0..num_short_term_ref_pic_sets as usize {
+        let rps = parse_st_ref_pic_set(
+            &mut r,
+            i,
+            num_short_term_ref_pic_sets as usize,
+            &st_ref_pic_sets,
+        )?;
+        st_ref_pic_sets.push(rps);
     }
 
     let long_term_ref_pics_present_flag = r.read_bit()? == 1;
+    // Phase 3d-1: parse SPS long-term reference picture info but do nothing
+    // with it yet (actual use is Phase 3d-2+).
+    let mut num_long_term_ref_pics_sps: u32 = 0;
+    let mut lt_ref_pic_poc_lsb_sps: Vec<u32> = Vec::new();
+    let mut used_by_curr_pic_lt_sps_flag: Vec<bool> = Vec::new();
     if long_term_ref_pics_present_flag {
-        return Err(DecodeError::Unsupported(
-            "long-term reference pictures not yet supported",
-        ));
+        num_long_term_ref_pics_sps = r.read_ue()?;
+        if num_long_term_ref_pics_sps as usize > MAX_LONG_TERM_REF_PICS_SPS {
+            return Err(DecodeError::InvalidSyntax(
+                "num_long_term_ref_pics_sps out of range",
+            ));
+        }
+        lt_ref_pic_poc_lsb_sps.reserve(num_long_term_ref_pics_sps as usize);
+        used_by_curr_pic_lt_sps_flag.reserve(num_long_term_ref_pics_sps as usize);
+        for _ in 0..num_long_term_ref_pics_sps {
+            lt_ref_pic_poc_lsb_sps.push(r.read_bits(log2_max_pic_order_cnt_lsb)?);
+            used_by_curr_pic_lt_sps_flag.push(r.read_bit()? == 1);
+        }
     }
 
     let sps_temporal_mvp_enabled_flag = r.read_bit()? == 1;
@@ -252,8 +599,72 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         log2_max_pcm_cb_size,
         pcm_loop_filter_disabled_flag,
         num_short_term_ref_pic_sets,
+        st_ref_pic_sets,
         long_term_ref_pics_present_flag,
+        num_long_term_ref_pics_sps,
+        lt_ref_pic_poc_lsb_sps,
+        used_by_curr_pic_lt_sps_flag,
         sps_temporal_mvp_enabled_flag,
         strong_intra_smoothing_enabled_flag,
+        sps_max_dec_pic_buffering_minus1,
+        sps_max_num_reorder_pics,
+        sps_max_latency_increase_plus1,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase 3d-1: parse a hand-built `st_ref_pic_set(0, ...)` describing a
+    /// "single previous reference" set.
+    ///
+    /// Layout (explicit, no inter-ref prediction):
+    ///   inter_ref_pic_set_prediction_flag: (absent, stRpsIdx == 0)
+    ///   num_negative_pics = 1  (ue = "010")
+    ///   num_positive_pics = 0  (ue = "1")
+    ///   delta_poc_s0_minus1[0] = 0 (ue = "1")        → deltaPocS0[0] = -1
+    ///   used_by_curr_pic_s0_flag[0] = 1              → bit "1"
+    ///
+    /// Bit stream:  010  1  1  1  = 0101 11_ = 0x5C
+    #[test]
+    fn parse_single_prev_ref_rps() {
+        let bytes = [0x5C];
+        let mut r = BitstreamReader::new(&bytes);
+        let rps = parse_st_ref_pic_set(&mut r, 0, 1, &[]).expect("parse st_ref_pic_set");
+        assert_eq!(rps.num_negative_pics, 1);
+        assert_eq!(rps.num_positive_pics, 0);
+        assert_eq!(rps.delta_poc_s0, vec![-1]);
+        assert!(rps.delta_poc_s1.is_empty());
+        assert_eq!(rps.used_by_curr_pic_s0_flag, vec![true]);
+        assert!(rps.used_by_curr_pic_s1_flag.is_empty());
+        assert_eq!(rps.num_delta_pocs(), 1);
+    }
+
+    /// Phase 3d-1: a 2-negative + 1-positive RPS (common IBP GOP pattern).
+    ///
+    /// Bits:
+    ///   num_negative_pics = 2  → ue code "011"
+    ///   num_positive_pics = 1  → ue code "010"
+    ///   delta_poc_s0_minus1[0] = 0 → "1"   (delta = -1)
+    ///   used_by_curr_pic_s0_flag[0] = 1    → "1"
+    ///   delta_poc_s0_minus1[1] = 0 → "1"   (delta = -1 - 1 = -2)
+    ///   used_by_curr_pic_s0_flag[1] = 0    → "0"
+    ///   delta_poc_s1_minus1[0] = 0 → "1"   (delta = +1)
+    ///   used_by_curr_pic_s1_flag[0] = 1    → "1"
+    ///
+    /// Concatenated: 011 010 1 1 1 0 1 1 = 0110 1011 1011
+    ///              = 0x6B 0xB0 (padded with trailing zeros).
+    #[test]
+    fn parse_two_negative_one_positive_rps() {
+        let bytes = [0x6B, 0xB0];
+        let mut r = BitstreamReader::new(&bytes);
+        let rps = parse_st_ref_pic_set(&mut r, 0, 1, &[]).expect("parse st_ref_pic_set");
+        assert_eq!(rps.num_negative_pics, 2);
+        assert_eq!(rps.num_positive_pics, 1);
+        assert_eq!(rps.delta_poc_s0, vec![-1, -2]);
+        assert_eq!(rps.delta_poc_s1, vec![1]);
+        assert_eq!(rps.used_by_curr_pic_s0_flag, vec![true, false]);
+        assert_eq!(rps.used_by_curr_pic_s1_flag, vec![true]);
+    }
 }

@@ -18,7 +18,7 @@ use crate::bitstream::BitstreamReader;
 use crate::error::DecodeError;
 use crate::nal::NalUnitType;
 use crate::pps::Pps;
-use crate::sps::Sps;
+use crate::sps::{ShortTermRps, Sps, parse_st_ref_pic_set};
 
 /// HEVC slice type (spec table 7-7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +26,23 @@ pub enum SliceType {
     B = 0,
     P = 1,
     I = 2,
+}
+
+/// Per-slice long-term reference picture set (parsed from the slice header
+/// when `long_term_ref_pics_present_flag = 1`).
+///
+/// For Phase 3d-1 we parse and store these fields but the decoder doesn't
+/// yet use them (actual reference list construction lands in later phases).
+#[derive(Debug, Clone, Default)]
+pub struct LongTermRefPicSet {
+    /// POC LSB for each long-term reference (either inherited from the SPS
+    /// LT table via `lt_idx_sps` or signaled inline as `poc_lsb_lt[i]`).
+    pub poc_lsb_lt: Vec<u32>,
+    /// `used_by_curr_pic_lt_flag[i]`.
+    pub used_by_curr_pic_lt_flag: Vec<bool>,
+    /// Optional POC MSB delta, per spec 7.4.7.1 "long-term refs".
+    pub delta_poc_msb_present_flag: Vec<bool>,
+    pub delta_poc_msb_cycle_lt: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +81,56 @@ pub struct SliceHeader {
     /// Number of bits consumed by the slice header so we know where the
     /// slice data (CABAC bytestream) begins.
     pub header_size_bits: usize,
+
+    // --- Phase 3d-1 inter bitstream fields (parsed but not yet used for
+    // actual decoding) ---
+    /// `short_term_ref_pic_set_sps_flag`. When true, the slice's ST RPS is
+    /// `sps.st_ref_pic_sets[short_term_ref_pic_set_idx]`. When false, the
+    /// slice defined its own inline RPS in `short_term_rps`.
+    pub short_term_ref_pic_set_sps_flag: bool,
+    /// Index into `sps.st_ref_pic_sets` when
+    /// `short_term_ref_pic_set_sps_flag == true`; otherwise unused.
+    pub short_term_ref_pic_set_idx: u32,
+    /// Inline ST RPS parsed from the slice header when
+    /// `short_term_ref_pic_set_sps_flag == false`. `None` for IDR slices
+    /// (no RPS is coded) or when the flag was set.
+    pub short_term_rps: Option<ShortTermRps>,
+    /// Parsed long-term RPS for the slice. Empty for IDR slices or SPS
+    /// without `long_term_ref_pics_present_flag`.
+    pub long_term_rps: LongTermRefPicSet,
+    /// `slice_temporal_mvp_enabled_flag`. Only parsed when
+    /// `sps.sps_temporal_mvp_enabled_flag = 1`. Defaults to false.
+    pub slice_temporal_mvp_enabled_flag: bool,
+    /// `num_ref_idx_l0_active_minus1` after override (or the PPS default).
+    /// Always >= 0 for P/B slices, 0 otherwise.
+    pub num_ref_idx_l0_active_minus1: u32,
+    /// `num_ref_idx_l1_active_minus1` after override (or the PPS default).
+    /// Only meaningful for B slices.
+    pub num_ref_idx_l1_active_minus1: u32,
+    /// Phase 3d-1: parsed but not used.
+    pub mvd_l1_zero_flag: bool,
+    /// CABAC init flag (when `pps.cabac_init_present_flag && P/B slice`).
+    pub cabac_init_flag: bool,
+    /// For temporal MVP: which reference list holds the collocated picture
+    /// (0 = L0, 1 = L1). In P slices it's always 0.
+    pub collocated_from_l0_flag: bool,
+    /// For temporal MVP: the collocated reference index inside the chosen list.
+    pub collocated_ref_idx: u32,
+    /// `MaxNumMergeCand = 5 - five_minus_max_num_merge_cand`. Defaults to 5
+    /// for I slices (where it's not signaled) to avoid any "unset" sentinel.
+    pub max_num_merge_cand: u32,
+    /// NAL unit type copy — needed for POC derivation downstream.
+    pub nal_unit_type: NalUnitType,
+    /// NAL temporal id — used by the DPB's "prev_tid0" tracking. Always 0
+    /// for fixtures we have today; populated by `Decoder::decode_slice` on
+    /// behalf of the slice since the parser doesn't see the NAL header.
+    pub temporal_id: u8,
+    /// Phase 3d-1: computed picture POC. For IDR slices this is 0; for
+    /// non-IDR slices it's filled in by `Decoder::decode_slice` via
+    /// `compute_poc`. The parser leaves it at the placeholder value
+    /// (signed i32 equivalent of `slice_pic_order_cnt_lsb`) and the
+    /// decoder overwrites it.
+    pub poc: i32,
 }
 
 /// Parse the slice segment header for a single VCL NAL unit.
@@ -138,7 +205,7 @@ pub fn parse_slice_segment_header(
     // independent slice segment they are decoded from the bitstream.
     let mut slice_type = SliceType::I;
     let mut pic_output_flag = true;
-    let slice_pic_order_cnt_lsb = 0u32;
+    let mut slice_pic_order_cnt_lsb = 0u32;
     let mut slice_sao_luma_flag = false;
     let mut slice_sao_chroma_flag = false;
     let mut slice_qp_delta = 0i32;
@@ -146,6 +213,21 @@ pub fn parse_slice_segment_header(
     let mut slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
     let mut slice_beta_offset_div2 = 0i32;
     let mut slice_tc_offset_div2 = 0i32;
+
+    // Phase 3d-1 inter bitstream fields. Defaults match what an I-slice
+    // picture expects: no RPS entries, no temporal MVP, zero ref indices.
+    let mut short_term_ref_pic_set_sps_flag = false;
+    let mut short_term_ref_pic_set_idx: u32 = 0;
+    let mut short_term_rps: Option<ShortTermRps> = None;
+    let mut long_term_rps = LongTermRefPicSet::default();
+    let mut slice_temporal_mvp_enabled_flag = false;
+    let mut num_ref_idx_l0_active_minus1: u32 = pps.num_ref_idx_l0_default_active_minus1;
+    let mut num_ref_idx_l1_active_minus1: u32 = pps.num_ref_idx_l1_default_active_minus1;
+    let mut mvd_l1_zero_flag = false;
+    let mut cabac_init_flag = false;
+    let mut collocated_from_l0_flag = true;
+    let mut collocated_ref_idx: u32 = 0;
+    let mut max_num_merge_cand: u32 = 5;
 
     if !dependent_slice_segment_flag {
         let slice_type_raw = r.read_ue()?;
@@ -158,13 +240,6 @@ pub fn parse_slice_segment_header(
             }
         };
 
-        if slice_type != SliceType::I {
-            // Phase 2 only handles I-slices. P/B slices need ref list + MV decode.
-            return Err(DecodeError::Unsupported(
-                "only I-slices are supported in Phase 2",
-            ));
-        }
-
         if pps.output_flag_present_flag {
             pic_output_flag = r.read_bit()? == 1;
         }
@@ -172,13 +247,51 @@ pub fn parse_slice_segment_header(
         // separate_colour_plane_flag is gated by chroma_format_idc==3, which we
         // already rejected in SPS parsing.
 
+        // Phase 3d-1: POC LSB + RPS parsing for non-IDR pictures. IDR slices
+        // still skip this whole section (POC forced to 0).
         if !nal_unit_type.is_idr() {
-            // POC + RPS section. IDR pictures skip this entirely (POC = 0).
-            // We don't yet handle non-IDR slices, so reject before consuming any
-            // bits — that way nothing here can mis-advance the bitstream.
-            return Err(DecodeError::Unsupported(
-                "non-IDR slice header parsing not yet implemented",
-            ));
+            slice_pic_order_cnt_lsb = r.read_bits(sps.log2_max_pic_order_cnt_lsb)?;
+
+            short_term_ref_pic_set_sps_flag = r.read_bit()? == 1;
+            if !short_term_ref_pic_set_sps_flag {
+                // Inline ST RPS. Index passed is num_short_term_ref_pic_sets
+                // per spec, so the slice RPS can use any of the SPS RPSs as
+                // a reference via delta_idx.
+                let rps = parse_st_ref_pic_set(
+                    &mut r,
+                    sps.num_short_term_ref_pic_sets as usize,
+                    sps.num_short_term_ref_pic_sets as usize,
+                    &sps.st_ref_pic_sets,
+                )?;
+                short_term_rps = Some(rps);
+            } else {
+                // Selected by index. Width is ceil(log2(num_short_term_ref_pic_sets));
+                // zero bits when only one RPS is defined.
+                if sps.num_short_term_ref_pic_sets == 0 {
+                    return Err(DecodeError::InvalidSyntax(
+                        "short_term_ref_pic_set_sps_flag set but SPS has no ST-RPSs",
+                    ));
+                }
+                let numbits = ceil_log2(sps.num_short_term_ref_pic_sets) as u8;
+                short_term_ref_pic_set_idx = if numbits > 0 {
+                    r.read_bits(numbits)?
+                } else {
+                    0
+                };
+                if short_term_ref_pic_set_idx >= sps.num_short_term_ref_pic_sets {
+                    return Err(DecodeError::InvalidSyntax(
+                        "short_term_ref_pic_set_idx out of range",
+                    ));
+                }
+            }
+
+            if sps.long_term_ref_pics_present_flag {
+                long_term_rps = parse_lt_ref_pic_set(&mut r, sps)?;
+            }
+
+            if sps.sps_temporal_mvp_enabled_flag {
+                slice_temporal_mvp_enabled_flag = r.read_bit()? == 1;
+            }
         }
 
         if sps.sample_adaptive_offset_enabled_flag {
@@ -187,7 +300,82 @@ pub fn parse_slice_segment_header(
             slice_sao_chroma_flag = r.read_bit()? == 1;
         }
 
-        // The big P/B section is skipped because slice_type == I above.
+        // Phase 3d-1: P/B-slice inter section (only parsing, no decoding).
+        if slice_type != SliceType::I {
+            let num_ref_idx_active_override_flag = r.read_bit()? == 1;
+            if num_ref_idx_active_override_flag {
+                num_ref_idx_l0_active_minus1 = r.read_ue()?;
+                if slice_type == SliceType::B {
+                    num_ref_idx_l1_active_minus1 = r.read_ue()?;
+                }
+            }
+            if num_ref_idx_l0_active_minus1 >= 15 || num_ref_idx_l1_active_minus1 >= 15 {
+                return Err(DecodeError::InvalidSyntax(
+                    "num_ref_idx_l{0,1}_active_minus1 out of range",
+                ));
+            }
+
+            // ref_pic_lists_modification(): we skip-parse this conservatively.
+            // For Phase 3d-1 we only reject-skip — no real fixture we care
+            // about in this phase toggles it.
+            if pps.lists_modification_present_flag {
+                // Spec 7.3.6.2: only signaled when NumPocTotalCurr > 1. Since
+                // we don't compute NumPocTotalCurr yet, reject loudly if a
+                // fixture actually trips this path.
+                return Err(DecodeError::Unsupported(
+                    "ref_pic_lists_modification not yet supported (Phase 3d-3)",
+                ));
+            }
+
+            if slice_type == SliceType::B {
+                mvd_l1_zero_flag = r.read_bit()? == 1;
+            }
+            if pps.cabac_init_present_flag {
+                cabac_init_flag = r.read_bit()? == 1;
+            }
+            if slice_temporal_mvp_enabled_flag {
+                if slice_type == SliceType::B {
+                    collocated_from_l0_flag = r.read_bit()? == 1;
+                } else {
+                    // P slice: always L0.
+                    collocated_from_l0_flag = true;
+                }
+                // Whether we read collocated_ref_idx depends on the number
+                // of refs in the selected list. Follow FFmpeg's signaling
+                // rule: `nb_refs[collocated_list] > 1`.
+                let active_list_max = if collocated_from_l0_flag {
+                    num_ref_idx_l0_active_minus1
+                } else {
+                    num_ref_idx_l1_active_minus1
+                };
+                if active_list_max > 0 {
+                    collocated_ref_idx = r.read_ue()?;
+                }
+            }
+
+            if (pps.weighted_pred_flag && slice_type == SliceType::P)
+                || (pps.weighted_bipred_flag && slice_type == SliceType::B)
+            {
+                // Parse-and-discard the pred_weight_table (Phase 3d-1
+                // doesn't use the values, but we need to advance past them
+                // so downstream parsing is byte-aligned).
+                parse_pred_weight_table(
+                    &mut r,
+                    slice_type,
+                    num_ref_idx_l0_active_minus1 + 1,
+                    num_ref_idx_l1_active_minus1 + 1,
+                    sps.chroma_format_idc,
+                )?;
+            }
+
+            let five_minus_max_num_merge_cand = r.read_ue()?;
+            if five_minus_max_num_merge_cand > 4 {
+                return Err(DecodeError::InvalidSyntax(
+                    "five_minus_max_num_merge_cand out of range",
+                ));
+            }
+            max_num_merge_cand = 5 - five_minus_max_num_merge_cand;
+        }
 
         slice_qp_delta = r.read_se()?;
         slice_qp_y = pps.init_qp + slice_qp_delta;
@@ -294,7 +482,152 @@ pub fn parse_slice_segment_header(
         slice_tc_offset_div2,
         entry_point_offsets,
         header_size_bits,
+        short_term_ref_pic_set_sps_flag,
+        short_term_ref_pic_set_idx,
+        short_term_rps,
+        long_term_rps,
+        slice_temporal_mvp_enabled_flag,
+        num_ref_idx_l0_active_minus1,
+        num_ref_idx_l1_active_minus1,
+        mvd_l1_zero_flag,
+        cabac_init_flag,
+        collocated_from_l0_flag,
+        collocated_ref_idx,
+        max_num_merge_cand,
+        nal_unit_type,
+        temporal_id: 0,
+        // IDR pictures have POC = 0 regardless of slice_pic_order_cnt_lsb
+        // (which is actually not even coded for IDR). For non-IDR slices
+        // the decoder will overwrite this with the full computed POC via
+        // `compute_poc` once it has access to prev_tid0_poc.
+        poc: 0,
     })
+}
+
+/// Parse `lt_ref_pic_set()` per spec 7.3.6.1 (semantics 7.4.7.1). Called
+/// only when `sps.long_term_ref_pics_present_flag` is true and the slice
+/// is non-IDR.
+fn parse_lt_ref_pic_set(
+    r: &mut BitstreamReader,
+    sps: &Sps,
+) -> Result<LongTermRefPicSet, DecodeError> {
+    let num_long_term_sps = if sps.num_long_term_ref_pics_sps > 0 {
+        r.read_ue()?
+    } else {
+        0
+    };
+    let num_long_term_pics = r.read_ue()?;
+    if num_long_term_sps > sps.num_long_term_ref_pics_sps {
+        return Err(DecodeError::InvalidSyntax(
+            "num_long_term_sps exceeds SPS count",
+        ));
+    }
+    let total = num_long_term_sps + num_long_term_pics;
+    if total as usize > crate::sps::MAX_LONG_TERM_REF_PICS_SPS * 2 {
+        return Err(DecodeError::InvalidSyntax(
+            "long-term reference count out of range",
+        ));
+    }
+
+    let mut set = LongTermRefPicSet {
+        poc_lsb_lt: Vec::with_capacity(total as usize),
+        used_by_curr_pic_lt_flag: Vec::with_capacity(total as usize),
+        delta_poc_msb_present_flag: Vec::with_capacity(total as usize),
+        delta_poc_msb_cycle_lt: Vec::with_capacity(total as usize),
+    };
+
+    for i in 0..total {
+        if i < num_long_term_sps {
+            let lt_idx_sps = if sps.num_long_term_ref_pics_sps > 1 {
+                let numbits = ceil_log2(sps.num_long_term_ref_pics_sps) as u8;
+                r.read_bits(numbits)? as usize
+            } else {
+                0usize
+            };
+            if lt_idx_sps >= sps.lt_ref_pic_poc_lsb_sps.len() {
+                return Err(DecodeError::InvalidSyntax("lt_idx_sps out of range"));
+            }
+            set.poc_lsb_lt.push(sps.lt_ref_pic_poc_lsb_sps[lt_idx_sps]);
+            set.used_by_curr_pic_lt_flag
+                .push(sps.used_by_curr_pic_lt_sps_flag[lt_idx_sps]);
+        } else {
+            set.poc_lsb_lt
+                .push(r.read_bits(sps.log2_max_pic_order_cnt_lsb)?);
+            set.used_by_curr_pic_lt_flag.push(r.read_bit()? == 1);
+        }
+        let msb_present = r.read_bit()? == 1;
+        set.delta_poc_msb_present_flag.push(msb_present);
+        if msb_present {
+            set.delta_poc_msb_cycle_lt.push(r.read_ue()?);
+        } else {
+            set.delta_poc_msb_cycle_lt.push(0);
+        }
+    }
+    Ok(set)
+}
+
+/// Parse `pred_weight_table()` (spec 7.3.6.3). Values are consumed to
+/// advance the bit position but not stored — Phase 3d-1 doesn't use them.
+fn parse_pred_weight_table(
+    r: &mut BitstreamReader,
+    slice_type: SliceType,
+    nb_ref_l0: u32,
+    nb_ref_l1: u32,
+    chroma_format_idc: u32,
+) -> Result<(), DecodeError> {
+    let _luma_log2_weight_denom = r.read_ue()?;
+    if chroma_format_idc != 0 {
+        let _delta_chroma_log2_weight_denom = r.read_se()?;
+    }
+    // L0 weights.
+    let mut luma_weight_l0_flag: Vec<bool> = Vec::with_capacity(nb_ref_l0 as usize);
+    for _ in 0..nb_ref_l0 {
+        luma_weight_l0_flag.push(r.read_bit()? == 1);
+    }
+    let mut chroma_weight_l0_flag: Vec<bool> = Vec::with_capacity(nb_ref_l0 as usize);
+    if chroma_format_idc != 0 {
+        for _ in 0..nb_ref_l0 {
+            chroma_weight_l0_flag.push(r.read_bit()? == 1);
+        }
+    }
+    for i in 0..nb_ref_l0 as usize {
+        if luma_weight_l0_flag[i] {
+            let _delta_luma_weight_l0 = r.read_se()?;
+            let _luma_offset_l0 = r.read_se()?;
+        }
+        if chroma_format_idc != 0 && chroma_weight_l0_flag[i] {
+            for _ in 0..2 {
+                let _delta_chroma_weight_l0 = r.read_se()?;
+                let _delta_chroma_offset_l0 = r.read_se()?;
+            }
+        }
+    }
+    // L1 weights (B-slice only).
+    if slice_type == SliceType::B {
+        let mut luma_weight_l1_flag: Vec<bool> = Vec::with_capacity(nb_ref_l1 as usize);
+        for _ in 0..nb_ref_l1 {
+            luma_weight_l1_flag.push(r.read_bit()? == 1);
+        }
+        let mut chroma_weight_l1_flag: Vec<bool> = Vec::with_capacity(nb_ref_l1 as usize);
+        if chroma_format_idc != 0 {
+            for _ in 0..nb_ref_l1 {
+                chroma_weight_l1_flag.push(r.read_bit()? == 1);
+            }
+        }
+        for i in 0..nb_ref_l1 as usize {
+            if luma_weight_l1_flag[i] {
+                let _delta_luma_weight_l1 = r.read_se()?;
+                let _luma_offset_l1 = r.read_se()?;
+            }
+            if chroma_format_idc != 0 && chroma_weight_l1_flag[i] {
+                for _ in 0..2 {
+                    let _delta_chroma_weight_l1 = r.read_se()?;
+                    let _delta_chroma_offset_l1 = r.read_se()?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Helper for `byte_alignment()` since the bitstream reader does not expose
@@ -403,9 +736,16 @@ mod tests {
             log2_max_pcm_cb_size: 0,
             pcm_loop_filter_disabled_flag: false,
             num_short_term_ref_pic_sets: 0,
+            st_ref_pic_sets: Vec::new(),
             long_term_ref_pics_present_flag: false,
+            num_long_term_ref_pics_sps: 0,
+            lt_ref_pic_poc_lsb_sps: Vec::new(),
+            used_by_curr_pic_lt_sps_flag: Vec::new(),
             sps_temporal_mvp_enabled_flag: true,
             strong_intra_smoothing_enabled_flag: false,
+            sps_max_dec_pic_buffering_minus1: 0,
+            sps_max_num_reorder_pics: 0,
+            sps_max_latency_increase_plus1: 0,
         }
     }
 
