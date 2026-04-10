@@ -1,12 +1,14 @@
-//! HEVC slice data parsing — coding tree, coding unit, intra mode signaling.
+//! HEVC slice data parsing — coding tree, coding unit, intra/inter mode signaling.
 //!
 //! Phase 2c-1 scope: recursive `coding_quadtree` / `coding_unit` decoding for
-//! the I-slice intra path, **stopping after intra prediction mode signaling**.
-//! Transform tree, residual coding, intra sample generation, and inverse
-//! transform are not yet implemented — those are Phase 2c-2 / 2c-3 / 2c-4.
+//! the I-slice intra path. Phase 3d-3 extends to inter CUs in P/B slices:
+//! `cu_skip_flag`, `pred_mode_flag`, merge/AMVP syntax, `mvd_coding`, and
+//! `rqt_root_cbf`. Motion compensation is NOT done here (Phase 3d-6) — the
+//! decoded MVs are stored in `tab_mvf` and a placeholder (128) prediction is
+//! used so that the CABAC stream is consumed correctly.
 //!
 //! The recursion structure mirrors FFmpeg `libavcodec/hevc/hevcdec.c`
-//! (`hls_coding_quadtree`, `hls_coding_unit`, `intra_prediction_unit`,
+//! (`hls_coding_quadtree`, `hls_coding_unit`, `hls_prediction_unit`,
 //! `luma_intra_pred_mode`) so that decoded values match byte-for-byte.
 
 use crate::cabac::{CabacContexts, CabacReader};
@@ -19,6 +21,7 @@ use crate::intra_pred::{
 use crate::inverse_transform::apply_inverse_transform;
 use crate::pps::Pps;
 use crate::residual_coding::{ResidualBlock, ResidualPlane, ScanOrder, decode_residual_coding};
+use crate::slice::SliceType;
 use crate::sps::Sps;
 
 /// HEVC luma intra prediction mode constants (spec table 8-1).
@@ -29,6 +32,14 @@ pub const INTRA_ANGULAR_26: u8 = 26;
 /// Used by the chroma DM-substitution rule when the mapped chroma mode
 /// equals the luma mode (spec table 8-3).
 pub const INTRA_ANGULAR_34: u8 = 34;
+
+/// HEVC prediction mode (spec table 7-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredMode {
+    Intra,
+    Inter,
+    Skip,
+}
 
 /// HEVC partition mode (spec table 7-10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +52,42 @@ pub enum PartMode {
     Part2NxnD,
     PartnLx2N,
     PartnRx2N,
+}
+
+/// Inter prediction direction (spec table 7-13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterPredIdc {
+    PredL0,
+    PredL1,
+    PredBi,
+}
+
+/// Motion vector (quarter-pel precision).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Mv {
+    pub x: i16,
+    pub y: i16,
+}
+
+/// Per min-PU motion field entry, analogous to FFmpeg's `MvField`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MvField {
+    pub mv: [Mv; 2],
+    pub ref_idx: [i8; 2],
+    /// Bit 0 = L0 active, bit 1 = L1 active.
+    pub pred_flag: u8,
+}
+
+/// Slice-level parameters needed by the CU tree for inter decoding.
+/// Threaded through `decode_coding_quadtree` / `decode_coding_unit` so the
+/// syntax decoders can see `slice_type`, `max_num_merge_cand`, etc.
+#[derive(Debug, Clone)]
+pub struct SliceParams {
+    pub slice_type: SliceType,
+    pub max_num_merge_cand: u32,
+    pub num_ref_idx_l0_active: u32,
+    pub num_ref_idx_l1_active: u32,
+    pub mvd_l1_zero_flag: bool,
 }
 
 /// Per-picture mutable state needed during slice decode.
@@ -107,6 +154,13 @@ pub struct PictureState {
     /// Consulted by `compute_luma_avail` to treat cross-tile neighbor
     /// samples as unavailable for intra prediction (spec 6.4.4 / 8.4.2).
     pub tab_tile_id: Vec<u32>,
+
+    /// Phase 3d-3: per min-PU motion field (MV + ref_idx + pred_flag).
+    /// Indexed by `(y >> log2_min_pu_size) * min_pu_width + (x >> log2_min_pu_size)`.
+    pub tab_mvf: Vec<MvField>,
+    /// Phase 3d-3: per min-CB skip flag, used for `cu_skip_flag` neighbor
+    /// context derivation. Indexed the same as `tab_ct_depth`.
+    pub tab_skip_flag: Vec<u8>,
 }
 
 impl PictureState {
@@ -172,6 +226,8 @@ impl PictureState {
                 let ph = h.div_ceil(ctb_size) as usize;
                 vec![0u32; pw * ph]
             },
+            tab_mvf: vec![MvField::default(); min_pu_width * min_pu_height],
+            tab_skip_flag: vec![0u8; min_cb_width * min_cb_height],
         }
     }
 }
@@ -192,6 +248,7 @@ pub fn decode_coding_quadtree(
     sps: &Sps,
     pps: &Pps,
     slice_qp_y: i32,
+    slice_params: &SliceParams,
     x0: u32,
     y0: u32,
     log2_cb_size: u8,
@@ -222,6 +279,7 @@ pub fn decode_coding_quadtree(
             sps,
             pps,
             slice_qp_y,
+            slice_params,
             x0,
             y0,
             log2_cb_size - 1,
@@ -235,6 +293,7 @@ pub fn decode_coding_quadtree(
                 sps,
                 pps,
                 slice_qp_y,
+                slice_params,
                 x1,
                 y0,
                 log2_cb_size - 1,
@@ -249,6 +308,7 @@ pub fn decode_coding_quadtree(
                 sps,
                 pps,
                 slice_qp_y,
+                slice_params,
                 x0,
                 y1,
                 log2_cb_size - 1,
@@ -263,6 +323,7 @@ pub fn decode_coding_quadtree(
                 sps,
                 pps,
                 slice_qp_y,
+                slice_params,
                 x1,
                 y1,
                 log2_cb_size - 1,
@@ -278,9 +339,11 @@ pub fn decode_coding_quadtree(
             sps,
             pps,
             slice_qp_y,
+            slice_params,
             x0,
             y0,
             log2_cb_size,
+            cb_depth,
         )?;
 
         // After a leaf CU, decode end_of_slice_flag if we're at a CTB
@@ -353,7 +416,375 @@ fn set_ct_depth(state: &mut PictureState, x0: u32, y0: u32, log2_cb_size: u8, cb
     }
 }
 
-/// `coding_unit` decode for the I-slice intra path (spec 7.3.8.5).
+// ---------------------------------------------------------------------------
+// Phase 3d-3: inter syntax element decoders
+// ---------------------------------------------------------------------------
+
+/// `cu_skip_flag` decode (FFmpeg `ff_hevc_skip_flag_decode`).
+/// Context: SKIP_FLAG offset + (skip_left + skip_above).
+fn decode_skip_flag(
+    cabac: &mut CabacReader,
+    contexts: &mut CabacContexts,
+    state: &PictureState,
+    x0: u32,
+    y0: u32,
+) -> u32 {
+    let x_cb = (x0 >> state.log2_min_cb_size) as usize;
+    let y_cb = (y0 >> state.log2_min_cb_size) as usize;
+    let mut inc = 0usize;
+    if x_cb > 0 {
+        inc += (state.tab_skip_flag[y_cb * state.min_cb_width + x_cb - 1] != 0) as usize;
+    }
+    if y_cb > 0 {
+        inc += (state.tab_skip_flag[(y_cb - 1) * state.min_cb_width + x_cb] != 0) as usize;
+    }
+    cabac.decode_bin(&mut contexts.state[ctx::SKIP_FLAG + inc])
+}
+
+/// `part_mode` decode for inter CUs (FFmpeg `ff_hevc_part_mode_decode`).
+/// Extended to cover all 8 partition modes.
+fn decode_part_mode(
+    cabac: &mut CabacReader,
+    contexts: &mut CabacContexts,
+    sps: &Sps,
+    log2_cb_size: u8,
+    pred_mode: PredMode,
+) -> PartMode {
+    if cabac.decode_bin(&mut contexts.state[ctx::PART_MODE]) != 0 {
+        return PartMode::Part2Nx2N;
+    }
+    if log2_cb_size == sps.min_cb_log2_size_y {
+        if pred_mode == PredMode::Intra {
+            return PartMode::PartNxN;
+        }
+        if cabac.decode_bin(&mut contexts.state[ctx::PART_MODE + 1]) != 0 {
+            return PartMode::Part2NxN;
+        }
+        if log2_cb_size == 3 {
+            return PartMode::PartNx2N;
+        }
+        if cabac.decode_bin(&mut contexts.state[ctx::PART_MODE + 2]) != 0 {
+            return PartMode::PartNx2N;
+        }
+        return PartMode::PartNxN;
+    }
+
+    // log2_cb_size > min_cb_log2_size.
+    if !sps.amp_enabled_flag {
+        if cabac.decode_bin(&mut contexts.state[ctx::PART_MODE + 1]) != 0 {
+            return PartMode::Part2NxN;
+        }
+        return PartMode::PartNx2N;
+    }
+
+    // AMP enabled.
+    if cabac.decode_bin(&mut contexts.state[ctx::PART_MODE + 1]) != 0 {
+        if cabac.decode_bin(&mut contexts.state[ctx::PART_MODE + 3]) != 0 {
+            return PartMode::Part2NxN;
+        }
+        if cabac.decode_bypass() != 0 {
+            return PartMode::Part2NxnD;
+        }
+        return PartMode::Part2NxnU;
+    }
+
+    if cabac.decode_bin(&mut contexts.state[ctx::PART_MODE + 3]) != 0 {
+        return PartMode::PartNx2N;
+    }
+    if cabac.decode_bypass() != 0 {
+        return PartMode::PartnRx2N;
+    }
+    PartMode::PartnLx2N
+}
+
+/// Decode a single prediction unit's merge/AMVP syntax (spec 7.3.8.6 /
+/// FFmpeg `hls_prediction_unit`). Returns the `merge_flag` value (needed
+/// for `rqt_root_cbf` gating).
+#[allow(clippy::too_many_arguments)]
+fn decode_prediction_unit(
+    cabac: &mut CabacReader,
+    contexts: &mut CabacContexts,
+    state: &mut PictureState,
+    slice_params: &SliceParams,
+    x0: u32,
+    y0: u32,
+    n_pb_w: u32,
+    n_pb_h: u32,
+    _log2_cb_size: u8,
+    is_skip: bool,
+    cb_depth: u8,
+) -> Result<bool, DecodeError> {
+    let mut current_mv = MvField::default();
+    let merge_flag = if is_skip {
+        true
+    } else {
+        cabac.decode_bin(&mut contexts.state[ctx::MERGE_FLAG]) != 0
+    };
+
+    if merge_flag {
+        // Merge mode: decode merge_idx.
+        let merge_idx = if slice_params.max_num_merge_cand > 1 {
+            decode_merge_idx(cabac, contexts, slice_params.max_num_merge_cand)
+        } else {
+            0
+        };
+
+        // Phase 3d-4 will compute actual merge MVs from neighbors. For now,
+        // store a placeholder with merge_idx recorded.
+        // The merge candidate derivation is not implemented yet — store
+        // zero MV with L0 pred flag as a placeholder.
+        current_mv.pred_flag = 1; // L0
+        current_mv.ref_idx[0] = 0;
+        let _ = merge_idx; // Will be used in Phase 3d-4.
+    } else {
+        // AMVP mode.
+        let inter_pred_idc = if slice_params.slice_type == SliceType::B {
+            decode_inter_pred_idc(cabac, contexts, n_pb_w, n_pb_h, cb_depth)
+        } else {
+            InterPredIdc::PredL0
+        };
+
+        // L0.
+        if inter_pred_idc != InterPredIdc::PredL1 {
+            if slice_params.num_ref_idx_l0_active > 0 {
+                current_mv.ref_idx[0] =
+                    decode_ref_idx(cabac, contexts, slice_params.num_ref_idx_l0_active, false)
+                        as i8;
+            }
+            current_mv.pred_flag |= 1; // PF_L0
+            let mvd = decode_mvd_coding(cabac, contexts);
+            current_mv.mv[0] = mvd;
+            let _mvp_l0_flag = cabac.decode_bin(&mut contexts.state[ctx::MVP_LX_FLAG]);
+        }
+
+        // L1.
+        if inter_pred_idc != InterPredIdc::PredL0 {
+            if slice_params.num_ref_idx_l1_active > 0 {
+                current_mv.ref_idx[1] =
+                    decode_ref_idx(cabac, contexts, slice_params.num_ref_idx_l1_active, true) as i8;
+            }
+            if slice_params.mvd_l1_zero_flag && inter_pred_idc == InterPredIdc::PredBi {
+                // mvd_l1_zero_flag: skip MVD coding for L1.
+            } else {
+                let mvd = decode_mvd_coding(cabac, contexts);
+                current_mv.mv[1] = mvd;
+            }
+            current_mv.pred_flag |= 2; // PF_L1
+            let _mvp_l1_flag = cabac.decode_bin(&mut contexts.state[ctx::MVP_LX_FLAG]);
+        }
+    }
+
+    // Write the decoded MV field into tab_mvf for all min-PUs in this PU.
+    let x_pu = (x0 >> state.log2_min_pu_size) as usize;
+    let y_pu = (y0 >> state.log2_min_pu_size) as usize;
+    let pu_w = (n_pb_w >> state.log2_min_pu_size).max(1) as usize;
+    let pu_h = (n_pb_h >> state.log2_min_pu_size).max(1) as usize;
+    for j in 0..pu_h {
+        for i in 0..pu_w {
+            state.tab_mvf[(y_pu + j) * state.min_pu_width + x_pu + i] = current_mv;
+        }
+    }
+
+    Ok(merge_flag)
+}
+
+/// Decode `merge_idx` (FFmpeg `ff_hevc_merge_idx_decode`).
+/// Truncated unary, first bin context-coded, rest bypass.
+fn decode_merge_idx(
+    cabac: &mut CabacReader,
+    contexts: &mut CabacContexts,
+    max_num_merge_cand: u32,
+) -> u32 {
+    let mut i = cabac.decode_bin(&mut contexts.state[ctx::MERGE_IDX]);
+    if i != 0 {
+        while i < max_num_merge_cand - 1 && cabac.decode_bypass() != 0 {
+            i += 1;
+        }
+    }
+    i
+}
+
+/// Decode `inter_pred_idc` (FFmpeg `ff_hevc_inter_pred_idc_decode`).
+///
+/// For small blocks (`nPbW + nPbH == 12`), only one context-coded bin
+/// (at INTER_PRED_IDC + 4) decides L0 (0) vs L1 (1); BI is not available.
+/// For larger blocks, first a bin at INTER_PRED_IDC + ct_depth is read:
+/// 1 = BI, 0 = another bin at INTER_PRED_IDC + 4 for L0 vs L1.
+fn decode_inter_pred_idc(
+    cabac: &mut CabacReader,
+    contexts: &mut CabacContexts,
+    n_pb_w: u32,
+    n_pb_h: u32,
+    cb_depth: u8,
+) -> InterPredIdc {
+    if n_pb_w + n_pb_h == 12 {
+        let v = cabac.decode_bin(&mut contexts.state[ctx::INTER_PRED_IDC + 4]);
+        return if v != 0 {
+            InterPredIdc::PredL1
+        } else {
+            InterPredIdc::PredL0
+        };
+    }
+    if cabac.decode_bin(&mut contexts.state[ctx::INTER_PRED_IDC + cb_depth as usize]) != 0 {
+        return InterPredIdc::PredBi;
+    }
+    let v = cabac.decode_bin(&mut contexts.state[ctx::INTER_PRED_IDC + 4]);
+    if v != 0 {
+        InterPredIdc::PredL1
+    } else {
+        InterPredIdc::PredL0
+    }
+}
+
+/// Decode `ref_idx_lX` (FFmpeg `ff_hevc_ref_idx_lx_decode`).
+/// Truncated unary: first 2 bins context-coded, rest bypass.
+fn decode_ref_idx(
+    cabac: &mut CabacReader,
+    contexts: &mut CabacContexts,
+    num_ref_idx_active: u32,
+    is_l1: bool,
+) -> u32 {
+    let max = num_ref_idx_active - 1;
+    if max == 0 {
+        return 0;
+    }
+    let ctx_base = if is_l1 {
+        ctx::REF_IDX_L1
+    } else {
+        ctx::REF_IDX_L0
+    };
+    let max_ctx = max.min(2) as usize;
+    let mut i = 0u32;
+    while (i as usize) < max_ctx
+        && cabac.decode_bin(&mut contexts.state[ctx_base + i as usize]) != 0
+    {
+        i += 1;
+    }
+    if i == 2 {
+        while i < max && cabac.decode_bypass() != 0 {
+            i += 1;
+        }
+    }
+    i
+}
+
+/// Decode `mvd_coding` (HEVC spec 7.3.8.8 / FFmpeg `ff_hevc_hls_mvd_coding`).
+fn decode_mvd_coding(cabac: &mut CabacReader, contexts: &mut CabacContexts) -> Mv {
+    let mut x_val = cabac.decode_bin(&mut contexts.state[ctx::ABS_MVD_GREATER0_FLAG]) as i32;
+    let mut y_val = cabac.decode_bin(&mut contexts.state[ctx::ABS_MVD_GREATER0_FLAG]) as i32;
+
+    if x_val != 0 {
+        x_val += cabac.decode_bin(&mut contexts.state[ctx::ABS_MVD_GREATER1_FLAG + 1]) as i32;
+    }
+    if y_val != 0 {
+        y_val += cabac.decode_bin(&mut contexts.state[ctx::ABS_MVD_GREATER1_FLAG + 1]) as i32;
+    }
+
+    let mvd_x = match x_val {
+        2 => decode_mvd_abs(cabac),
+        1 => decode_mvd_sign(cabac),
+        _ => 0,
+    };
+    let mvd_y = match y_val {
+        2 => decode_mvd_abs(cabac),
+        1 => decode_mvd_sign(cabac),
+        _ => 0,
+    };
+
+    Mv {
+        x: mvd_x as i16,
+        y: mvd_y as i16,
+    }
+}
+
+/// Decode abs_mvd_minus2 (EG-0 + sign) — FFmpeg `mvd_decode`.
+/// Returns the signed MV delta value.
+fn decode_mvd_abs(cabac: &mut CabacReader) -> i32 {
+    let mut ret: i32 = 2;
+    let mut k: u32 = 1;
+    const CABAC_MAX_BIN: u32 = 31;
+    while k < CABAC_MAX_BIN && cabac.decode_bypass() != 0 {
+        ret += 1 << k;
+        k += 1;
+    }
+    let mut kk = k;
+    while kk > 0 {
+        kk -= 1;
+        ret += (cabac.decode_bypass() as i32) << kk;
+    }
+    // Sign bit.
+    if cabac.decode_bypass() != 0 {
+        -ret
+    } else {
+        ret
+    }
+}
+
+/// Decode mvd with magnitude 1 (just a sign bit) — FFmpeg `mvd_sign_flag_decode`.
+fn decode_mvd_sign(cabac: &mut CabacReader) -> i32 {
+    if cabac.decode_bypass() != 0 { -1 } else { 1 }
+}
+
+/// Write mid-gray (128) placeholder prediction into all planes for an
+/// inter CU. Motion compensation is not yet implemented (Phase 3d-6),
+/// so this ensures that any decoded residual produces plausible pixel values.
+fn write_placeholder_prediction(state: &mut PictureState, x0: u32, y0: u32, log2_cb_size: u8) {
+    let size = 1usize << log2_cb_size;
+    // Luma.
+    let y_stride = state.y_stride;
+    let y_off = (y0 as usize) * y_stride + (x0 as usize);
+    for j in 0..size {
+        for i in 0..size {
+            if y_off + j * y_stride + i < state.y_plane.len() {
+                state.y_plane[y_off + j * y_stride + i] = 128;
+            }
+        }
+    }
+    // Chroma (4:2:0).
+    let c_size = size / 2;
+    let uv_stride = state.uv_stride;
+    let c_off = (y0 as usize / 2) * uv_stride + (x0 as usize / 2);
+    for j in 0..c_size {
+        for i in 0..c_size {
+            if c_off + j * uv_stride + i < state.u_plane.len() {
+                state.u_plane[c_off + j * uv_stride + i] = 128;
+                state.v_plane[c_off + j * uv_stride + i] = 128;
+            }
+        }
+    }
+}
+
+/// Mark inter CU boundaries for deblocking with bS=1 (inter-CU default).
+fn mark_inter_cu_boundaries(state: &mut PictureState, x0: u32, y0: u32, log2_size: u8) {
+    let size = 1u32 << log2_size;
+    let pic_w = state.width as usize;
+    let bs_w = pic_w >> 2;
+
+    if y0 > 0 {
+        let yy = (y0 >> 2) as usize;
+        let xx_start = (x0 >> 2) as usize;
+        let xx_end = ((x0 + size) >> 2) as usize;
+        for xx in xx_start..xx_end {
+            if state.bs_horizontal[yy * bs_w + xx] == 0 {
+                state.bs_horizontal[yy * bs_w + xx] = 1;
+            }
+        }
+    }
+    if x0 > 0 {
+        let xx = (x0 >> 2) as usize;
+        let yy_start = (y0 >> 2) as usize;
+        let yy_end = ((y0 + size) >> 2) as usize;
+        for yy in yy_start..yy_end {
+            if state.bs_vertical[yy * bs_w + xx] == 0 {
+                state.bs_vertical[yy * bs_w + xx] = 1;
+            }
+        }
+    }
+}
+
+/// `coding_unit` decode (HEVC spec 7.3.8.5 / FFmpeg `hls_coding_unit`).
+///
+/// Handles both intra (I/P/B slices) and inter (P/B slices) CUs.
 #[allow(clippy::too_many_arguments)]
 fn decode_coding_unit(
     cabac: &mut CabacReader,
@@ -362,79 +793,369 @@ fn decode_coding_unit(
     sps: &Sps,
     pps: &Pps,
     slice_qp_y: i32,
+    slice_params: &SliceParams,
     x0: u32,
     y0: u32,
     log2_cb_size: u8,
+    cb_depth: u8,
 ) -> Result<(), DecodeError> {
     if pps.transquant_bypass_enabled_flag {
-        // FFmpeg would read cu_transquant_bypass_flag here; we already
-        // rejected this PPS feature in pps.rs.
         return Err(DecodeError::Unsupported(
             "cu_transquant_bypass not supported",
         ));
     }
 
-    // I-slice: no skip_flag, no pred_mode_flag — pred_mode is always intra.
-    // part_mode: only at min CB size do we even decode it (intra has only
-    // PART_2Nx2N elsewhere).
-    let part_mode = if log2_cb_size == state.log2_min_cb_size {
-        let bit0 = cabac.decode_bin(&mut contexts.state[ctx::PART_MODE]);
-        if bit0 != 0 {
-            PartMode::Part2Nx2N
-        } else {
-            // For intra at min CB size, the only other allowed value is NxN.
-            PartMode::PartNxN
-        }
-    } else {
-        PartMode::Part2Nx2N
-    };
+    let cb_size = 1u32 << log2_cb_size;
+    let x_cb = (x0 >> state.log2_min_cb_size) as usize;
+    let y_cb = (y0 >> state.log2_min_cb_size) as usize;
+    let length = (cb_size >> state.log2_min_cb_size) as usize;
 
-    // PCM decode gate (spec 7.3.8.5 / FFmpeg `hls_coding_unit`). `pcm_flag`
-    // is signaled as a terminate bin only when:
-    //   - part_mode == PART_2Nx2N
-    //   - sps.pcm_enabled_flag
-    //   - log2_min_pcm_cb_size <= log2_cb_size <= log2_max_pcm_cb_size
-    let pcm_allowed = sps.pcm_enabled_flag
-        && part_mode == PartMode::Part2Nx2N
-        && log2_cb_size >= sps.log2_min_pcm_cb_size
-        && log2_cb_size <= sps.log2_max_pcm_cb_size;
-    if pcm_allowed && cabac.decode_terminate() != 0 {
-        // PCM block: skip intra prediction signaling, prediction, residual,
-        // and transform entirely. The raw PCM bytes follow `pcm_flag` at the
-        // next byte boundary; after consuming them CABAC is reinitialized.
-        decode_pcm_block(cabac, state, sps, x0, y0, log2_cb_size)?;
+    // ---- Step 1: cu_skip_flag (P/B slices only) ----
+    let mut pred_mode = PredMode::Intra;
+    if slice_params.slice_type != SliceType::I {
+        let skip_flag = decode_skip_flag(cabac, contexts, state, x0, y0);
+        // Write skip_flag for neighbor context derivation.
+        for j in 0..length {
+            let row = (y_cb + j) * state.min_cb_width;
+            for i in 0..length {
+                state.tab_skip_flag[row + x_cb + i] = skip_flag as u8;
+            }
+        }
+        pred_mode = if skip_flag != 0 {
+            PredMode::Skip
+        } else {
+            PredMode::Inter
+        };
+    } else {
+        // I-slice: zero the skip flag for this CU.
+        for j in 0..length {
+            let row = (y_cb + j) * state.min_cb_width;
+            for i in 0..length {
+                state.tab_skip_flag[row + x_cb + i] = 0;
+            }
+        }
+    }
+
+    // ---- Step 2: skip CU path (merge only, no residual) ----
+    if pred_mode == PredMode::Skip {
+        decode_prediction_unit(
+            cabac,
+            contexts,
+            state,
+            slice_params,
+            x0,
+            y0,
+            cb_size,
+            cb_size,
+            log2_cb_size,
+            true,
+            cb_depth,
+        )?;
+        // Write default intra pred modes (DC) for the skip CU so that
+        // subsequent intra CUs' MPM derivation sees valid modes.
+        write_intra_pred_mode(state, x0, y0, cb_size, INTRA_DC);
+        // Phase 3d-3: write placeholder (128) prediction for all planes.
+        write_placeholder_prediction(state, x0, y0, log2_cb_size);
+        // Deblocking for inter skip: mark edges with bS=1.
+        mark_inter_cu_boundaries(state, x0, y0, log2_cb_size);
         state.cu_count += 1;
         return Ok(());
     }
 
-    decode_intra_mode_signaling(cabac, contexts, state, x0, y0, log2_cb_size, part_mode)?;
+    // ---- Step 3: non-skip path ----
+    // pred_mode_flag: for P/B slices, decode it. 1 = intra, 0 = inter.
+    if slice_params.slice_type != SliceType::I {
+        let pm_flag = cabac.decode_bin(&mut contexts.state[ctx::PRED_MODE_FLAG]);
+        pred_mode = if pm_flag != 0 {
+            PredMode::Intra
+        } else {
+            PredMode::Inter
+        };
+    }
 
-    // Phase 2c-2: descend into transform_tree (no residual_coding yet).
-    // For intra at PART_2Nx2N, intra_split is false → max_trafo_depth =
-    // sps.max_transform_hierarchy_depth_intra. The PART_NxN case adds 1 to
-    // max_trafo_depth and sets intra_split, but our fixture doesn't hit it.
-    let intra_split = part_mode == PartMode::PartNxN;
-    let max_trafo_depth = sps.max_transform_hierarchy_depth_intra + if intra_split { 1 } else { 0 };
+    // ---- Step 4: part_mode ----
+    let part_mode = if pred_mode != PredMode::Intra || log2_cb_size == state.log2_min_cb_size {
+        decode_part_mode(cabac, contexts, sps, log2_cb_size, pred_mode)
+    } else {
+        PartMode::Part2Nx2N
+    };
 
-    decode_transform_tree(
-        cabac,
-        contexts,
-        state,
-        sps,
-        pps,
-        slice_qp_y,
-        x0,
-        y0,
-        x0,
-        y0,
-        log2_cb_size,
-        log2_cb_size,
-        0,
-        max_trafo_depth,
-        intra_split,
-        0,
-        TransformTreeCbf::default(),
-    )?;
+    let intra_split = part_mode == PartMode::PartNxN && pred_mode == PredMode::Intra;
+
+    // ---- Step 5: intra or inter prediction ----
+    let mut merge_flag_for_rqt = false;
+    if pred_mode == PredMode::Intra {
+        // PCM decode gate.
+        let pcm_allowed = sps.pcm_enabled_flag
+            && part_mode == PartMode::Part2Nx2N
+            && log2_cb_size >= sps.log2_min_pcm_cb_size
+            && log2_cb_size <= sps.log2_max_pcm_cb_size;
+        if pcm_allowed && cabac.decode_terminate() != 0 {
+            decode_pcm_block(cabac, state, sps, x0, y0, log2_cb_size)?;
+            state.cu_count += 1;
+            return Ok(());
+        }
+        decode_intra_mode_signaling(cabac, contexts, state, x0, y0, log2_cb_size, part_mode)?;
+    } else {
+        // Inter prediction: write default intra modes (DC) for MPM derivation.
+        write_intra_pred_mode(state, x0, y0, cb_size, INTRA_DC);
+
+        // Decode prediction units based on part_mode.
+        match part_mode {
+            PartMode::Part2Nx2N => {
+                merge_flag_for_rqt = decode_prediction_unit(
+                    cabac,
+                    contexts,
+                    state,
+                    slice_params,
+                    x0,
+                    y0,
+                    cb_size,
+                    cb_size,
+                    log2_cb_size,
+                    false,
+                    cb_depth,
+                )?;
+            }
+            PartMode::Part2NxN => {
+                decode_prediction_unit(
+                    cabac,
+                    contexts,
+                    state,
+                    slice_params,
+                    x0,
+                    y0,
+                    cb_size,
+                    cb_size / 2,
+                    log2_cb_size,
+                    false,
+                    cb_depth,
+                )?;
+                decode_prediction_unit(
+                    cabac,
+                    contexts,
+                    state,
+                    slice_params,
+                    x0,
+                    y0 + cb_size / 2,
+                    cb_size,
+                    cb_size / 2,
+                    log2_cb_size,
+                    false,
+                    cb_depth,
+                )?;
+            }
+            PartMode::PartNx2N => {
+                decode_prediction_unit(
+                    cabac,
+                    contexts,
+                    state,
+                    slice_params,
+                    x0,
+                    y0,
+                    cb_size / 2,
+                    cb_size,
+                    log2_cb_size,
+                    false,
+                    cb_depth,
+                )?;
+                decode_prediction_unit(
+                    cabac,
+                    contexts,
+                    state,
+                    slice_params,
+                    x0 + cb_size / 2,
+                    y0,
+                    cb_size / 2,
+                    cb_size,
+                    log2_cb_size,
+                    false,
+                    cb_depth,
+                )?;
+            }
+            PartMode::Part2NxnU => {
+                decode_prediction_unit(
+                    cabac,
+                    contexts,
+                    state,
+                    slice_params,
+                    x0,
+                    y0,
+                    cb_size,
+                    cb_size / 4,
+                    log2_cb_size,
+                    false,
+                    cb_depth,
+                )?;
+                decode_prediction_unit(
+                    cabac,
+                    contexts,
+                    state,
+                    slice_params,
+                    x0,
+                    y0 + cb_size / 4,
+                    cb_size,
+                    cb_size * 3 / 4,
+                    log2_cb_size,
+                    false,
+                    cb_depth,
+                )?;
+            }
+            PartMode::Part2NxnD => {
+                decode_prediction_unit(
+                    cabac,
+                    contexts,
+                    state,
+                    slice_params,
+                    x0,
+                    y0,
+                    cb_size,
+                    cb_size * 3 / 4,
+                    log2_cb_size,
+                    false,
+                    cb_depth,
+                )?;
+                decode_prediction_unit(
+                    cabac,
+                    contexts,
+                    state,
+                    slice_params,
+                    x0,
+                    y0 + cb_size * 3 / 4,
+                    cb_size,
+                    cb_size / 4,
+                    log2_cb_size,
+                    false,
+                    cb_depth,
+                )?;
+            }
+            PartMode::PartnLx2N => {
+                decode_prediction_unit(
+                    cabac,
+                    contexts,
+                    state,
+                    slice_params,
+                    x0,
+                    y0,
+                    cb_size / 4,
+                    cb_size,
+                    log2_cb_size,
+                    false,
+                    cb_depth,
+                )?;
+                decode_prediction_unit(
+                    cabac,
+                    contexts,
+                    state,
+                    slice_params,
+                    x0 + cb_size / 4,
+                    y0,
+                    cb_size * 3 / 4,
+                    cb_size,
+                    log2_cb_size,
+                    false,
+                    cb_depth,
+                )?;
+            }
+            PartMode::PartnRx2N => {
+                decode_prediction_unit(
+                    cabac,
+                    contexts,
+                    state,
+                    slice_params,
+                    x0,
+                    y0,
+                    cb_size * 3 / 4,
+                    cb_size,
+                    log2_cb_size,
+                    false,
+                    cb_depth,
+                )?;
+                decode_prediction_unit(
+                    cabac,
+                    contexts,
+                    state,
+                    slice_params,
+                    x0 + cb_size * 3 / 4,
+                    y0,
+                    cb_size / 4,
+                    cb_size,
+                    log2_cb_size,
+                    false,
+                    cb_depth,
+                )?;
+            }
+            PartMode::PartNxN => {
+                // NxN for inter: 4 sub-PUs, each cb_size/2 x cb_size/2.
+                let half = cb_size / 2;
+                for pi in 0..2u32 {
+                    for pj in 0..2u32 {
+                        decode_prediction_unit(
+                            cabac,
+                            contexts,
+                            state,
+                            slice_params,
+                            x0 + pj * half,
+                            y0 + pi * half,
+                            half,
+                            half,
+                            log2_cb_size,
+                            false,
+                            cb_depth,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // Phase 3d-3: write placeholder (128) prediction for all planes.
+        write_placeholder_prediction(state, x0, y0, log2_cb_size);
+    }
+
+    // ---- Step 6: transform tree / residual ----
+    {
+        let rqt_root_cbf = if pred_mode != PredMode::Intra
+            && !(part_mode == PartMode::Part2Nx2N && merge_flag_for_rqt)
+        {
+            cabac.decode_bin(&mut contexts.state[ctx::NO_RESIDUAL_DATA_FLAG]) != 0
+        } else {
+            // Intra CUs always have a transform tree.
+            // PART_2Nx2N + merge: rqt_root_cbf was not coded.
+            pred_mode == PredMode::Intra || (part_mode == PartMode::Part2Nx2N && merge_flag_for_rqt)
+        };
+
+        if rqt_root_cbf {
+            let max_trafo_depth = if pred_mode == PredMode::Intra {
+                sps.max_transform_hierarchy_depth_intra + if intra_split { 1 } else { 0 }
+            } else {
+                sps.max_transform_hierarchy_depth_inter
+            };
+
+            decode_transform_tree(
+                cabac,
+                contexts,
+                state,
+                sps,
+                pps,
+                slice_qp_y,
+                pred_mode,
+                x0,
+                y0,
+                x0,
+                y0,
+                log2_cb_size,
+                log2_cb_size,
+                0,
+                max_trafo_depth,
+                intra_split,
+                0,
+                TransformTreeCbf::default(),
+            )?;
+        } else {
+            // No residual: for inter, mark deblocking edges.
+            mark_inter_cu_boundaries(state, x0, y0, log2_cb_size);
+        }
+    }
 
     state.cu_count += 1;
     Ok(())
@@ -590,6 +1311,7 @@ fn decode_transform_tree(
     sps: &Sps,
     pps: &Pps,
     slice_qp_y: i32,
+    pred_mode: PredMode,
     x0: u32,
     y0: u32,
     x_base: u32,
@@ -652,6 +1374,7 @@ fn decode_transform_tree(
             sps,
             pps,
             slice_qp_y,
+            pred_mode,
             x0,
             y0,
             x0,
@@ -671,6 +1394,7 @@ fn decode_transform_tree(
             sps,
             pps,
             slice_qp_y,
+            pred_mode,
             x1,
             y0,
             x0,
@@ -690,6 +1414,7 @@ fn decode_transform_tree(
             sps,
             pps,
             slice_qp_y,
+            pred_mode,
             x0,
             y1,
             x0,
@@ -709,6 +1434,7 @@ fn decode_transform_tree(
             sps,
             pps,
             slice_qp_y,
+            pred_mode,
             x1,
             y1,
             x0,
@@ -730,6 +1456,7 @@ fn decode_transform_tree(
             sps,
             pps,
             slice_qp_y,
+            pred_mode,
             x0,
             y0,
             x_base,
@@ -801,8 +1528,9 @@ fn decode_cu_qp_delta_sign_flag(cabac: &mut CabacReader) -> u32 {
 
 /// `transform_unit` decode (spec 7.3.8.11). Decodes the cbf flags,
 /// `cu_qp_delta`, and (if any cbf is set) the per-plane residual_coding.
-/// Also performs intra prediction and reconstruction (residual + prediction
-/// → clipped pixels) into the picture's frame planes.
+/// For intra CUs: performs intra prediction and reconstruction.
+/// For inter CUs: prediction was already written as placeholder (128)
+/// and residual is added on top.
 #[allow(clippy::too_many_arguments)]
 fn decode_transform_unit(
     cabac: &mut CabacReader,
@@ -811,6 +1539,7 @@ fn decode_transform_unit(
     sps: &Sps,
     pps: &Pps,
     slice_qp_y: i32,
+    pred_mode: PredMode,
     x0: u32,
     y0: u32,
     x_base: u32,
@@ -820,27 +1549,30 @@ fn decode_transform_unit(
     blk_idx: u8,
     inherited: TransformTreeCbf,
 ) -> Result<TransformTreeCbf, DecodeError> {
-    // ---- Step 1: luma intra prediction (always for the I-slice intra path).
-    let luma_mode = state.last_luma_pred_mode;
-    predict_intra_luma(state, sps, x0, y0, log2_trafo_size, luma_mode)?;
+    let is_intra = pred_mode == PredMode::Intra;
+
+    // ---- Step 1: luma intra prediction (only for intra CUs).
+    if is_intra {
+        let luma_mode = state.last_luma_pred_mode;
+        predict_intra_luma(state, sps, x0, y0, log2_trafo_size, luma_mode)?;
+    }
 
     // ---- Step 2: cbf_luma decode.
     // FFmpeg gates cbf_luma decoding behind:
     //   pred_mode == INTRA || trafo_depth != 0 || any chroma cbf set
-    // For our I-slice intra path, the first clause is always true.
-    let cbf_luma = decode_cbf_luma(cabac, contexts, trafo_depth) != 0;
+    let cbf_luma = if is_intra || trafo_depth != 0 || inherited.cbf_cb || inherited.cbf_cr {
+        decode_cbf_luma(cabac, contexts, trafo_depth) != 0
+    } else {
+        // Inter, trafo_depth == 0, no chroma cbf: luma cbf must be 1.
+        true
+    };
     state.last_cbf_luma = cbf_luma;
 
     let mut new_cbf = inherited;
-    // For 4:2:0, chroma is handled at log2_trafo_size > 2. When log2_trafo_size
-    // == 2 (4x4 luma TUs), chroma is deferred to blk_idx==3 where it's handled
-    // at the parent TU size (xBase, yBase, log2_trafo_size == parent's log2-1).
     let do_chroma_inline = sps.chroma_format_idc == 1 && log2_trafo_size > 2;
     let do_chroma_deferred = sps.chroma_format_idc == 1 && log2_trafo_size == 2 && blk_idx == 3;
 
     if cbf_luma || inherited.cbf_cb || inherited.cbf_cr {
-        // cu_qp_delta is decoded once per CU, the first time we see a TU
-        // with a non-zero CBF.
         if pps.cu_qp_delta_enabled_flag && !inherited.cu_qp_delta_coded {
             let abs = decode_cu_qp_delta_abs(cabac, contexts) as i32;
             let signed = if abs != 0 {
@@ -850,21 +1582,22 @@ fn decode_transform_unit(
                 0
             };
             state.last_cu_qp_delta = signed;
-            // Spec 7.4.7.10: cu_qp_delta_val ∈ [-(26 + QpBdOffsetY/2),
-            // 25 + QpBdOffsetY/2]. For 8-bit, that's [-26, 25].
             if !(-26..=25).contains(&signed) {
                 return Err(DecodeError::InvalidSyntax("cu_qp_delta out of range"));
             }
             new_cbf.cu_qp_delta_coded = true;
         }
 
-        // Effective per-CU QP for dequant.
         let qp_y = slice_qp_y + state.last_cu_qp_delta;
         state.last_qp_y = qp_y;
 
         // ---- Step 3: luma residual_coding + IDCT + reconstruction.
         if cbf_luma {
-            let scan_idx = pick_scan_order(log2_trafo_size, state.last_luma_pred_mode);
+            let scan_idx = if is_intra {
+                pick_scan_order(log2_trafo_size, state.last_luma_pred_mode)
+            } else {
+                ScanOrder::Diag
+            };
             let block = decode_residual_coding(
                 cabac,
                 contexts,
@@ -874,57 +1607,60 @@ fn decode_transform_unit(
                 ResidualPlane::Luma,
                 qp_y,
                 scan_idx,
-                true, // is_intra (I-slice path)
+                is_intra,
             )?;
             apply_residual_to_luma(state, x0, y0, log2_trafo_size, &block);
             state.last_luma_residual = Some(block);
         }
 
-        // ---- Step 4: chroma intra prediction + (optional) residual.
-        if do_chroma_inline {
-            let chroma_mode = state.last_chroma_pred_mode;
-            predict_intra_chroma(state, sps, x0, y0, log2_trafo_size - 1, chroma_mode)?;
-            if inherited.cbf_cb || inherited.cbf_cr {
-                return Err(DecodeError::Unsupported(
-                    "chroma residual_coding not yet implemented",
-                ));
+        // ---- Step 4: chroma prediction + (optional) residual.
+        if is_intra {
+            if do_chroma_inline {
+                let chroma_mode = state.last_chroma_pred_mode;
+                predict_intra_chroma(state, sps, x0, y0, log2_trafo_size - 1, chroma_mode)?;
+                if inherited.cbf_cb || inherited.cbf_cr {
+                    return Err(DecodeError::Unsupported(
+                        "chroma residual_coding not yet implemented",
+                    ));
+                }
+            } else if do_chroma_deferred {
+                let chroma_mode = state.last_chroma_pred_mode;
+                predict_intra_chroma(state, sps, x_base, y_base, log2_trafo_size, chroma_mode)?;
+                if inherited.cbf_cb || inherited.cbf_cr {
+                    return Err(DecodeError::Unsupported(
+                        "chroma residual_coding not yet implemented",
+                    ));
+                }
             }
-        } else if do_chroma_deferred {
-            // For 4:2:0 with 4x4 luma TUs, chroma prediction happens at blk_idx==3
-            // using the parent TU coordinates (xBase, yBase) at log2_trafo_size.
-            let chroma_mode = state.last_chroma_pred_mode;
-            predict_intra_chroma(state, sps, x_base, y_base, log2_trafo_size, chroma_mode)?;
+        } else {
+            // Inter: chroma prediction is placeholder (already 128).
+            // Chroma residual decoding: not yet implemented.
             if inherited.cbf_cb || inherited.cbf_cr {
                 return Err(DecodeError::Unsupported(
-                    "chroma residual_coding not yet implemented",
+                    "inter chroma residual_coding not yet implemented",
                 ));
             }
         }
-    } else if do_chroma_inline {
-        // Intra CU with no CBFs at all — still need chroma prediction.
-        let chroma_mode = state.last_chroma_pred_mode;
-        predict_intra_chroma(state, sps, x0, y0, log2_trafo_size - 1, chroma_mode)?;
-    } else if do_chroma_deferred {
-        let chroma_mode = state.last_chroma_pred_mode;
-        predict_intra_chroma(state, sps, x_base, y_base, log2_trafo_size, chroma_mode)?;
+    } else if is_intra {
+        if do_chroma_inline {
+            let chroma_mode = state.last_chroma_pred_mode;
+            predict_intra_chroma(state, sps, x0, y0, log2_trafo_size - 1, chroma_mode)?;
+        } else if do_chroma_deferred {
+            let chroma_mode = state.last_chroma_pred_mode;
+            predict_intra_chroma(state, sps, x_base, y_base, log2_trafo_size, chroma_mode)?;
+        }
     }
 
-    // ---- Step 5: deblocking bookkeeping (Phase 3b-1).
-    //
-    // For the I-slice intra path, every internal TU edge gets bS = 2.
-    // We mark the top and left edges of this TU on the per-4×4 BS grids.
-    // The picture's outer borders (x0 == 0, y0 == 0) are skipped because
-    // there's nothing to filter against. We also write the per-min-CB QP
-    // so the deblock pass can read the right tc/beta indices.
+    // ---- Step 5: deblocking bookkeeping.
     let qp_y = if cbf_luma || inherited.cbf_cb || inherited.cbf_cr {
         state.last_qp_y
     } else {
-        // No CBFs → no cu_qp_delta this CU; the running qp from previous TUs
-        // (or slice_qp_y if first TU) still applies.
         slice_qp_y + state.last_cu_qp_delta
     };
     write_qp_y_table(state, x0, y0, log2_trafo_size, qp_y);
-    mark_intra_tu_boundaries(state, x0, y0, log2_trafo_size);
+    if is_intra {
+        mark_intra_tu_boundaries(state, x0, y0, log2_trafo_size);
+    }
 
     Ok(new_cbf)
 }
@@ -1496,6 +2232,13 @@ mod tests {
         let mut cabac = CabacReader::new(&slice_nal.rbsp, cabac_byte_offset);
 
         let mut state = PictureState::new(&sps);
+        let slice_params = SliceParams {
+            slice_type: sh.slice_type,
+            max_num_merge_cand: sh.max_num_merge_cand,
+            num_ref_idx_l0_active: sh.num_ref_idx_l0_active_minus1 + 1,
+            num_ref_idx_l1_active: 0,
+            mvd_l1_zero_flag: false,
+        };
         // The single CTU is at (0, 0) with log2_cb_size = ctb_log2_size_y = 4.
         decode_coding_quadtree(
             &mut cabac,
@@ -1504,6 +2247,7 @@ mod tests {
             &sps,
             &pps,
             sh.slice_qp_y,
+            &slice_params,
             0,
             0,
             sps.ctb_log2_size_y,

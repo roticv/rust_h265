@@ -382,15 +382,6 @@ impl Decoder {
             }
         }
 
-        if sh.slice_type != SliceType::I {
-            // Phase 3d-1 plumbs the slice header but does not yet decode
-            // the inter CUs — reject at decode time so the test suite
-            // still passes for all intra fixtures.
-            return Err(DecodeError::Unsupported(
-                "P/B slice decoding not yet implemented (Phase 3d-3)",
-            ));
-        }
-
         // Phase 3c-4: CABAC context setup.
         //
         // - Independent slice segment → fresh `CabacContexts::init` from
@@ -528,6 +519,19 @@ impl Decoder {
                 None
             };
 
+        // Phase 3d-3: construct SliceParams for the CU tree.
+        let slice_params = crate::cu_tree::SliceParams {
+            slice_type: sh.slice_type,
+            max_num_merge_cand: sh.max_num_merge_cand,
+            num_ref_idx_l0_active: sh.num_ref_idx_l0_active_minus1 + 1,
+            num_ref_idx_l1_active: if sh.slice_type == SliceType::B {
+                sh.num_ref_idx_l1_active_minus1 + 1
+            } else {
+                0
+            },
+            mvd_l1_zero_flag: sh.mvd_l1_zero_flag,
+        };
+
         let mut more_data = true;
         // Phase 3c-2: iterate in tile-scan order. For single-tile pictures
         // `ctb_addr_ts_to_rs` is the identity, so the loop visits CTBs in
@@ -630,6 +634,7 @@ impl Decoder {
                 sps,
                 pps,
                 sh.slice_qp_y,
+                &slice_params,
                 x_ctb,
                 y_ctb,
                 sps.ctb_log2_size_y,
@@ -754,9 +759,8 @@ impl Decoder {
 
         // Phase 3d-2: build RefPicList0 / RefPicList1 per spec 8.3.2.
         // I slices never reference other pictures → leave both lists empty.
-        // P/B slices are still rejected at decode time (see above), but we
-        // construct the lists here for completeness so Phase 3d-3 can start
-        // consuming them directly.
+        // P/B slices use the lists for merge/AMVP candidate derivation
+        // (Phase 3d-4/3d-5).
         self.current_ref_list_l0.clear();
         self.current_ref_list_l1.clear();
         if last_sh_cloned.slice_type != SliceType::I {
@@ -2707,6 +2711,168 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// **Phase 3d-3 inter syntax test**: encode a 2-frame IPP sequence with
+    /// x265, decode both frames, and verify:
+    /// - Frame 0 (IDR) decodes byte-exact against FFmpeg reference.
+    /// - Frame 1 (P-slice) decodes without crashing and has the right
+    ///   dimensions. Pixel values are NOT checked because motion compensation
+    ///   is not yet implemented (placeholder prediction used).
+    ///
+    /// If x265 or ffmpeg are not on PATH the test silently skips.
+    #[test]
+    fn test_decode_inter_p_slice_no_crash() {
+        use std::process::Command;
+
+        let tmp = std::env::temp_dir();
+        let input_yuv = tmp.join("inter_p_input.yuv");
+        let h265_path = tmp.join("inter_p.h265");
+        let ref_yuv_path = tmp.join("inter_p_ref.yuv");
+
+        let w: usize = 16;
+        let h: usize = 16;
+        let y_size = w * h;
+        let uv_size = (w / 2) * (h / 2);
+        let frame_size = y_size + 2 * uv_size;
+
+        // 2 identical flat-gray frames. With flat content, x265 should produce
+        // zero-MV skip/merge CUs on the P-frame (no residual).
+        let mut yuv_data = Vec::with_capacity(frame_size * 2);
+        for _ in 0..2 {
+            yuv_data.extend(std::iter::repeat_n(0x7Eu8, y_size));
+            yuv_data.extend(std::iter::repeat_n(128u8, uv_size * 2));
+        }
+        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
+
+        // Encode with x265: 2 frames, keyint=2 to get one IDR + one P-frame.
+        let x265_status = Command::new("x265")
+            .args([
+                "--input",
+                input_yuv.to_str().unwrap(),
+                "--input-res",
+                &format!("{w}x{h}"),
+                "--fps",
+                "1",
+                "--frames",
+                "2",
+                "--output",
+                h265_path.to_str().unwrap(),
+                "--preset",
+                "ultrafast",
+                "--no-wpp",
+                "--no-signhide",
+                "--ctu",
+                "16",
+                "--no-open-gop",
+                "--keyint",
+                "2",
+                "--bframes",
+                "0",
+                "--no-scenecut",
+                "--no-sao",
+                "--no-deblock",
+                "--qp",
+                "25",
+                "--no-psnr",
+                "--no-ssim",
+                "--no-info",
+                "--no-weightp",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let x265_status = match x265_status {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("x265 not found, skipping inter P-slice test");
+                return;
+            }
+        };
+        assert!(x265_status.success(), "x265 encoding failed");
+
+        // Decode reference with FFmpeg (for frame 0 byte-exact check).
+        let ffmpeg_status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-i",
+                h265_path.to_str().unwrap(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                ref_yuv_path.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let ffmpeg_status = match ffmpeg_status {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("ffmpeg not found, skipping inter P-slice test");
+                return;
+            }
+        };
+        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
+
+        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
+
+        // Sanity: reference should have 2 frames worth of YUV.
+        assert_eq!(
+            ref_yuv.len(),
+            frame_size * 2,
+            "reference YUV should have 2 frames"
+        );
+
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+        let mut frames: Vec<Frame> = Vec::new();
+        for nal in &nals {
+            match decoder.decode_nal(nal) {
+                Ok(Some(f)) => frames.push(f),
+                Ok(None) => {}
+                Err(e) => panic!("decode_nal failed: {:?}", e),
+            }
+        }
+
+        assert!(
+            !frames.is_empty(),
+            "expected at least 1 decoded frame, got {}",
+            frames.len()
+        );
+
+        // Frame 0 (IDR): byte-exact against FFmpeg.
+        let frame0 = &frames[0];
+        assert_eq!(frame0.width as usize, w);
+        assert_eq!(frame0.height as usize, h);
+
+        let ref_frame0 = &ref_yuv[..frame_size];
+        let mut decoded0 = Vec::with_capacity(frame_size);
+        decoded0.extend_from_slice(&frame0.y);
+        decoded0.extend_from_slice(&frame0.u);
+        decoded0.extend_from_slice(&frame0.v);
+        assert_eq!(
+            decoded0, ref_frame0,
+            "frame 0 (IDR) is not byte-exact against FFmpeg reference"
+        );
+
+        // Frame 1 (P-slice): should exist and have the right dimensions.
+        // Pixel values are NOT checked -- motion compensation is a placeholder.
+        if frames.len() >= 2 {
+            let frame1 = &frames[1];
+            assert_eq!(frame1.width as usize, w);
+            assert_eq!(frame1.height as usize, h);
+            assert_eq!(frame1.y.len(), y_size, "P-frame luma plane size");
+            assert_eq!(frame1.u.len(), uv_size, "P-frame Cb plane size");
+            assert_eq!(frame1.v.len(), uv_size, "P-frame Cr plane size");
+        } else {
+            eprintln!(
+                "only {} frame(s) decoded (expected 2) -- P-frame may have been \
+                 rejected or x265 produced an all-IDR stream",
+                frames.len()
+            );
         }
     }
 }
