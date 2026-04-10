@@ -6,8 +6,13 @@
 //! the bitstream past data we can't interpret.
 //!
 //! Phase 3c-1 extends this to independent multi-slice pictures: non-first
-//! slice segments are allowed, but dependent slice segments remain
-//! `Unsupported` (deferred to Phase 3c-4).
+//! slice segments are allowed. Phase 3c-4 adds dependent slice segments:
+//! a non-first slice segment with `dependent_slice_segment_flag = 1` has a
+//! minimal header (just the slice address + byte alignment) and inherits
+//! every other field from the most recent independent slice segment in the
+//! picture. The parser returns a `SliceHeader` with the inherited fields
+//! left at their defaults; the caller (`Decoder`) fills them in from the
+//! saved independent slice header.
 
 use crate::bitstream::BitstreamReader;
 use crate::error::DecodeError;
@@ -88,19 +93,15 @@ pub fn parse_slice_segment_header(
     }
 
     // spec 7.3.6.1: dependent_slice_segment_flag and slice_segment_address
-    // are only present when first_slice_segment_in_pic_flag == 0. Phase 3c-1
-    // supports independent slice segments only — dependent slices are
-    // Phase 3c-4.
+    // are only present when first_slice_segment_in_pic_flag == 0. A
+    // dependent slice segment carries a minimal header: only the slice
+    // address + byte alignment. Every other field is inherited from the
+    // most recent independent slice segment in the picture by the caller.
     let mut dependent_slice_segment_flag = false;
     let mut slice_segment_address = 0u32;
     if !first_slice_segment_in_pic_flag {
         if pps.dependent_slice_segments_enabled_flag {
             dependent_slice_segment_flag = r.read_bit()? == 1;
-            if dependent_slice_segment_flag {
-                return Err(DecodeError::Unsupported(
-                    "dependent slice segments not supported (Phase 3c-4)",
-                ));
-            }
         }
         // slice_segment_address: ceil(log2(NumCtbsInPic)) bits. Spec eq. 7-78.
         let num_ctbs_in_pic = sps.pic_width_in_ctbs_y() * sps.pic_height_in_ctbs_y();
@@ -115,96 +116,108 @@ pub fn parse_slice_segment_header(
                 "slice_segment_address out of range",
             ));
         }
-    } else if pps.dependent_slice_segments_enabled_flag {
-        // PPS enables dependent slices but this is the first slice segment;
-        // the flag is implicitly 0 for the first segment and no bit is coded.
-        // We still reject with Unsupported to keep the surface tight — any
-        // subsequent slice in this picture could be dependent, which we
-        // cannot handle.
-        return Err(DecodeError::Unsupported(
-            "dependent_slice_segments_enabled_flag=1 not supported (Phase 3c-4)",
-        ));
     }
 
-    // Reserved slice header bits (none for our PPS).
-    for _ in 0..pps.num_extra_slice_header_bits {
-        let _ = r.read_bit()?;
-    }
-
-    let slice_type_raw = r.read_ue()?;
-    let slice_type = match slice_type_raw {
-        0 => SliceType::B,
-        1 => SliceType::P,
-        2 => SliceType::I,
-        _ => {
-            return Err(DecodeError::InvalidSyntax("invalid slice_type"));
+    // Dependent slice segment: skip the big `if (!dependent_slice_segment_flag)`
+    // body entirely — every field in it is inherited from the most recent
+    // independent slice segment and filled in by the caller. Spec 7.3.6.1
+    // explicitly gates the reserved-bits / slice_type / ... region on
+    // `!dependent_slice_segment_flag`, but the entry_point_offsets section
+    // below and the slice_header_extension + byte_alignment() tail are
+    // parsed regardless.
+    if !dependent_slice_segment_flag {
+        // Reserved slice header bits (none for our PPS).
+        for _ in 0..pps.num_extra_slice_header_bits {
+            let _ = r.read_bit()?;
         }
-    };
-
-    if slice_type != SliceType::I {
-        // Phase 2 only handles I-slices. P/B slices need ref list + MV decode.
-        return Err(DecodeError::Unsupported(
-            "only I-slices are supported in Phase 2",
-        ));
     }
 
+    // Inherited-from-independent-segment fields. For a dependent slice
+    // segment they stay at their default values here and are filled in by
+    // the caller from the saved independent slice header. For an
+    // independent slice segment they are decoded from the bitstream.
+    let mut slice_type = SliceType::I;
     let mut pic_output_flag = true;
-    if pps.output_flag_present_flag {
-        pic_output_flag = r.read_bit()? == 1;
-    }
-
-    // separate_colour_plane_flag is gated by chroma_format_idc==3, which we
-    // already rejected in SPS parsing.
-
-    if !nal_unit_type.is_idr() {
-        // POC + RPS section. IDR pictures skip this entirely (POC = 0).
-        // We don't yet handle non-IDR slices, so reject before consuming any
-        // bits — that way nothing here can mis-advance the bitstream.
-        return Err(DecodeError::Unsupported(
-            "non-IDR slice header parsing not yet implemented",
-        ));
-    }
     let slice_pic_order_cnt_lsb = 0u32;
-
     let mut slice_sao_luma_flag = false;
     let mut slice_sao_chroma_flag = false;
-    if sps.sample_adaptive_offset_enabled_flag {
-        slice_sao_luma_flag = r.read_bit()? == 1;
-        // For 4:2:0 there's also a chroma SAO flag.
-        slice_sao_chroma_flag = r.read_bit()? == 1;
-    }
-
-    // The big P/B section is skipped because slice_type == I above.
-
-    let slice_qp_delta = r.read_se()?;
-    let slice_qp_y = pps.init_qp + slice_qp_delta;
-    if !(-(6 * sps.bit_depth_luma as i32 - 6)..=51).contains(&slice_qp_y) {
-        return Err(DecodeError::InvalidSyntax("SliceQpY out of range"));
-    }
-
-    if pps.pps_slice_chroma_qp_offsets_present_flag {
-        let _slice_cb_qp_offset = r.read_se()?;
-        let _slice_cr_qp_offset = r.read_se()?;
-    }
-
+    let mut slice_qp_delta = 0i32;
+    let mut slice_qp_y = 0i32;
     let mut slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
     let mut slice_beta_offset_div2 = 0i32;
     let mut slice_tc_offset_div2 = 0i32;
-    if pps.deblocking_filter_override_enabled_flag {
-        let deblocking_filter_override_flag = r.read_bit()? == 1;
-        if deblocking_filter_override_flag {
-            slice_deblocking_filter_disabled_flag = r.read_bit()? == 1;
-            if !slice_deblocking_filter_disabled_flag {
-                slice_beta_offset_div2 = r.read_se()?;
-                slice_tc_offset_div2 = r.read_se()?;
+
+    if !dependent_slice_segment_flag {
+        let slice_type_raw = r.read_ue()?;
+        slice_type = match slice_type_raw {
+            0 => SliceType::B,
+            1 => SliceType::P,
+            2 => SliceType::I,
+            _ => {
+                return Err(DecodeError::InvalidSyntax("invalid slice_type"));
+            }
+        };
+
+        if slice_type != SliceType::I {
+            // Phase 2 only handles I-slices. P/B slices need ref list + MV decode.
+            return Err(DecodeError::Unsupported(
+                "only I-slices are supported in Phase 2",
+            ));
+        }
+
+        if pps.output_flag_present_flag {
+            pic_output_flag = r.read_bit()? == 1;
+        }
+
+        // separate_colour_plane_flag is gated by chroma_format_idc==3, which we
+        // already rejected in SPS parsing.
+
+        if !nal_unit_type.is_idr() {
+            // POC + RPS section. IDR pictures skip this entirely (POC = 0).
+            // We don't yet handle non-IDR slices, so reject before consuming any
+            // bits — that way nothing here can mis-advance the bitstream.
+            return Err(DecodeError::Unsupported(
+                "non-IDR slice header parsing not yet implemented",
+            ));
+        }
+
+        if sps.sample_adaptive_offset_enabled_flag {
+            slice_sao_luma_flag = r.read_bit()? == 1;
+            // For 4:2:0 there's also a chroma SAO flag.
+            slice_sao_chroma_flag = r.read_bit()? == 1;
+        }
+
+        // The big P/B section is skipped because slice_type == I above.
+
+        slice_qp_delta = r.read_se()?;
+        slice_qp_y = pps.init_qp + slice_qp_delta;
+        if !(-(6 * sps.bit_depth_luma as i32 - 6)..=51).contains(&slice_qp_y) {
+            return Err(DecodeError::InvalidSyntax("SliceQpY out of range"));
+        }
+
+        if pps.pps_slice_chroma_qp_offsets_present_flag {
+            let _slice_cb_qp_offset = r.read_se()?;
+            let _slice_cr_qp_offset = r.read_se()?;
+        }
+
+        if pps.deblocking_filter_override_enabled_flag {
+            let deblocking_filter_override_flag = r.read_bit()? == 1;
+            if deblocking_filter_override_flag {
+                slice_deblocking_filter_disabled_flag = r.read_bit()? == 1;
+                if !slice_deblocking_filter_disabled_flag {
+                    slice_beta_offset_div2 = r.read_se()?;
+                    slice_tc_offset_div2 = r.read_se()?;
+                }
             }
         }
-    }
 
-    if pps.pps_loop_filter_across_slices_enabled_flag
-        && (slice_sao_luma_flag || slice_sao_chroma_flag || !slice_deblocking_filter_disabled_flag)
-    {
-        let _slice_loop_filter_across_slices_enabled_flag = r.read_bit()?;
+        if pps.pps_loop_filter_across_slices_enabled_flag
+            && (slice_sao_luma_flag
+                || slice_sao_chroma_flag
+                || !slice_deblocking_filter_disabled_flag)
+        {
+            let _slice_loop_filter_across_slices_enabled_flag = r.read_bit()?;
+        }
     }
 
     // Phase 3c-3: WPP entry point parsing. `tiles_enabled_flag` is still

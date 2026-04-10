@@ -63,6 +63,27 @@ struct PictureInProgress {
     /// picture share the same filter flags, which this approximation
     /// matches.
     last_slice_header: SliceHeader,
+    /// Phase 3c-4: header of the most recent *independent* slice segment
+    /// in this picture. A dependent slice segment inherits `slice_type`,
+    /// `slice_qp_y`, `slice_sao_*`, and the deblock filter fields from
+    /// this header; the parser leaves those fields at default values on
+    /// dependent slices and the decoder copies them in from here. For a
+    /// picture that doesn't use dependent slice segments this is simply a
+    /// copy of `last_slice_header` after every slice.
+    last_independent_slice_header: SliceHeader,
+    /// Phase 3c-4: CABAC contexts snapshot at the end of the previous
+    /// slice segment (after the slice's final `end_of_slice_flag = 1`
+    /// terminate bin). A dependent slice segment restores its contexts
+    /// from this snapshot instead of re-initializing from the slice QP
+    /// when the slice does NOT start on a WPP row boundary. `None`
+    /// before any slice has finished.
+    saved_cabac_state: Option<[u8; crate::cabac_tables::HEVC_CONTEXTS]>,
+    /// Phase 3c-4: WPP context state snapshot (state after the 2nd CTB
+    /// of a row). For WPP + dependent slice segments (one slice per row
+    /// layout), the dependent slice at the start of a new row loads this
+    /// state instead of `saved_cabac_state`. Mirrors FFmpeg's
+    /// `common_cabac_state->state` save/load used by `load_states`.
+    saved_wpp_cabac_state: Option<[u8; crate::cabac_tables::HEVC_CONTEXTS]>,
     /// Number of CTBs already decoded in this picture (sum across all
     /// slice segments seen so far).
     ctbs_decoded: u32,
@@ -254,16 +275,93 @@ impl Decoder {
         let pps = self.pps.as_ref().expect("pps present above");
         let tile_tables = self.tile_tables.as_ref().expect("tile tables built above");
 
-        let sh = parse_slice_segment_header(&nal.rbsp, nut, sps, pps)?;
+        let mut sh = parse_slice_segment_header(&nal.rbsp, nut, sps, pps)?;
+
+        // Phase 3c-4: a dependent slice segment inherits the slice-header
+        // fields that the parser deliberately left at their defaults —
+        // slice_type, slice_qp_y, slice_sao_*, deblock override, ... —
+        // from the most recent independent slice segment in this picture.
+        // The entry_point_offsets / slice_segment_address / header_size_bits
+        // are independently signaled in the dependent slice's own header
+        // and must NOT be overwritten.
+        if sh.dependent_slice_segment_flag {
+            let pic = self
+                .current_picture
+                .as_ref()
+                .ok_or(DecodeError::InvalidSyntax(
+                    "dependent slice segment without an active picture",
+                ))?;
+            let parent = &pic.last_independent_slice_header;
+            sh.slice_type = parent.slice_type;
+            sh.pic_output_flag = parent.pic_output_flag;
+            sh.slice_pic_order_cnt_lsb = parent.slice_pic_order_cnt_lsb;
+            sh.slice_sao_luma_flag = parent.slice_sao_luma_flag;
+            sh.slice_sao_chroma_flag = parent.slice_sao_chroma_flag;
+            sh.slice_qp_delta = parent.slice_qp_delta;
+            sh.slice_qp_y = parent.slice_qp_y;
+            sh.slice_deblocking_filter_disabled_flag = parent.slice_deblocking_filter_disabled_flag;
+            sh.slice_beta_offset_div2 = parent.slice_beta_offset_div2;
+            sh.slice_tc_offset_div2 = parent.slice_tc_offset_div2;
+        }
+
         if sh.slice_type != SliceType::I {
             return Err(DecodeError::Unsupported(
                 "only I-slices are supported in Phase 2",
             ));
         }
-        // Per-slice CABAC reinit (independent slice segments only — dependent
-        // slice segments would reuse the previous segment's context state,
-        // which we reject at parse time).
-        let mut contexts = CabacContexts::init(sh.slice_qp_y, sh.slice_type, false);
+
+        // Phase 3c-4: CABAC context setup.
+        //
+        // - Independent slice segment → fresh `CabacContexts::init` from
+        //   the slice QP and slice type, matching FFmpeg's `cabac_init_state`.
+        // - Dependent slice segment → restore the contexts as they were at
+        //   the end of the previous slice segment (after its last CTB's
+        //   `end_of_slice_flag = 1` terminate bin), matching FFmpeg's
+        //   behavior in `ff_hevc_cabac_init` which skips `cabac_init_state`
+        //   when `dependent_slice_segment_flag == 1`. Exception: if the
+        //   dependent slice's first CTB coincides with a WPP row start
+        //   and the picture is wider than 1 CTB, use the "end of previous
+        //   row's 2nd CTB" WPP save instead (spec 9.3.2.2 / FFmpeg
+        //   `load_states` path in `ff_hevc_cabac_init`). Single-column
+        //   pictures fall back to a fresh init for the row start, matching
+        //   the `ctb_width == 1` branch in FFmpeg.
+        //
+        // The CABAC byte stream is freshly opened on the new NAL's RBSP
+        // either way — the dependent slice has its own bitstream bytes,
+        // only the context state is inherited.
+        let pic_width_in_ctbs_for_init = sps.pic_width_in_ctbs_y();
+        let wpp_for_init = pps.entropy_coding_sync_enabled_flag;
+        let tiles_for_init = pps.tiles_enabled_flag;
+        let mut contexts = if sh.dependent_slice_segment_flag {
+            let pic = self.current_picture.as_ref().expect("checked above");
+            // Does the dependent slice's first CTB sit on a WPP row
+            // boundary? `slice_segment_address` is a tile-scan address, so
+            // for single-tile pictures it equals the raster address and
+            // `% pic_width_in_ctbs` gives the column. WPP is incompatible
+            // with multi-tile slices in practice so we only special-case
+            // the single-tile path.
+            let on_row_start = !tiles_for_init
+                && sh
+                    .slice_segment_address
+                    .is_multiple_of(pic_width_in_ctbs_for_init);
+            if wpp_for_init && on_row_start && !tiles_for_init {
+                if pic_width_in_ctbs_for_init == 1 {
+                    CabacContexts::init(sh.slice_qp_y, sh.slice_type, false)
+                } else {
+                    let saved = pic.saved_wpp_cabac_state.ok_or(DecodeError::InvalidSyntax(
+                        "dependent WPP slice at row start without a saved WPP context state",
+                    ))?;
+                    CabacContexts { state: saved }
+                }
+            } else {
+                let saved = pic.saved_cabac_state.ok_or(DecodeError::InvalidSyntax(
+                    "dependent slice segment without a saved CABAC state",
+                ))?;
+                CabacContexts { state: saved }
+            }
+        } else {
+            CabacContexts::init(sh.slice_qp_y, sh.slice_type, false)
+        };
         let cabac_byte_offset = sh.header_size_bits / 8;
         let mut cabac = CabacReader::new(&nal.rbsp, cabac_byte_offset);
 
@@ -297,6 +395,9 @@ impl Decoder {
             self.current_picture = Some(PictureInProgress {
                 state: ps,
                 last_slice_header: sh.clone(),
+                last_independent_slice_header: sh.clone(),
+                saved_cabac_state: None,
+                saved_wpp_cabac_state: None,
                 ctbs_decoded: 0,
                 total_ctbs,
             });
@@ -335,8 +436,16 @@ impl Decoder {
         // Phase 3c-3 (WPP): saved CABAC context state captured after the
         // second CTB of each row, to be loaded at the start of the next row.
         // Not used by tiles — tiles reinit from the slice QP at every tile
-        // boundary instead.
-        let mut saved_state: Option<[u8; crate::cabac_tables::HEVC_CONTEXTS]> = None;
+        // boundary instead. Phase 3c-4: for dependent slices we seed this
+        // from the picture-level `saved_wpp_cabac_state` so that the
+        // first inner-row reinit inside the dependent slice can still find
+        // a state from the previous slice's row.
+        let mut saved_state: Option<[u8; crate::cabac_tables::HEVC_CONTEXTS]> =
+            if sh.dependent_slice_segment_flag {
+                pic.saved_wpp_cabac_state
+            } else {
+                None
+            };
 
         let mut more_data = true;
         // Phase 3c-2: iterate in tile-scan order. For single-tile pictures
@@ -413,7 +522,25 @@ impl Decoder {
             // Record the slice this CTB belongs to BEFORE decoding, so the
             // intra prediction availability check can see the current CTB's
             // slice address. `tab_slice_addr_rs` is indexed by raster.
-            state.tab_slice_addr_rs[ctb_addr_rs as usize] = sh.slice_segment_address as i32;
+            //
+            // Phase 3c-4: for a dependent slice segment we store the
+            // **independent** parent slice's segment address, not this
+            // dependent segment's address. Dependent slice segments are
+            // logically part of the same slice as their parent, so
+            // cross-segment intra prediction MUST be allowed (spec 3.162:
+            // "independent slice segment: [...] the slice segment header
+            // information is not inferred from that of a preceding slice
+            // segment"; dependent segments inherit and therefore extend
+            // the same logical slice). Matches FFmpeg's
+            // `tab_slice_address[ctb_addr_rs] = s->sh.slice_addr`, where
+            // `sh->slice_addr` is only updated on independent segments
+            // (hevcdec.c line 824-826).
+            let recorded_slice_addr = if sh.dependent_slice_segment_flag {
+                pic.last_independent_slice_header.slice_segment_address as i32
+            } else {
+                sh.slice_segment_address as i32
+            };
+            state.tab_slice_addr_rs[ctb_addr_rs as usize] = recorded_slice_addr;
             crate::sao::decode_sao_param(&mut cabac, &mut contexts, state, sps, &sh, rx, ry);
             more_data = decode_coding_quadtree(
                 &mut cabac,
@@ -461,6 +588,25 @@ impl Decoder {
         }
 
         pic.ctbs_decoded = ctb_addr_ts;
+        // Phase 3c-4: snapshot the CABAC contexts at the end of the slice
+        // segment so the next dependent slice segment can restore them.
+        // We take the snapshot after `more_data` has gone false (i.e. after
+        // the final `end_of_slice_flag = 1` terminate bin has been decoded)
+        // which places us immediately after the slice's last CTB — exactly
+        // the state a dependent slice segment should start from (per spec
+        // 9.3.2.3 storage process for context variables).
+        //
+        // NOTE: `contexts.state` at this point includes the effects of the
+        // terminate bin decode, which doesn't mutate the context table
+        // (it's a bypass/terminate path), so the snapshot is equivalent to
+        // the "after last CTB" state the spec asks for.
+        pic.saved_cabac_state = Some(contexts.state);
+        // Persist the WPP row-state snapshot so a subsequent dependent
+        // slice segment starting on a WPP row boundary can restore it.
+        pic.saved_wpp_cabac_state = saved_state;
+        if !sh.dependent_slice_segment_flag {
+            pic.last_independent_slice_header = sh.clone();
+        }
         pic.last_slice_header = sh;
 
         if pic.ctbs_decoded != total_ctbs {
@@ -1720,6 +1866,212 @@ mod tests {
         );
         assert_eq!(pps.num_tile_columns, 2);
         assert_eq!(pps.num_tile_rows, 2);
+
+        let mut decoder = Decoder::new();
+        let mut frame: Option<Frame> = None;
+        for nal in &nals {
+            if let Some(f) = decoder.decode_nal(nal).expect("decode_nal") {
+                assert!(frame.is_none(), "fixture has only one frame");
+                frame = Some(f);
+            }
+        }
+        let frame = frame.expect("expected one decoded frame");
+        assert_eq!(frame.width as usize, w);
+        assert_eq!(frame.height as usize, h);
+
+        let mut decoded = Vec::with_capacity(ref_yuv.len());
+        decoded.extend_from_slice(&frame.y);
+        decoded.extend_from_slice(&frame.u);
+        decoded.extend_from_slice(&frame.v);
+
+        assert_eq!(
+            decoded.len(),
+            ref_yuv.len(),
+            "size mismatch: {} vs {}",
+            decoded.len(),
+            ref_yuv.len()
+        );
+        if decoded != ref_yuv {
+            for (i, (a, b)) in decoded.iter().zip(ref_yuv.iter()).enumerate() {
+                if a != b {
+                    let (plane, idx) = if i < w * h {
+                        ("Y", i)
+                    } else if i < w * h + (w / 2) * (h / 2) {
+                        ("U", i - w * h)
+                    } else {
+                        ("V", i - w * h - (w / 2) * (h / 2))
+                    };
+                    let (px, py) = (idx % w, idx / w);
+                    panic!(
+                        "first mismatch at byte {} (plane {} x={} y={}) ours={} ref={}",
+                        i, plane, px, py, a, b
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Phase 3c-4 byte-exact test**: 128×128 flat-gray intra frame with
+    /// `kvazaar --slices wpp --wpp`, which puts each CTB row in its own
+    /// slice segment with `dependent_slice_segment_flag = 1`. Tests:
+    ///
+    /// - PPS `dependent_slice_segments_enabled_flag = 1` (first slice is
+    ///   still independent and must decode as today)
+    /// - Slice header parser accepting `dependent_slice_segment_flag = 1`
+    ///   and emitting a `SliceHeader` with the inherited fields left at
+    ///   their defaults
+    /// - `Decoder::decode_slice` copying `slice_type` / `slice_qp_y` /
+    ///   `slice_sao_*` / deblock override from the saved independent
+    ///   slice header into the dependent slice header
+    /// - CABAC save at the end of each slice + WPP row-save restore at
+    ///   the start of every dependent slice (which happens to sit on a
+    ///   WPP row boundary in this fixture)
+    /// - Per-slice `entry_point_offsets` still parsed for dependent slices
+    ///   (they live outside the `!dependent_slice_segment_flag` block in
+    ///   the spec's slice header syntax)
+    ///
+    /// The fixture is generated at runtime by kvazaar. If kvazaar or
+    /// ffmpeg are not on the `PATH` the test silently skips, matching the
+    /// convention of the other dynamic fixtures in this file.
+    #[test]
+    fn test_decode_dependent_slices_byte_exact() {
+        use std::process::Command;
+
+        let tmp = std::env::temp_dir();
+        let input_yuv = tmp.join("dep_slices_input.yuv");
+        let h265_path = tmp.join("dep_slices.h265");
+        let ref_yuv_path = tmp.join("dep_slices_ref.yuv");
+
+        // 128×128 flat gray input. At kvazaar's default CTU=64 this is a
+        // 2×2 CTB picture, which gives us two CTB rows → two dependent
+        // slice segments per picture (row 0 is the independent slice,
+        // row 1 is the dependent slice that inherits from row 0). Keep
+        // the luma plane flat gray because the upstream decoder does not
+        // yet support chroma residual coding.
+        let w: usize = 128;
+        let h: usize = 128;
+        let mut yuv_data = Vec::with_capacity(w * h + 2 * (w / 2) * (h / 2));
+        yuv_data.extend(std::iter::repeat_n(0x7Eu8, w * h));
+        yuv_data.extend(std::iter::repeat_n(128u8, (w / 2) * (h / 2) * 2));
+        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
+
+        // `--slices wpp` → each row in its own dependent slice segment.
+        // `--wpp` is implied by `--slices wpp`, but we set it explicitly
+        // so it's obvious from the test what the encoder is doing.
+        let kvz = Command::new("/opt/homebrew/bin/kvazaar")
+            .args([
+                "--input",
+                input_yuv.to_str().unwrap(),
+                "--input-res",
+                "128x128",
+                "--input-fps",
+                "1",
+                "--frames",
+                "1",
+                "--output",
+                h265_path.to_str().unwrap(),
+                "--preset",
+                "ultrafast",
+                "--slices",
+                "wpp",
+                "--wpp",
+                "--no-sao",
+                "--no-deblock",
+                "--no-signhide",
+                "--gop",
+                "0",
+                "--period",
+                "1",
+                "--qp",
+                "25",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let kvz = match kvz {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("kvazaar not found, skipping dependent slices fixture test");
+                return;
+            }
+        };
+        assert!(kvz.success(), "kvazaar encoding failed");
+
+        let ffmpeg_status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-i",
+                h265_path.to_str().unwrap(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                ref_yuv_path.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let ffmpeg_status = match ffmpeg_status {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("ffmpeg not found, skipping dependent slices fixture test");
+                return;
+            }
+        };
+        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
+
+        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
+        let nals = parse_annex_b(&h265);
+
+        // Sanity-check: the PPS really enables dependent slice segments,
+        // and at least one VCL NAL has `dependent_slice_segment_flag = 1`.
+        let pps_nal = nals
+            .iter()
+            .find(|n| n.nal_unit_type == NalUnitType::Pps)
+            .expect("fixture must contain a PPS");
+        let pps = parse_pps(&pps_nal.rbsp).expect("parse dep-slice PPS");
+        assert!(
+            pps.dependent_slice_segments_enabled_flag,
+            "dependent slices fixture must have dependent_slice_segments_enabled_flag = 1"
+        );
+
+        let vcl_count = nals.iter().filter(|n| n.nal_unit_type.is_vcl()).count();
+        assert!(
+            vcl_count >= 2,
+            "dependent slices fixture must have at least 2 VCL NAL units (got {})",
+            vcl_count
+        );
+
+        // Parse each VCL slice header and check that at least one is a
+        // dependent slice segment. We need a running SPS/PPS pair for the
+        // parser.
+        let sps_nal = nals
+            .iter()
+            .find(|n| n.nal_unit_type == NalUnitType::Sps)
+            .expect("fixture must contain an SPS");
+        let sps = crate::sps::parse_sps(&sps_nal.rbsp).expect("parse SPS");
+        let mut pps_resolved = pps.clone();
+        pps_resolved
+            .resolve_tile_geometry(&sps)
+            .expect("resolve tile geometry");
+        let mut dependent_count = 0usize;
+        for vcl in nals.iter().filter(|n| n.nal_unit_type.is_vcl()) {
+            let sh = crate::slice::parse_slice_segment_header(
+                &vcl.rbsp,
+                vcl.nal_unit_type,
+                &sps,
+                &pps_resolved,
+            )
+            .expect("parse slice header");
+            if sh.dependent_slice_segment_flag {
+                dependent_count += 1;
+            }
+        }
+        assert!(
+            dependent_count >= 1,
+            "dependent slices fixture must contain at least one dependent slice segment"
+        );
 
         let mut decoder = Decoder::new();
         let mut frame: Option<Frame> = None;
