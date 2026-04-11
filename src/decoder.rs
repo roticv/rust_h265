@@ -1573,103 +1573,34 @@ mod tests {
         );
     }
 
-    /// **Phase 3a-3 byte-exact test**: 32x32 diagonal-gradient frame with
+    /// **Phase 3a-3 byte-exact test**: 16x16 flat-gray frame with
     /// `--ctu 16 --max-tu-size 4` to force angular intra prediction modes.
     ///
-    /// The gradient input causes x265 to choose angular modes for many PUs,
-    /// exercising predict_angular + reference sample filtering. The test
-    /// generates the fixture at runtime (x265 encode + ffmpeg decode) and
-    /// then verifies our decoder is byte-exact against FFmpeg's output.
+    /// Fixture: `testdata/angular.h265` + `testdata/angular_ref.yuv`
+    /// Generated with:
+    /// ```text
+    /// # 16x16 flat gray YUV input (luma=0x7E, chroma=128)
+    /// x265 --input angular_input.yuv --input-res 16x16 --fps 1 --frames 1 \
+    ///   --preset ultrafast --no-wpp --no-signhide --ctu 16 --max-tu-size 4 \
+    ///   --no-open-gop --keyint 1 --no-scenecut --no-sao --no-deblock \
+    ///   --qp 25 --no-psnr --no-ssim --no-info -o angular.h265
+    /// ffmpeg -i angular.h265 -f rawvideo -pix_fmt yuv420p angular_ref.yuv
+    /// ```
     #[test]
     fn test_decode_angular_byte_exact() {
-        use std::process::Command;
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/angular.h265"
+        ))
+        .expect("read fixture");
+        let ref_yuv = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/angular_ref.yuv"
+        ))
+        .expect("read ref");
 
-        let tmp = std::env::temp_dir();
-        let input_yuv = tmp.join("angular_input.yuv");
-        let h265_path = tmp.join("angular.h265");
-        let ref_yuv_path = tmp.join("angular_ref.yuv");
-
-        // Step 1: Generate 16x16 flat gray YUV input.
-        // x265 with --max-tu-size 4 picks angular modes for some 4x4 PUs.
         let w: usize = 16;
         let h: usize = 16;
-        let mut yuv_data = Vec::with_capacity(w * h + 2 * (w / 2) * (h / 2));
-        yuv_data.extend(std::iter::repeat_n(0x7Eu8, w * h));
-        yuv_data.extend(std::iter::repeat_n(128u8, (w / 2) * (h / 2) * 2));
-        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
-
-        // Step 2: Encode with x265 (intra-only, no sign-hiding, max-tu-size 4).
-        let x265_status = Command::new("x265")
-            .args([
-                "--input",
-                input_yuv.to_str().unwrap(),
-                "--input-res",
-                "16x16",
-                "--fps",
-                "1",
-                "--frames",
-                "1",
-                "--output",
-                h265_path.to_str().unwrap(),
-                "--preset",
-                "ultrafast",
-                "--no-wpp",
-                "--no-signhide",
-                "--ctu",
-                "16",
-                "--max-tu-size",
-                "4",
-                "--no-open-gop",
-                "--keyint",
-                "1",
-                "--no-scenecut",
-                "--no-sao",
-                "--no-deblock",
-                "--qp",
-                "25",
-                "--no-psnr",
-                "--no-ssim",
-                "--no-info",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let x265_status = match x265_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("x265 not found, skipping angular fixture test");
-                return;
-            }
-        };
-        assert!(x265_status.success(), "x265 encoding failed");
-
-        // Step 3: Decode reference with FFmpeg.
-        let ffmpeg_status = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-i",
-                h265_path.to_str().unwrap(),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                ref_yuv_path.to_str().unwrap(),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let ffmpeg_status = match ffmpeg_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("ffmpeg not found, skipping angular fixture test");
-                return;
-            }
-        };
-        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
-
-        // Step 4: Decode with our decoder.
-        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
-        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
 
         let nals = parse_annex_b(&h265);
         let mut decoder = Decoder::new();
@@ -1698,7 +1629,6 @@ mod tests {
             ref_yuv.len()
         );
 
-        // Find first difference for debugging.
         if decoded != ref_yuv {
             for (i, (a, b)) in decoded.iter().zip(ref_yuv.iter()).enumerate() {
                 if a != b {
@@ -1718,100 +1648,36 @@ mod tests {
         }
     }
 
-    /// **Phase 3a-3 byte-exact test**: 16x16 diagonal-gradient frame with
-    /// `--ctu 16 --max-tu-size 4 --qp 32` to force angular intra prediction
-    /// modes (modes 2..34). The gradient causes x265 to pick modes like 3
+    /// **Phase 3a-3 byte-exact test**: 16x16 vertical-stripe frame with
+    /// `--ctu 16 --max-tu-size 4 --qp 30` to force angular intra prediction
+    /// modes (modes 2..34). The stripe pattern causes x265 to pick modes like 3
     /// and 34 for many PUs within a single CTU.
+    ///
+    /// Fixture: `testdata/angular_grad.h265` + `testdata/angular_grad_ref.yuv`
+    /// Generated with:
+    /// ```text
+    /// # 16x16 vertical stripe YUV input (left=40, right=200, chroma=128)
+    /// x265 --input angular_grad_input.yuv --input-res 16x16 --fps 1 --frames 1 \
+    ///   --preset ultrafast --no-wpp --no-signhide --ctu 16 --max-tu-size 4 \
+    ///   --no-open-gop --keyint 1 --no-scenecut --no-sao --no-deblock \
+    ///   --qp 30 --no-psnr --no-ssim --no-info -o angular_grad.h265
+    /// ffmpeg -i angular_grad.h265 -f rawvideo -pix_fmt yuv420p angular_grad_ref.yuv
+    /// ```
     #[test]
     fn test_decode_angular_gradient_byte_exact() {
-        use std::process::Command;
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/angular_grad.h265"
+        ))
+        .expect("read fixture");
+        let ref_yuv = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/angular_grad_ref.yuv"
+        ))
+        .expect("read ref");
 
-        let tmp = std::env::temp_dir();
-        let input_yuv = tmp.join("angular_grad_input.yuv");
-        let h265_path = tmp.join("angular_grad.h265");
-        let ref_yuv_path = tmp.join("angular_grad_ref.yuv");
-
-        // Use a vertical stripe pattern to encourage angular modes.
         let w: usize = 16;
         let h: usize = 16;
-        let mut yuv_data = Vec::with_capacity(w * h + 2 * (w / 2) * (h / 2));
-        for _y in 0..h {
-            for x in 0..w {
-                yuv_data.push(if x < 8 { 40u8 } else { 200u8 });
-            }
-        }
-        yuv_data.extend(std::iter::repeat_n(128u8, (w / 2) * (h / 2) * 2));
-        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
-
-        let x265_status = Command::new("x265")
-            .args([
-                "--input",
-                input_yuv.to_str().unwrap(),
-                "--input-res",
-                "16x16",
-                "--fps",
-                "1",
-                "--frames",
-                "1",
-                "--output",
-                h265_path.to_str().unwrap(),
-                "--preset",
-                "ultrafast",
-                "--no-wpp",
-                "--no-signhide",
-                "--ctu",
-                "16",
-                "--max-tu-size",
-                "4",
-                "--no-open-gop",
-                "--keyint",
-                "1",
-                "--no-scenecut",
-                "--no-sao",
-                "--no-deblock",
-                "--qp",
-                "30",
-                "--no-psnr",
-                "--no-ssim",
-                "--no-info",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let x265_status = match x265_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("x265 not found, skipping angular gradient test");
-                return;
-            }
-        };
-        assert!(x265_status.success(), "x265 encoding failed");
-
-        let ffmpeg_status = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-i",
-                h265_path.to_str().unwrap(),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                ref_yuv_path.to_str().unwrap(),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let ffmpeg_status = match ffmpeg_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("ffmpeg not found, skipping angular gradient test");
-                return;
-            }
-        };
-        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
-
-        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
-        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
 
         let nals = parse_annex_b(&h265);
         let mut decoder = Decoder::new();
@@ -1868,95 +1734,33 @@ mod tests {
     /// - Scaling matrix lookup in `residual_coding` dequantization
     /// - DC scale for 16x16 TUs (`sl_dc`)
     /// - Position downsampling for 16x16: `pos = ((y>>1)<<3) + (x>>1)`
+    ///
+    /// Fixture: `testdata/scaling_list.h265` + `testdata/scaling_list_ref.yuv`
+    /// Generated with:
+    /// ```text
+    /// # 16x16 flat gray YUV input (luma=0x7E, chroma=128)
+    /// x265 --input scaling_list_input.yuv --input-res 16x16 --fps 1 --frames 1 \
+    ///   --preset ultrafast --no-wpp --no-signhide --ctu 16 \
+    ///   --no-open-gop --keyint 1 --no-scenecut --no-sao --no-deblock \
+    ///   --qp 25 --no-psnr --no-ssim --no-info --scaling-list default \
+    ///   -o scaling_list.h265
+    /// ffmpeg -i scaling_list.h265 -f rawvideo -pix_fmt yuv420p scaling_list_ref.yuv
+    /// ```
     #[test]
     fn test_decode_scaling_list_default_byte_exact() {
-        use std::process::Command;
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/scaling_list.h265"
+        ))
+        .expect("read fixture");
+        let ref_yuv = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/scaling_list_ref.yuv"
+        ))
+        .expect("read ref");
 
-        let tmp = std::env::temp_dir();
-        let input_yuv = tmp.join("scaling_list_input.yuv");
-        let h265_path = tmp.join("scaling_list.h265");
-        let ref_yuv_path = tmp.join("scaling_list_ref.yuv");
-
-        // 16x16 flat gray input.
         let w: usize = 16;
         let h: usize = 16;
-        let mut yuv_data = Vec::with_capacity(w * h + 2 * (w / 2) * (h / 2));
-        yuv_data.extend(std::iter::repeat_n(0x7Eu8, w * h));
-        yuv_data.extend(std::iter::repeat_n(128u8, (w / 2) * (h / 2) * 2));
-        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
-
-        // Encode with x265 using --scaling-list default.
-        let x265_status = Command::new("x265")
-            .args([
-                "--input",
-                input_yuv.to_str().unwrap(),
-                "--input-res",
-                "16x16",
-                "--fps",
-                "1",
-                "--frames",
-                "1",
-                "--output",
-                h265_path.to_str().unwrap(),
-                "--preset",
-                "ultrafast",
-                "--no-wpp",
-                "--no-signhide",
-                "--ctu",
-                "16",
-                "--no-open-gop",
-                "--keyint",
-                "1",
-                "--no-scenecut",
-                "--no-sao",
-                "--no-deblock",
-                "--qp",
-                "25",
-                "--no-psnr",
-                "--no-ssim",
-                "--no-info",
-                "--scaling-list",
-                "default",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let x265_status = match x265_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("x265 not found, skipping scaling list test");
-                return;
-            }
-        };
-        assert!(x265_status.success(), "x265 encoding failed");
-
-        // Decode reference with FFmpeg.
-        let ffmpeg_status = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-i",
-                h265_path.to_str().unwrap(),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                ref_yuv_path.to_str().unwrap(),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let ffmpeg_status = match ffmpeg_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("ffmpeg not found, skipping scaling list test");
-                return;
-            }
-        };
-        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
-
-        // Decode with our decoder.
-        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
-        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
 
         let nals = parse_annex_b(&h265);
         let mut decoder = Decoder::new();
@@ -2004,117 +1808,44 @@ mod tests {
         }
     }
 
-    /// **Phase 3a-6 byte-exact test**: 16×16 vertical-stripe frame encoded
-    /// *without* `--no-signhide`, so `pps_sign_data_hiding_enabled_flag` is
-    /// set and x265 will omit the sign bit of the last-in-scan-order
-    /// non-zero coefficient in sub-blocks that meet the 4-position gap
-    /// criterion.
+    /// **Phase 3a-6 byte-exact test**: 16x16 vertical-stripe frame encoded
+    /// with `--signhide`, so `pps_sign_data_hiding_enabled_flag` is set.
     ///
     /// Exercises:
     /// - `sign_data_hiding_enabled_flag = 1` in the PPS (no longer rejected)
     /// - `sign_hidden = (last_nz_pos_in_cg - first_nz_pos_in_cg >= 4)` gate
     /// - Decoding `n_end - 1` sign bits in hidden sub-blocks
     /// - Sum-of-abs parity adjustment on the hidden coefficient
+    ///
+    /// Fixture: `testdata/signhide.h265` + `testdata/signhide_ref.yuv`
+    /// Generated with:
+    /// ```text
+    /// # 16x16 vertical stripe YUV input (left=40, right=200, chroma=128)
+    /// x265 --input signhide_input.yuv --input-res 16x16 --fps 1 --frames 1 \
+    ///   --preset ultrafast --no-wpp --signhide --ctu 16 --max-tu-size 4 \
+    ///   --no-open-gop --keyint 1 --no-scenecut --no-sao --no-deblock \
+    ///   --qp 20 --no-psnr --no-ssim --no-info -o signhide.h265
+    /// ffmpeg -i signhide.h265 -f rawvideo -pix_fmt yuv420p signhide_ref.yuv
+    /// ```
     #[test]
     fn test_decode_signhide_byte_exact() {
-        use std::process::Command;
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/signhide.h265"
+        ))
+        .expect("read fixture");
+        let ref_yuv = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/signhide_ref.yuv"
+        ))
+        .expect("read ref");
 
-        let tmp = std::env::temp_dir();
-        let input_yuv = tmp.join("signhide_input.yuv");
-        let h265_path = tmp.join("signhide.h265");
-        let ref_yuv_path = tmp.join("signhide_ref.yuv");
-
-        // Vertical-stripe pattern: produces many non-zero high-frequency
-        // coefficients per sub-block, so the 4-position SDH gap condition
-        // is met often (the encoder is free to actually hide signs).
         let w: usize = 16;
         let h: usize = 16;
-        let mut yuv_data = Vec::with_capacity(w * h + 2 * (w / 2) * (h / 2));
-        for _y in 0..h {
-            for x in 0..w {
-                yuv_data.push(if x < 8 { 40u8 } else { 200u8 });
-            }
-        }
-        yuv_data.extend(std::iter::repeat_n(128u8, (w / 2) * (h / 2) * 2));
-        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
-
-        // `--preset ultrafast` implicitly sets `signhide 0`, so we have to
-        // explicitly request `--signhide` to enable it. That's exactly the
-        // path we want to exercise.
-        let x265_status = Command::new("x265")
-            .args([
-                "--input",
-                input_yuv.to_str().unwrap(),
-                "--input-res",
-                "16x16",
-                "--fps",
-                "1",
-                "--frames",
-                "1",
-                "--output",
-                h265_path.to_str().unwrap(),
-                "--preset",
-                "ultrafast",
-                "--no-wpp",
-                "--signhide",
-                "--ctu",
-                "16",
-                "--max-tu-size",
-                "4",
-                "--no-open-gop",
-                "--keyint",
-                "1",
-                "--no-scenecut",
-                "--no-sao",
-                "--no-deblock",
-                "--qp",
-                "20",
-                "--no-psnr",
-                "--no-ssim",
-                "--no-info",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let x265_status = match x265_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("x265 not found, skipping signhide fixture test");
-                return;
-            }
-        };
-        assert!(x265_status.success(), "x265 encoding failed");
-
-        let ffmpeg_status = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-i",
-                h265_path.to_str().unwrap(),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                ref_yuv_path.to_str().unwrap(),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let ffmpeg_status = match ffmpeg_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("ffmpeg not found, skipping signhide fixture test");
-                return;
-            }
-        };
-        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
-
-        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
-        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
 
         let nals = parse_annex_b(&h265);
 
         // Sanity-check: the PPS in this fixture must actually have SDH on.
-        // If it doesn't we're not exercising the new path at all.
         let pps_nal = nals
             .iter()
             .find(|n| n.nal_unit_type == NalUnitType::Pps)
@@ -2170,124 +1901,33 @@ mod tests {
         }
     }
 
-    /// **Phase 3a-5 byte-exact test**: attempt to produce a PCM-bearing
-    /// bitstream via x265 `--pcm`. x265 is notoriously reluctant to choose
-    /// PCM over intra; on a flat-gray frame with a very high QP it *may*
-    /// decide the PCM cost is lower. If the resulting file ends up without
-    /// any `pcm_flag = 1` CUs we still get a useful byte-exact regression
-    /// test against FFmpeg for the non-PCM path with `pcm_enabled_flag = 1`
-    /// in the SPS — verifying that our updated SPS parser handles the flag
-    /// correctly. If x265 or ffmpeg isn't installed the test silently skips,
-    /// matching the convention of the other dynamic fixtures in this file.
+    /// **Phase 3a-5 byte-exact test**: 16x16 noise-pattern frame at QP 51.
     ///
-    /// TODO: this doesn't guarantee the PCM *decode* path runs. The unit
-    /// tests in `cu_tree.rs` for `decode_pcm_block` and
-    /// `CabacReader::pcm_byte_position` cover that path synthetically
-    /// without needing a PCM-bearing fixture.
+    /// The original test attempted `--pcm` but most x265 builds don't
+    /// support it. The fixture was generated without `--pcm`, so it tests
+    /// the high-QP noise-pattern decode path rather than actual PCM CUs.
+    /// The unit tests in `cu_tree.rs` for `decode_pcm_block` and
+    /// `CabacReader::pcm_byte_position` cover the PCM path synthetically.
+    ///
+    /// Fixture: `testdata/pcm.h265` + `testdata/pcm_ref.yuv`
+    /// Generated with:
+    /// ```text
+    /// # 16x16 deterministic xorshift noise YUV input (seed=0xdeadbeef)
+    /// x265 --input pcm_input.yuv --input-res 16x16 --fps 1 --frames 1 \
+    ///   --preset ultrafast --no-wpp --no-signhide --ctu 16 \
+    ///   --no-open-gop --keyint 1 --no-scenecut --no-sao --no-deblock \
+    ///   --qp 51 --no-psnr --no-ssim --no-info -o pcm.h265
+    /// ffmpeg -i pcm.h265 -f rawvideo -pix_fmt yuv420p pcm_ref.yuv
+    /// ```
     #[test]
     fn test_decode_pcm_byte_exact() {
-        use std::process::Command;
+        let h265 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/pcm.h265"))
+            .expect("read fixture");
+        let ref_yuv = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/pcm_ref.yuv"))
+            .expect("read ref");
 
-        let tmp = std::env::temp_dir();
-        let input_yuv = tmp.join("pcm_input.yuv");
-        let h265_path = tmp.join("pcm.h265");
-        let ref_yuv_path = tmp.join("pcm_ref.yuv");
-
-        // 16x16 "noise" pattern. Pure random data frustrates x265's RDO
-        // harder than a flat frame — making the PCM escape hatch more
-        // attractive. We use a deterministic xorshift so the fixture is
-        // reproducible across runs.
         let w: usize = 16;
         let h: usize = 16;
-        let mut yuv_data = Vec::with_capacity(w * h + 2 * (w / 2) * (h / 2));
-        let mut s: u32 = 0xdead_beef;
-        let mut next = || {
-            s ^= s << 13;
-            s ^= s >> 17;
-            s ^= s << 5;
-            s as u8
-        };
-        for _ in 0..(w * h) {
-            yuv_data.push(next());
-        }
-        for _ in 0..(2 * (w / 2) * (h / 2)) {
-            yuv_data.push(next());
-        }
-        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
-
-        let x265_status = Command::new("x265")
-            .args([
-                "--input",
-                input_yuv.to_str().unwrap(),
-                "--input-res",
-                "16x16",
-                "--fps",
-                "1",
-                "--frames",
-                "1",
-                "--output",
-                h265_path.to_str().unwrap(),
-                "--preset",
-                "ultrafast",
-                "--no-wpp",
-                "--no-signhide",
-                "--ctu",
-                "16",
-                "--no-open-gop",
-                "--keyint",
-                "1",
-                "--no-scenecut",
-                "--no-sao",
-                "--no-deblock",
-                // Very high QP + --pcm nudges x265 into picking PCM for
-                // hard-to-predict blocks.
-                "--qp",
-                "51",
-                "--pcm",
-                "--no-psnr",
-                "--no-ssim",
-                "--no-info",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let x265_status = match x265_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("x265 not found, skipping PCM fixture test");
-                return;
-            }
-        };
-        if !x265_status.success() {
-            eprintln!("x265 encoding failed (perhaps the build lacks --pcm); skipping");
-            return;
-        }
-
-        let ffmpeg_status = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-i",
-                h265_path.to_str().unwrap(),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                ref_yuv_path.to_str().unwrap(),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let ffmpeg_status = match ffmpeg_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("ffmpeg not found, skipping PCM fixture test");
-                return;
-            }
-        };
-        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
-
-        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
-        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
 
         let nals = parse_annex_b(&h265);
         let mut decoder = Decoder::new();
@@ -2410,122 +2050,41 @@ mod tests {
         }
     }
 
-    /// **Phase 3c-2 byte-exact test**: 128×64 flat-gray intra frame with
-    /// `--tiles 2x1`, encoded by kvazaar (x265 has no tile support). Tests:
+    /// **Phase 3c-2 byte-exact test**: 256x256 flat-gray intra frame with
+    /// `--tiles 2x2`, encoded by kvazaar. Tests:
     ///
     /// - PPS `tiles_enabled_flag = 1` parsing (no longer rejected)
     /// - `num_tile_columns_minus1` / `num_tile_rows_minus1` / uniform spacing
     /// - `Pps::resolve_tile_geometry` producing `column_widths_in_ctbs`
-    /// - `TileScanTables::build` building the raster↔tile-scan mapping
+    /// - `TileScanTables::build` building the raster<->tile-scan mapping
     /// - Per-tile CABAC reinit at the tile boundary (byte offset + state)
     /// - CTB iteration in tile-scan order
     /// - `tab_tile_id` population + intra-availability tile boundary check
     /// - Byte-exact match against FFmpeg
     ///
-    /// The fixture is generated at runtime by kvazaar. If kvazaar or ffmpeg
-    /// are not on the `PATH` the test silently skips, matching the
-    /// convention of the other dynamic fixtures above.
+    /// Fixture: `testdata/tiles.h265` + `testdata/tiles_ref.yuv`
+    /// Generated with:
+    /// ```text
+    /// # 256x256 flat gray YUV input (luma=0x7E, chroma=128)
+    /// kvazaar --input tiles_input.yuv --input-res 256x256 --input-fps 1 \
+    ///   --frames 1 --preset ultrafast --tiles 2x2 --no-wpp --no-sao \
+    ///   --no-deblock --no-signhide --gop 0 --period 1 --qp 25 \
+    ///   --output tiles.h265
+    /// ffmpeg -i tiles.h265 -f rawvideo -pix_fmt yuv420p tiles_ref.yuv
+    /// ```
     #[test]
     fn test_decode_tiles_byte_exact() {
-        use std::process::Command;
+        let h265 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/tiles.h265"))
+            .expect("read fixture");
+        let ref_yuv = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/tiles_ref.yuv"
+        ))
+        .expect("read ref");
 
-        let tmp = std::env::temp_dir();
-        let input_yuv = tmp.join("tiles_input.yuv");
-        let h265_path = tmp.join("tiles.h265");
-        let ref_yuv_path = tmp.join("tiles_ref.yuv");
-
-        // 256×256 flat gray input. At kvazaar's default CTU=64 this is
-        // 4×4 CTBs. With a 2×2 tile layout each tile is 2×2 CTBs, which
-        // gives genuine reordering between raster and tile scan (e.g.
-        // raster CTB 2 has tile-scan index 4), exercising the real reorder
-        // path in `decode_slice` (not just the identity mapping of a
-        // 1 CTB per tile picture).
-        //
-        // We keep luma flat gray (not striped) because the upstream decoder
-        // does not yet support chroma residual coding; a striped pattern
-        // would generate non-zero chroma residuals that x265/kvazaar will
-        // happily encode but our decoder can't dequantize yet.
         let w: usize = 256;
         let h: usize = 256;
-        let mut yuv_data = Vec::with_capacity(w * h + 2 * (w / 2) * (h / 2));
-        yuv_data.extend(std::iter::repeat_n(0x7Eu8, w * h));
-        yuv_data.extend(std::iter::repeat_n(128u8, (w / 2) * (h / 2) * 2));
-        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
 
-        // kvazaar encode. `--slices tiles` puts each tile in its own slice
-        // segment, but even without it kvazaar produces a single slice with
-        // one entry point per tile boundary. We go with the single-slice
-        // form here because our multi-slice handling is already covered by
-        // `test_decode_multi_slice_byte_exact`.
-        //
-        // Notes:
-        // - `--gop 0` → all-intra (no B/P frames).
-        // - `--period 1` → every frame is a key frame.
-        // - Loop filters disabled to keep the fixture scope minimal.
-        let kvz = Command::new("/opt/homebrew/bin/kvazaar")
-            .args([
-                "--input",
-                input_yuv.to_str().unwrap(),
-                "--input-res",
-                "256x256",
-                "--input-fps",
-                "1",
-                "--frames",
-                "1",
-                "--output",
-                h265_path.to_str().unwrap(),
-                "--preset",
-                "ultrafast",
-                "--tiles",
-                "2x2",
-                "--no-wpp",
-                "--no-sao",
-                "--no-deblock",
-                "--no-signhide",
-                "--gop",
-                "0",
-                "--period",
-                "1",
-                "--qp",
-                "25",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let kvz = match kvz {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("kvazaar not found, skipping tiles fixture test");
-                return;
-            }
-        };
-        assert!(kvz.success(), "kvazaar encoding failed");
-
-        let ffmpeg_status = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-i",
-                h265_path.to_str().unwrap(),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                ref_yuv_path.to_str().unwrap(),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let ffmpeg_status = match ffmpeg_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("ffmpeg not found, skipping tiles fixture test");
-                return;
-            }
-        };
-        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
-
-        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
-        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
         let nals = parse_annex_b(&h265);
 
         // Sanity-check: the PPS really has tiles_enabled_flag = 1.
@@ -2585,121 +2144,46 @@ mod tests {
         }
     }
 
-    /// **Phase 3c-4 byte-exact test**: 128×128 flat-gray intra frame with
+    /// **Phase 3c-4 byte-exact test**: 128x128 flat-gray intra frame with
     /// `kvazaar --slices wpp --wpp`, which puts each CTB row in its own
     /// slice segment with `dependent_slice_segment_flag = 1`. Tests:
     ///
-    /// - PPS `dependent_slice_segments_enabled_flag = 1` (first slice is
-    ///   still independent and must decode as today)
+    /// - PPS `dependent_slice_segments_enabled_flag = 1`
     /// - Slice header parser accepting `dependent_slice_segment_flag = 1`
-    ///   and emitting a `SliceHeader` with the inherited fields left at
-    ///   their defaults
-    /// - `Decoder::decode_slice` copying `slice_type` / `slice_qp_y` /
-    ///   `slice_sao_*` / deblock override from the saved independent
-    ///   slice header into the dependent slice header
-    /// - CABAC save at the end of each slice + WPP row-save restore at
-    ///   the start of every dependent slice (which happens to sit on a
-    ///   WPP row boundary in this fixture)
+    /// - `Decoder::decode_slice` copying inherited fields from the
+    ///   independent slice header into the dependent slice header
+    /// - CABAC save at the end of each slice + WPP row-save restore
     /// - Per-slice `entry_point_offsets` still parsed for dependent slices
-    ///   (they live outside the `!dependent_slice_segment_flag` block in
-    ///   the spec's slice header syntax)
     ///
-    /// The fixture is generated at runtime by kvazaar. If kvazaar or
-    /// ffmpeg are not on the `PATH` the test silently skips, matching the
-    /// convention of the other dynamic fixtures in this file.
+    /// Fixture: `testdata/dep_slices.h265` + `testdata/dep_slices_ref.yuv`
+    /// Generated with:
+    /// ```text
+    /// # 128x128 flat gray YUV input (luma=0x7E, chroma=128)
+    /// kvazaar --input dep_slices_input.yuv --input-res 128x128 --input-fps 1 \
+    ///   --frames 1 --preset ultrafast --slices wpp --wpp --no-sao \
+    ///   --no-deblock --no-signhide --gop 0 --period 1 --qp 25 \
+    ///   --output dep_slices.h265
+    /// ffmpeg -i dep_slices.h265 -f rawvideo -pix_fmt yuv420p dep_slices_ref.yuv
+    /// ```
     #[test]
     fn test_decode_dependent_slices_byte_exact() {
-        use std::process::Command;
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/dep_slices.h265"
+        ))
+        .expect("read fixture");
+        let ref_yuv = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/dep_slices_ref.yuv"
+        ))
+        .expect("read ref");
 
-        let tmp = std::env::temp_dir();
-        let input_yuv = tmp.join("dep_slices_input.yuv");
-        let h265_path = tmp.join("dep_slices.h265");
-        let ref_yuv_path = tmp.join("dep_slices_ref.yuv");
-
-        // 128×128 flat gray input. At kvazaar's default CTU=64 this is a
-        // 2×2 CTB picture, which gives us two CTB rows → two dependent
-        // slice segments per picture (row 0 is the independent slice,
-        // row 1 is the dependent slice that inherits from row 0). Keep
-        // the luma plane flat gray because the upstream decoder does not
-        // yet support chroma residual coding.
         let w: usize = 128;
         let h: usize = 128;
-        let mut yuv_data = Vec::with_capacity(w * h + 2 * (w / 2) * (h / 2));
-        yuv_data.extend(std::iter::repeat_n(0x7Eu8, w * h));
-        yuv_data.extend(std::iter::repeat_n(128u8, (w / 2) * (h / 2) * 2));
-        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
 
-        // `--slices wpp` → each row in its own dependent slice segment.
-        // `--wpp` is implied by `--slices wpp`, but we set it explicitly
-        // so it's obvious from the test what the encoder is doing.
-        let kvz = Command::new("/opt/homebrew/bin/kvazaar")
-            .args([
-                "--input",
-                input_yuv.to_str().unwrap(),
-                "--input-res",
-                "128x128",
-                "--input-fps",
-                "1",
-                "--frames",
-                "1",
-                "--output",
-                h265_path.to_str().unwrap(),
-                "--preset",
-                "ultrafast",
-                "--slices",
-                "wpp",
-                "--wpp",
-                "--no-sao",
-                "--no-deblock",
-                "--no-signhide",
-                "--gop",
-                "0",
-                "--period",
-                "1",
-                "--qp",
-                "25",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let kvz = match kvz {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("kvazaar not found, skipping dependent slices fixture test");
-                return;
-            }
-        };
-        assert!(kvz.success(), "kvazaar encoding failed");
-
-        let ffmpeg_status = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-i",
-                h265_path.to_str().unwrap(),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                ref_yuv_path.to_str().unwrap(),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let ffmpeg_status = match ffmpeg_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("ffmpeg not found, skipping dependent slices fixture test");
-                return;
-            }
-        };
-        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
-
-        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
-        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
         let nals = parse_annex_b(&h265);
 
-        // Sanity-check: the PPS really enables dependent slice segments,
-        // and at least one VCL NAL has `dependent_slice_segment_flag = 1`.
+        // Sanity-check: the PPS really enables dependent slice segments.
         let pps_nal = nals
             .iter()
             .find(|n| n.nal_unit_type == NalUnitType::Pps)
@@ -2718,8 +2202,7 @@ mod tests {
         );
 
         // Parse each VCL slice header and check that at least one is a
-        // dependent slice segment. We need a running SPS/PPS pair for the
-        // parser.
+        // dependent slice segment.
         let sps_nal = nals
             .iter()
             .find(|n| n.nal_unit_type == NalUnitType::Sps)
@@ -2791,22 +2274,32 @@ mod tests {
         }
     }
 
-    /// **Phase 3d-3 inter syntax test**: encode a 2-frame IPP sequence with
-    /// x265, decode both frames, and verify:
+    /// **Phase 3d-3 inter P-slice byte-exact test**: 2-frame IPP sequence.
     /// - Frame 0 (IDR) decodes byte-exact against FFmpeg reference.
-    /// - Frame 1 (P-slice) decodes without crashing and has the right
-    ///   dimensions. Pixel values are NOT checked because motion compensation
-    ///   is not yet implemented (placeholder prediction used).
+    /// - Frame 1 (P-slice) decodes byte-exact against FFmpeg reference.
     ///
-    /// If x265 or ffmpeg are not on PATH the test silently skips.
+    /// Fixture: `testdata/inter_p.h265` + `testdata/inter_p_ref.yuv`
+    /// Generated with:
+    /// ```text
+    /// # 16x16, 2 identical flat-gray frames (luma=0x7E, chroma=128)
+    /// x265 --input inter_p_input.yuv --input-res 16x16 --fps 1 --frames 2 \
+    ///   --preset ultrafast --no-wpp --no-signhide --ctu 16 --no-open-gop \
+    ///   --keyint 2 --bframes 0 --no-scenecut --no-sao --no-deblock \
+    ///   --qp 25 --no-psnr --no-ssim --no-info --no-weightp -o inter_p.h265
+    /// ffmpeg -i inter_p.h265 -f rawvideo -pix_fmt yuv420p inter_p_ref.yuv
+    /// ```
     #[test]
     fn test_decode_inter_p_slice_no_crash() {
-        use std::process::Command;
-
-        let tmp = std::env::temp_dir();
-        let input_yuv = tmp.join("inter_p_input.yuv");
-        let h265_path = tmp.join("inter_p.h265");
-        let ref_yuv_path = tmp.join("inter_p_ref.yuv");
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/inter_p.h265"
+        ))
+        .expect("read fixture");
+        let ref_yuv = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/inter_p_ref.yuv"
+        ))
+        .expect("read ref");
 
         let w: usize = 16;
         let h: usize = 16;
@@ -2814,89 +2307,6 @@ mod tests {
         let uv_size = (w / 2) * (h / 2);
         let frame_size = y_size + 2 * uv_size;
 
-        // 2 identical flat-gray frames. With flat content, x265 should produce
-        // zero-MV skip/merge CUs on the P-frame (no residual).
-        let mut yuv_data = Vec::with_capacity(frame_size * 2);
-        for _ in 0..2 {
-            yuv_data.extend(std::iter::repeat_n(0x7Eu8, y_size));
-            yuv_data.extend(std::iter::repeat_n(128u8, uv_size * 2));
-        }
-        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
-
-        // Encode with x265: 2 frames, keyint=2 to get one IDR + one P-frame.
-        let x265_status = Command::new("x265")
-            .args([
-                "--input",
-                input_yuv.to_str().unwrap(),
-                "--input-res",
-                &format!("{w}x{h}"),
-                "--fps",
-                "1",
-                "--frames",
-                "2",
-                "--output",
-                h265_path.to_str().unwrap(),
-                "--preset",
-                "ultrafast",
-                "--no-wpp",
-                "--no-signhide",
-                "--ctu",
-                "16",
-                "--no-open-gop",
-                "--keyint",
-                "2",
-                "--bframes",
-                "0",
-                "--no-scenecut",
-                "--no-sao",
-                "--no-deblock",
-                "--qp",
-                "25",
-                "--no-psnr",
-                "--no-ssim",
-                "--no-info",
-                "--no-weightp",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let x265_status = match x265_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("x265 not found, skipping inter P-slice test");
-                return;
-            }
-        };
-        assert!(x265_status.success(), "x265 encoding failed");
-
-        // Decode reference with FFmpeg (for frame 0 byte-exact check).
-        let ffmpeg_status = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-i",
-                h265_path.to_str().unwrap(),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                ref_yuv_path.to_str().unwrap(),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let ffmpeg_status = match ffmpeg_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("ffmpeg not found, skipping inter P-slice test");
-                return;
-            }
-        };
-        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
-
-        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
-        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
-
-        // Sanity: reference should have 2 frames worth of YUV.
         assert_eq!(
             ref_yuv.len(),
             frame_size * 2,
@@ -2935,7 +2345,7 @@ mod tests {
             "frame 0 (IDR) is not byte-exact against FFmpeg reference"
         );
 
-        // Frame 1 (P-slice): byte-exact against FFmpeg (Phase 3d-6 MC).
+        // Frame 1 (P-slice): byte-exact against FFmpeg.
         assert!(
             frames.len() >= 2,
             "expected 2 decoded frames, got {}",
@@ -2958,16 +2368,31 @@ mod tests {
 
     /// Phase 3e: B-slice byte-exact test.
     ///
-    /// Encodes a 3-frame sequence (IDR + P + B) with x265, decodes with both
-    /// FFmpeg and our decoder, and verifies all frames are byte-exact.
+    /// 3-frame sequence (IDR + P + B), all frames byte-exact against FFmpeg.
+    ///
+    /// Fixture: `testdata/inter_b.h265` + `testdata/inter_b_ref.yuv`
+    /// Generated with:
+    /// ```text
+    /// # 16x16, 3 frames: luma=100, 110, 120; chroma=128
+    /// x265 --input inter_b_input.yuv --input-res 16x16 --fps 1 --frames 3 \
+    ///   --preset ultrafast --no-wpp --no-signhide --ctu 16 --no-open-gop \
+    ///   --keyint 3 --bframes 1 --no-scenecut --no-sao --no-deblock \
+    ///   --qp 25 --no-psnr --no-ssim --no-info --no-weightp --no-weightb \
+    ///   -o inter_b.h265
+    /// ffmpeg -i inter_b.h265 -f rawvideo -pix_fmt yuv420p inter_b_ref.yuv
+    /// ```
     #[test]
     fn test_decode_inter_b_slice_byte_exact() {
-        use std::process::Command;
-
-        let tmp = std::env::temp_dir();
-        let input_yuv = tmp.join("inter_b_input.yuv");
-        let h265_path = tmp.join("inter_b.h265");
-        let ref_yuv_path = tmp.join("inter_b_ref.yuv");
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/inter_b.h265"
+        ))
+        .expect("read fixture");
+        let ref_yuv = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/inter_b_ref.yuv"
+        ))
+        .expect("read ref");
 
         let w: usize = 16;
         let h: usize = 16;
@@ -2975,90 +2400,6 @@ mod tests {
         let uv_size = (w / 2) * (h / 2);
         let frame_size = y_size + 2 * uv_size;
 
-        // 3 frames with slightly different content so B-frame has non-trivial MVs.
-        // Frame 0: luma=100, Frame 1: luma=110, Frame 2: luma=120.
-        let mut yuv_data = Vec::with_capacity(frame_size * 3);
-        for luma_val in [100u8, 110u8, 120u8] {
-            yuv_data.extend(std::iter::repeat_n(luma_val, y_size));
-            yuv_data.extend(std::iter::repeat_n(128u8, uv_size * 2));
-        }
-        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
-
-        // Encode with x265: 3 frames, bframes=1 to get IDR(0) + P(2) + B(1).
-        let x265_status = Command::new("x265")
-            .args([
-                "--input",
-                input_yuv.to_str().unwrap(),
-                "--input-res",
-                &format!("{w}x{h}"),
-                "--fps",
-                "1",
-                "--frames",
-                "3",
-                "--output",
-                h265_path.to_str().unwrap(),
-                "--preset",
-                "ultrafast",
-                "--no-wpp",
-                "--no-signhide",
-                "--ctu",
-                "16",
-                "--no-open-gop",
-                "--keyint",
-                "3",
-                "--bframes",
-                "1",
-                "--no-scenecut",
-                "--no-sao",
-                "--no-deblock",
-                "--qp",
-                "25",
-                "--no-psnr",
-                "--no-ssim",
-                "--no-info",
-                "--no-weightp",
-                "--no-weightb",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let x265_status = match x265_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("x265 not found, skipping inter B-slice test");
-                return;
-            }
-        };
-        assert!(x265_status.success(), "x265 encoding failed");
-
-        // Decode reference with FFmpeg (outputs in display order).
-        let ffmpeg_status = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-i",
-                h265_path.to_str().unwrap(),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                ref_yuv_path.to_str().unwrap(),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let ffmpeg_status = match ffmpeg_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("ffmpeg not found, skipping inter B-slice test");
-                return;
-            }
-        };
-        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
-
-        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
-        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
-
-        // Sanity: reference should have 3 frames worth of YUV.
         assert_eq!(
             ref_yuv.len(),
             frame_size * 3,
@@ -3106,148 +2447,29 @@ mod tests {
 
     /// Phase 3f: 1080p hash-only test.
     ///
-    /// Generates a 1920x1080 10-frame P-only sequence at runtime using
-    /// ffmpeg + x265, decodes with both FFmpeg (for reference SHA-256) and
-    /// our decoder, and verifies the SHA-256 hashes match. P-only encoding
-    /// (--bframes 0) ensures decode order == display order so hash
-    /// comparison is straightforward.
+    /// Decodes a 1920x1080 10-frame P-only sequence and verifies all 10
+    /// frames decode without crashing. SHA-256 hash is logged but not
+    /// asserted (known mismatch vs FFmpeg, to be fixed).
     ///
-    /// Skips gracefully if ffmpeg or x265 are not installed.
+    /// Fixture: `testdata/1080p.h265`
+    /// Generated with:
+    /// ```text
+    /// ffmpeg -y -f lavfi -i color=gray:size=1920x1080:rate=30:duration=0.33 \
+    ///   -frames:v 10 -pix_fmt yuv420p -f rawvideo input_1080p.yuv
+    /// x265 --input input_1080p.yuv --input-res 1920x1080 --fps 30 --frames 10 \
+    ///   --preset ultrafast --no-wpp --bframes 0 --ref 1 --keyint 10 --qp 28 \
+    ///   --no-open-gop --no-sao --no-deblock --no-signhide \
+    ///   --no-psnr --no-ssim --no-info -o 1080p.h265
+    /// ```
     #[test]
     fn test_decode_1080p_hash() {
         use sha2::{Digest, Sha256};
-        use std::process::Command;
 
-        let tmp = std::env::temp_dir();
-        let input_yuv = tmp.join("input_1080p.yuv");
-        let h265_path = tmp.join("1080p_test.h265");
-        let ref_yuv_path = tmp.join("1080p_ref.yuv");
+        let h265 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/1080p.h265"))
+            .expect("read fixture");
 
-        let w: usize = 1920;
-        let h: usize = 1080;
         let num_frames: usize = 10;
 
-        // Step 1: Generate 1080p test source with ffmpeg (flat gray to start simple).
-        let ffmpeg_gen = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                &format!("color=gray:size={w}x{h}:rate=30:duration=0.33"),
-                "-frames:v",
-                &num_frames.to_string(),
-                "-pix_fmt",
-                "yuv420p",
-                "-f",
-                "rawvideo",
-                input_yuv.to_str().unwrap(),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let ffmpeg_gen = match ffmpeg_gen {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("ffmpeg not found, skipping 1080p hash test");
-                return;
-            }
-        };
-        assert!(ffmpeg_gen.success(), "ffmpeg input generation failed");
-
-        // Step 2: Encode with x265 -- P-only, no B-frames, simplified settings.
-        let x265_status = Command::new("x265")
-            .args([
-                "--input",
-                input_yuv.to_str().unwrap(),
-                "--input-res",
-                &format!("{w}x{h}"),
-                "--fps",
-                "30",
-                "--frames",
-                &num_frames.to_string(),
-                "--output",
-                h265_path.to_str().unwrap(),
-                "--preset",
-                "ultrafast",
-                "--no-wpp",
-                "--bframes",
-                "0",
-                "--ref",
-                "1",
-                "--keyint",
-                "10",
-                "--qp",
-                "28",
-                "--no-open-gop",
-                "--no-sao",
-                "--no-deblock",
-                "--no-signhide",
-                "--no-psnr",
-                "--no-ssim",
-                "--no-info",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let x265_status = match x265_status {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("x265 not found, skipping 1080p hash test");
-                return;
-            }
-        };
-        assert!(x265_status.success(), "x265 encoding failed");
-
-        // Step 3: Decode reference with FFmpeg and hash the output.
-        let ffmpeg_dec = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-nostdin",
-                "-i",
-                h265_path.to_str().unwrap(),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                ref_yuv_path.to_str().unwrap(),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let ffmpeg_dec = match ffmpeg_dec {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("ffmpeg not found, skipping 1080p hash test");
-                return;
-            }
-        };
-        assert!(ffmpeg_dec.success(), "ffmpeg decoding failed");
-
-        let ref_yuv_data = std::fs::read(&ref_yuv_path).expect("read reference yuv");
-        let y_size = w * h;
-        let uv_size = (w / 2) * (h / 2);
-        let frame_size = y_size + 2 * uv_size;
-        assert_eq!(
-            ref_yuv_data.len(),
-            frame_size * num_frames,
-            "reference YUV should have {} frames ({} bytes), got {} bytes",
-            num_frames,
-            frame_size * num_frames,
-            ref_yuv_data.len()
-        );
-
-        // Hash the FFmpeg reference output.
-        let mut ref_hasher = Sha256::new();
-        ref_hasher.update(&ref_yuv_data);
-        let ref_hash = ref_hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-
-        // Step 4: Decode with our decoder.
-        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
         let nals = parse_annex_b(&h265);
         let mut decoder = Decoder::new();
         let mut our_hasher = Sha256::new();
@@ -3288,16 +2510,9 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
 
-        // For now, log the hash comparison but don't fail on mismatch.
-        // The 16×16 P-frame byte-exact test validates correctness; this
-        // test primarily validates that 1080p decode doesn't crash.
-        // TODO: investigate the pixel-level difference and promote to
-        // assert_eq once the hash matches.
-        if our_hash != ref_hash {
-            eprintln!(
-                "1080p hash INFO (not failing): ours={} ref={}",
-                our_hash, ref_hash
-            );
-        }
+        // Log the hash for debugging. The hash assertion is disabled until
+        // the pixel-level accuracy is fixed.
+        // TODO: re-enable hash assertion once decoder matches FFmpeg output.
+        eprintln!("1080p decoded hash: {}", our_hash);
     }
 }
