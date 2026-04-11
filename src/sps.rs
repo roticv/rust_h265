@@ -317,6 +317,11 @@ pub struct Sps {
     pub chroma_format_idc: u32,
     pub pic_width_in_luma_samples: u32,
     pub pic_height_in_luma_samples: u32,
+    /// Conformance window crop offsets (in chroma sample units for 4:2:0).
+    pub conf_win_left_offset: u32,
+    pub conf_win_right_offset: u32,
+    pub conf_win_top_offset: u32,
+    pub conf_win_bottom_offset: u32,
     pub bit_depth_luma: u8,
     pub bit_depth_chroma: u8,
     pub log2_max_pic_order_cnt_lsb: u8,
@@ -385,6 +390,22 @@ impl Sps {
     pub fn pic_height_in_ctbs_y(&self) -> u32 {
         self.pic_height_in_luma_samples.div_ceil(self.ctb_size_y)
     }
+
+    /// Cropped output width in luma samples (after conformance window).
+    /// For 4:2:0, `SubWidthC = 2`.
+    pub fn cropped_width(&self) -> u32 {
+        let sub_width_c = if self.chroma_format_idc == 1 { 2 } else { 1 };
+        self.pic_width_in_luma_samples
+            - sub_width_c * (self.conf_win_left_offset + self.conf_win_right_offset)
+    }
+
+    /// Cropped output height in luma samples (after conformance window).
+    /// For 4:2:0, `SubHeightC = 2`.
+    pub fn cropped_height(&self) -> u32 {
+        let sub_height_c = if self.chroma_format_idc == 1 { 2 } else { 1 };
+        self.pic_height_in_luma_samples
+            - sub_height_c * (self.conf_win_top_offset + self.conf_win_bottom_offset)
+    }
 }
 
 pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
@@ -413,11 +434,15 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     let pic_height_in_luma_samples = r.read_ue()?;
 
     let conformance_window_flag = r.read_bit()? == 1;
+    let mut conf_win_left_offset = 0u32;
+    let mut conf_win_right_offset = 0u32;
+    let mut conf_win_top_offset = 0u32;
+    let mut conf_win_bottom_offset = 0u32;
     if conformance_window_flag {
-        let _conf_win_left_offset = r.read_ue()?;
-        let _conf_win_right_offset = r.read_ue()?;
-        let _conf_win_top_offset = r.read_ue()?;
-        let _conf_win_bottom_offset = r.read_ue()?;
+        conf_win_left_offset = r.read_ue()?;
+        conf_win_right_offset = r.read_ue()?;
+        conf_win_top_offset = r.read_ue()?;
+        conf_win_bottom_offset = r.read_ue()?;
     }
 
     let bit_depth_luma_minus8 = r.read_ue()?;
@@ -578,6 +603,10 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         chroma_format_idc,
         pic_width_in_luma_samples,
         pic_height_in_luma_samples,
+        conf_win_left_offset,
+        conf_win_right_offset,
+        conf_win_top_offset,
+        conf_win_bottom_offset,
         bit_depth_luma,
         bit_depth_chroma,
         log2_max_pic_order_cnt_lsb,

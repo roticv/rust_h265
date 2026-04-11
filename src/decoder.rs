@@ -242,6 +242,64 @@ pub struct Decoder {
     current_ref_list_l1: Vec<Rc<DecodedPicture>>,
 }
 
+/// Crop a decoded picture's planes to the conformance window and build a Frame.
+/// When `cropped_w == coded_w && cropped_h == coded_h`, this is a zero-copy move.
+#[allow(clippy::too_many_arguments)]
+fn crop_frame(
+    state: &crate::cu_tree::PictureState,
+    coded_w: u32,
+    coded_h: u32,
+    cropped_w: u32,
+    cropped_h: u32,
+    left_offset: u32, // in chroma sample units
+    top_offset: u32,  // in chroma sample units
+    poc: i32,
+) -> Frame {
+    if cropped_w == coded_w && cropped_h == coded_h && left_offset == 0 && top_offset == 0 {
+        // No crop needed — common case for CTU-aligned pictures.
+        return Frame {
+            y: state.y_plane.clone(),
+            u: state.u_plane.clone(),
+            v: state.v_plane.clone(),
+            width: coded_w,
+            height: coded_h,
+            pic_order_cnt: poc,
+        };
+    }
+    // For 4:2:0, SubWidthC = SubHeightC = 2.
+    let luma_left = (left_offset * 2) as usize;
+    let luma_top = (top_offset * 2) as usize;
+    let cw = cropped_w as usize;
+    let ch = cropped_h as usize;
+    let stride_y = coded_w as usize;
+    let stride_uv = (coded_w / 2) as usize;
+
+    let mut y = Vec::with_capacity(cw * ch);
+    for row in 0..ch {
+        let src_row = luma_top + row;
+        let start = src_row * stride_y + luma_left;
+        y.extend_from_slice(&state.y_plane[start..start + cw]);
+    }
+    let cw_c = cw / 2;
+    let ch_c = ch / 2;
+    let mut u = Vec::with_capacity(cw_c * ch_c);
+    let mut v = Vec::with_capacity(cw_c * ch_c);
+    for row in 0..ch_c {
+        let src_row = top_offset as usize + row;
+        let start = src_row * stride_uv + left_offset as usize;
+        u.extend_from_slice(&state.u_plane[start..start + cw_c]);
+        v.extend_from_slice(&state.v_plane[start..start + cw_c]);
+    }
+    Frame {
+        y,
+        u,
+        v,
+        width: cropped_w,
+        height: cropped_h,
+        pic_order_cnt: poc,
+    }
+}
+
 impl Decoder {
     pub fn new() -> Self {
         Self::default()
@@ -291,15 +349,19 @@ impl Decoder {
             let sps = self.sps.as_ref()?;
             let pic_width = sps.pic_width_in_luma_samples;
             let pic_height = sps.pic_height_in_luma_samples;
+            let cropped_w = sps.cropped_width();
+            let cropped_h = sps.cropped_height();
             let poc = pic.last_slice_header.poc;
-            return Some(Frame {
-                y: pic.state.y_plane,
-                u: pic.state.u_plane,
-                v: pic.state.v_plane,
-                width: pic_width,
-                height: pic_height,
-                pic_order_cnt: poc,
-            });
+            return Some(crop_frame(
+                &pic.state,
+                pic_width,
+                pic_height,
+                cropped_w,
+                cropped_h,
+                sps.conf_win_left_offset,
+                sps.conf_win_top_offset,
+                poc,
+            ));
         }
         None
     }
@@ -798,14 +860,20 @@ impl Decoder {
 
         // Build the output Frame now (while `sps`/etc. are still in
         // scope) so the `pic` state can be moved into the DPB afterwards.
-        let emitted_frame = Frame {
-            y: pic.state.y_plane.clone(),
-            u: pic.state.u_plane.clone(),
-            v: pic.state.v_plane.clone(),
-            width: pic_width,
-            height: pic_height,
-            pic_order_cnt: picture_poc,
-        };
+        // Apply the conformance window crop so the output dimensions match
+        // the visible picture (not the CTU-padded coded picture).
+        let cropped_w = sps.cropped_width();
+        let cropped_h = sps.cropped_height();
+        let emitted_frame = crop_frame(
+            &pic.state,
+            pic_width,
+            pic_height,
+            cropped_w,
+            cropped_h,
+            sps.conf_win_left_offset,
+            sps.conf_win_top_offset,
+            picture_poc,
+        );
 
         // The borrows `sps` / `pps` / `tile_tables` / `last_sh` are no
         // longer used beyond this point — NLL will release them here so
@@ -2510,9 +2578,15 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
 
-        // Log the hash for debugging. The hash assertion is disabled until
-        // the pixel-level accuracy is fixed.
-        // TODO: re-enable hash assertion once decoder matches FFmpeg output.
-        eprintln!("1080p decoded hash: {}", our_hash);
+        // SHA-256 verified against FFmpeg: `ffmpeg -i 1080p.h265 -f rawvideo
+        // -pix_fmt yuv420p pipe:1 | shasum -a 256`. The conformance window
+        // crop ensures our output matches FFmpeg's 1920×1080 output (not the
+        // CTU-padded 1920×1088 coded picture).
+        let expected_hash = "ee157a13ccac1b08728ece0719421731e6ce0bbdfabe10c43a5239c3a1b6f810";
+        assert_eq!(
+            our_hash, expected_hash,
+            "1080p SHA-256 mismatch: ours={} expected={}",
+            our_hash, expected_hash
+        );
     }
 }
