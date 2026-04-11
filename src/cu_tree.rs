@@ -2567,31 +2567,71 @@ fn decode_transform_unit(
         }
 
         // ---- Step 4: chroma prediction + (optional) residual.
+        // For 4:2:0, chroma TU is at log2_trafo_size - 1 (half the luma TU).
+        // The chroma QP is derived from the luma QP via spec table 8-9.
+        let log2_trafo_size_c = if do_chroma_inline || do_chroma_deferred {
+            if do_chroma_inline {
+                log2_trafo_size - 1
+            } else {
+                log2_trafo_size // deferred uses parent's log2 size
+            }
+        } else {
+            0 // unused
+        };
+
         if is_intra {
             if do_chroma_inline {
                 let chroma_mode = state.last_chroma_pred_mode;
                 predict_intra_chroma(state, sps, x0, y0, log2_trafo_size - 1, chroma_mode)?;
-                if inherited.cbf_cb || inherited.cbf_cr {
-                    return Err(DecodeError::Unsupported(
-                        "chroma residual_coding not yet implemented",
-                    ));
-                }
+                decode_chroma_residuals(
+                    cabac,
+                    contexts,
+                    state,
+                    sps,
+                    pps,
+                    x0,
+                    y0,
+                    log2_trafo_size_c,
+                    qp_y,
+                    inherited.cbf_cb,
+                    inherited.cbf_cr,
+                    true,
+                )?;
             } else if do_chroma_deferred {
                 let chroma_mode = state.last_chroma_pred_mode;
                 predict_intra_chroma(state, sps, x_base, y_base, log2_trafo_size, chroma_mode)?;
-                if inherited.cbf_cb || inherited.cbf_cr {
-                    return Err(DecodeError::Unsupported(
-                        "chroma residual_coding not yet implemented",
-                    ));
-                }
+                decode_chroma_residuals(
+                    cabac,
+                    contexts,
+                    state,
+                    sps,
+                    pps,
+                    x_base,
+                    y_base,
+                    log2_trafo_size_c,
+                    qp_y,
+                    inherited.cbf_cb,
+                    inherited.cbf_cr,
+                    true,
+                )?;
             }
         } else {
-            // Inter: chroma prediction is placeholder (already 128).
-            // Chroma residual decoding: not yet implemented.
-            if inherited.cbf_cb || inherited.cbf_cr {
-                return Err(DecodeError::Unsupported(
-                    "inter chroma residual_coding not yet implemented",
-                ));
+            // Inter chroma residual.
+            if do_chroma_inline && (inherited.cbf_cb || inherited.cbf_cr) {
+                decode_chroma_residuals(
+                    cabac,
+                    contexts,
+                    state,
+                    sps,
+                    pps,
+                    x0,
+                    y0,
+                    log2_trafo_size_c,
+                    qp_y,
+                    inherited.cbf_cb,
+                    inherited.cbf_cr,
+                    false,
+                )?;
             }
         }
     } else if is_intra {
@@ -2632,6 +2672,90 @@ fn write_qp_y_table(state: &mut PictureState, x0: u32, y0: u32, log2_size: u8, q
             state.tab_qp_y[row + x_cb + i] = v;
         }
     }
+}
+
+/// Decode and apply chroma Cb/Cr residuals for a single TU. The chroma
+/// QP is derived from the luma QP via the HEVC spec table 8-9 mapping.
+/// `x0`/`y0` are in luma sample coordinates; chroma is at half that for 4:2:0.
+#[allow(clippy::too_many_arguments)]
+fn decode_chroma_residuals(
+    cabac: &mut CabacReader,
+    contexts: &mut CabacContexts,
+    state: &mut PictureState,
+    sps: &Sps,
+    pps: &Pps,
+    x0: u32,
+    y0: u32,
+    log2_trafo_size_c: u8,
+    qp_y: i32,
+    cbf_cb: bool,
+    cbf_cr: bool,
+    is_intra: bool,
+) -> Result<(), DecodeError> {
+    let x_c = (x0 >> 1) as usize;
+    let y_c = (y0 >> 1) as usize;
+
+    for c_idx in 1..=2u8 {
+        let cbf = if c_idx == 1 { cbf_cb } else { cbf_cr };
+        if !cbf {
+            continue;
+        }
+        // Derive chroma QP per spec 8.6.1 / table 8-9.
+        let qp_offset = if c_idx == 1 {
+            pps.pps_cb_qp_offset
+        } else {
+            pps.pps_cr_qp_offset
+        };
+        let qp_i = (qp_y + qp_offset).clamp(0, 57);
+        let qp_c = if qp_i < 30 {
+            qp_i
+        } else if qp_i > 43 {
+            qp_i - 6
+        } else {
+            const QP_C: [i32; 14] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37];
+            QP_C[(qp_i - 30) as usize]
+        };
+
+        let plane = if c_idx == 1 {
+            ResidualPlane::Cb
+        } else {
+            ResidualPlane::Cr
+        };
+        let scan_idx = ScanOrder::Diag; // chroma always uses diagonal scan
+        let block = decode_residual_coding(
+            cabac,
+            contexts,
+            sps,
+            pps,
+            log2_trafo_size_c,
+            plane,
+            qp_c,
+            scan_idx,
+            is_intra,
+        )?;
+
+        // Apply inverse transform + add to chroma plane.
+        let size_c = 1usize << log2_trafo_size_c;
+        let mut residual = block.coeffs.clone();
+        apply_inverse_transform(
+            &mut residual,
+            log2_trafo_size_c,
+            block.last_sig_x,
+            block.last_sig_y,
+            sps.bit_depth_chroma as u32,
+            false, // chroma never uses DST
+        );
+        let dst_stride = state.uv_stride;
+        let dst_plane = if c_idx == 1 {
+            &mut state.u_plane
+        } else {
+            &mut state.v_plane
+        };
+        let dst_offset = y_c * dst_stride + x_c;
+        let dst = &mut dst_plane[dst_offset..dst_offset + (size_c - 1) * dst_stride + size_c];
+        add_residual(dst, dst_stride, &residual, log2_trafo_size_c);
+    }
+    Ok(())
 }
 
 /// Mark the top and left edges of an intra TU at `(x0, y0)` of size
