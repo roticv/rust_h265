@@ -542,6 +542,19 @@ impl Decoder {
         // check same-ref and compute MV scaling.
         let ref_list_l0_pocs: Vec<i32> = self.current_ref_list_l0.iter().map(|p| p.poc).collect();
         let ref_list_l1_pocs: Vec<i32> = self.current_ref_list_l1.iter().map(|p| p.poc).collect();
+        // Phase 3e: derive the collocated reference picture for temporal MVP.
+        let collocated_ref = if sh.slice_temporal_mvp_enabled_flag && sh.slice_type != SliceType::I
+        {
+            let col_list = if sh.collocated_from_l0_flag {
+                &self.current_ref_list_l0
+            } else {
+                &self.current_ref_list_l1
+            };
+            let col_idx = sh.collocated_ref_idx as usize;
+            col_list.get(col_idx).cloned()
+        } else {
+            None
+        };
         let slice_params = crate::cu_tree::SliceParams {
             slice_type: sh.slice_type,
             max_num_merge_cand: sh.max_num_merge_cand,
@@ -557,6 +570,8 @@ impl Decoder {
             ref_pic_list_pocs: [ref_list_l0_pocs, ref_list_l1_pocs],
             ref_frames_l0: self.current_ref_list_l0.clone(),
             ref_frames_l1: self.current_ref_list_l1.clone(),
+            collocated_ref,
+            slice_temporal_mvp_enabled_flag: sh.slice_temporal_mvp_enabled_flag,
         };
 
         let mut more_data = true;
@@ -826,13 +841,21 @@ impl Decoder {
         // Insert the fresh picture into the DPB so later frames can look
         // it up by POC. Also clean up any unreferenced + already-output
         // pictures (none exist today; this is future-proofing).
-        let decoded_pic = Rc::new(DecodedPicture::new(
+        // Phase 3e: store tab_mvf + ref list POCs for temporal MVP.
+        let ref_list_l0_pocs: Vec<i32> = self.current_ref_list_l0.iter().map(|p| p.poc).collect();
+        let ref_list_l1_pocs: Vec<i32> = self.current_ref_list_l1.iter().map(|p| p.poc).collect();
+        let decoded_pic = Rc::new(DecodedPicture::new_with_mvf(
             pic.state.y_plane,
             pic.state.u_plane,
             pic.state.v_plane,
             pic_width,
             pic_height,
             picture_poc,
+            pic.state.tab_mvf,
+            pic.state.log2_min_pu_size,
+            pic.state.min_pu_width,
+            pic.state.log2_ctb_size,
+            [ref_list_l0_pocs, ref_list_l1_pocs],
         ));
         // Mark as short-term reference initially — a subsequent frame's
         // RPS will flip it to long-term / unused as needed.
@@ -2904,5 +2927,153 @@ mod tests {
             decoded1, ref_frame1,
             "frame 1 (P-slice) is not byte-exact against FFmpeg reference"
         );
+    }
+
+    /// Phase 3e: B-slice byte-exact test.
+    ///
+    /// Encodes a 3-frame sequence (IDR + P + B) with x265, decodes with both
+    /// FFmpeg and our decoder, and verifies all frames are byte-exact.
+    #[test]
+    fn test_decode_inter_b_slice_byte_exact() {
+        use std::process::Command;
+
+        let tmp = std::env::temp_dir();
+        let input_yuv = tmp.join("inter_b_input.yuv");
+        let h265_path = tmp.join("inter_b.h265");
+        let ref_yuv_path = tmp.join("inter_b_ref.yuv");
+
+        let w: usize = 16;
+        let h: usize = 16;
+        let y_size = w * h;
+        let uv_size = (w / 2) * (h / 2);
+        let frame_size = y_size + 2 * uv_size;
+
+        // 3 frames with slightly different content so B-frame has non-trivial MVs.
+        // Frame 0: luma=100, Frame 1: luma=110, Frame 2: luma=120.
+        let mut yuv_data = Vec::with_capacity(frame_size * 3);
+        for luma_val in [100u8, 110u8, 120u8] {
+            yuv_data.extend(std::iter::repeat_n(luma_val, y_size));
+            yuv_data.extend(std::iter::repeat_n(128u8, uv_size * 2));
+        }
+        std::fs::write(&input_yuv, &yuv_data).expect("write input yuv");
+
+        // Encode with x265: 3 frames, bframes=1 to get IDR(0) + P(2) + B(1).
+        let x265_status = Command::new("x265")
+            .args([
+                "--input",
+                input_yuv.to_str().unwrap(),
+                "--input-res",
+                &format!("{w}x{h}"),
+                "--fps",
+                "1",
+                "--frames",
+                "3",
+                "--output",
+                h265_path.to_str().unwrap(),
+                "--preset",
+                "ultrafast",
+                "--no-wpp",
+                "--no-signhide",
+                "--ctu",
+                "16",
+                "--no-open-gop",
+                "--keyint",
+                "3",
+                "--bframes",
+                "1",
+                "--no-scenecut",
+                "--no-sao",
+                "--no-deblock",
+                "--qp",
+                "25",
+                "--no-psnr",
+                "--no-ssim",
+                "--no-info",
+                "--no-weightp",
+                "--no-weightb",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let x265_status = match x265_status {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("x265 not found, skipping inter B-slice test");
+                return;
+            }
+        };
+        assert!(x265_status.success(), "x265 encoding failed");
+
+        // Decode reference with FFmpeg (outputs in display order).
+        let ffmpeg_status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-i",
+                h265_path.to_str().unwrap(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                ref_yuv_path.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let ffmpeg_status = match ffmpeg_status {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("ffmpeg not found, skipping inter B-slice test");
+                return;
+            }
+        };
+        assert!(ffmpeg_status.success(), "ffmpeg decoding failed");
+
+        let h265 = std::fs::read(&h265_path).expect("read h265 fixture");
+        let ref_yuv = std::fs::read(&ref_yuv_path).expect("read reference yuv");
+
+        // Sanity: reference should have 3 frames worth of YUV.
+        assert_eq!(
+            ref_yuv.len(),
+            frame_size * 3,
+            "reference YUV should have 3 frames"
+        );
+
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+        let mut frames: Vec<Frame> = Vec::new();
+        for nal in &nals {
+            match decoder.decode_nal(nal) {
+                Ok(Some(f)) => frames.push(f),
+                Ok(None) => {}
+                Err(e) => panic!("decode_nal failed: {:?}", e),
+            }
+        }
+
+        assert_eq!(
+            frames.len(),
+            3,
+            "expected 3 decoded frames, got {}",
+            frames.len()
+        );
+
+        // Sort our decoded frames by POC (display order) to match FFmpeg output.
+        frames.sort_by_key(|f| f.pic_order_cnt);
+
+        // Compare each frame byte-exact against FFmpeg reference.
+        for (i, frame) in frames.iter().enumerate() {
+            assert_eq!(frame.width as usize, w);
+            assert_eq!(frame.height as usize, h);
+
+            let ref_frame = &ref_yuv[i * frame_size..(i + 1) * frame_size];
+            let mut decoded = Vec::with_capacity(frame_size);
+            decoded.extend_from_slice(&frame.y);
+            decoded.extend_from_slice(&frame.u);
+            decoded.extend_from_slice(&frame.v);
+            assert_eq!(
+                decoded, ref_frame,
+                "frame {} (POC {}) is not byte-exact against FFmpeg reference",
+                i, frame.pic_order_cnt
+            );
+        }
     }
 }

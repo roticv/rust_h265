@@ -55,6 +55,20 @@ pub struct DecodedPicture {
     pub reference_status: RefCell<PictureReferenceStatus>,
     /// Whether the picture has been output yet (emitted as a `Frame`).
     pub output: RefCell<bool>,
+
+    /// Phase 3e: per min-PU motion field stored when inserting into the DPB.
+    /// Used by temporal merge/AMVP candidate derivation (spec 8.5.3.2.3 / 8.5.3.2.7).
+    pub tab_mvf: Vec<crate::cu_tree::MvField>,
+    /// Phase 3e: `log2_min_pu_size` of this picture (needed to index `tab_mvf`).
+    pub log2_min_pu_size: u8,
+    /// Phase 3e: min-PU width = `width >> log2_min_pu_size`.
+    pub min_pu_width: usize,
+    /// Phase 3e: `log2_ctb_size` of this picture (needed for CTB row check in temporal candidate).
+    pub log2_ctb_size: u8,
+    /// Phase 3e: per-list reference POCs at the time this picture was decoded.
+    /// Used to compute POC distances for temporal MV scaling.
+    /// `ref_pic_list_pocs[0]` = L0 POCs, `ref_pic_list_pocs[1]` = L1 POCs.
+    pub ref_pic_list_pocs: [Vec<i32>; 2],
 }
 
 impl DecodedPicture {
@@ -68,6 +82,44 @@ impl DecodedPicture {
             poc,
             reference_status: RefCell::new(PictureReferenceStatus::ShortTerm),
             output: RefCell::new(false),
+            tab_mvf: Vec::new(),
+            log2_min_pu_size: 2,
+            min_pu_width: 0,
+            log2_ctb_size: 0,
+            ref_pic_list_pocs: [Vec::new(), Vec::new()],
+        }
+    }
+
+    /// Create a `DecodedPicture` with temporal MVP data (tab_mvf and ref lists)
+    /// for use in temporal merge/AMVP candidate derivation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_mvf(
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
+        width: u32,
+        height: u32,
+        poc: i32,
+        tab_mvf: Vec<crate::cu_tree::MvField>,
+        log2_min_pu_size: u8,
+        min_pu_width: usize,
+        log2_ctb_size: u8,
+        ref_pic_list_pocs: [Vec<i32>; 2],
+    ) -> Self {
+        Self {
+            y,
+            u,
+            v,
+            width,
+            height,
+            poc,
+            reference_status: RefCell::new(PictureReferenceStatus::ShortTerm),
+            output: RefCell::new(false),
+            tab_mvf,
+            log2_min_pu_size,
+            min_pu_width,
+            log2_ctb_size,
+            ref_pic_list_pocs,
         }
     }
 
