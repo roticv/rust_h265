@@ -91,6 +91,11 @@ pub struct SliceParams {
     /// `log2_parallel_merge_level_minus2 + 2` from PPS.
     /// Used to suppress self-referencing merge candidates (spec 8.5.3.2.2).
     pub log2_parallel_merge_level: u8,
+    /// POC of the current picture being decoded.
+    pub poc: i32,
+    /// POC values of RefPicList0 entries (one per active L0 reference).
+    /// `ref_pic_list_pocs[0][i]` is the POC of the picture at L0 index `i`.
+    pub ref_pic_list_pocs: [Vec<i32>; 2],
 }
 
 /// Per-picture mutable state needed during slice decode.
@@ -717,6 +722,323 @@ fn build_merge_candidates(
     list
 }
 
+/// MV scaling per HEVC spec 8.5.3.2.8 / FFmpeg `mv_scale`.
+///
+/// `td` = `poc_col - poc_col_ref` (temporal distance of the neighbor's MV)
+/// `tb` = `poc_curr - poc_ref_curr` (temporal distance of the current ref)
+///
+/// Returns the scaled MV. The rounding follows the FFmpeg implementation
+/// which adds `(scale * mv < 0)` before shifting — equivalent to "round
+/// away from zero" for positive scale, matching the spec.
+fn mv_scale(mv: Mv, td: i32, tb: i32) -> Mv {
+    let td = td.clamp(-128, 127);
+    let tb = tb.clamp(-128, 127);
+    if td == 0 {
+        return mv;
+    }
+    let tx = (0x4000 + (td.abs() >> 1)) / td;
+    let scale_factor = ((tb * tx + 32) >> 6).clamp(-4096, 4095);
+    let sx = (scale_factor * mv.x as i32 + 127 + ((scale_factor * mv.x as i32) < 0) as i32) >> 8;
+    let sy = (scale_factor * mv.y as i32 + 127 + ((scale_factor * mv.y as i32) < 0) as i32) >> 8;
+    Mv {
+        x: sx.clamp(-32768, 32767) as i16,
+        y: sy.clamp(-32768, 32767) as i16,
+    }
+}
+
+/// Check if a spatial neighbor at `(x_n, y_n)` has a MV on list `pred_flag_idx`
+/// that references the same picture as `ref_idx` on list `ref_idx_curr` (i.e.
+/// same POC). If so, returns `Some(neighbor_mv)`. This corresponds to FFmpeg's
+/// `mv_mp_mode_mx`.
+fn amvp_same_ref_mv(
+    state: &PictureState,
+    slice_params: &SliceParams,
+    x_n: i32,
+    y_n: i32,
+    pred_flag_idx: usize,
+    ref_idx_curr: usize,
+    ref_idx: i8,
+) -> Option<Mv> {
+    let mvf = tab_mvf_at(state, x_n, y_n);
+    if (mvf.pred_flag & (1 << pred_flag_idx)) == 0 {
+        return None;
+    }
+    let neighbor_ref_idx = mvf.ref_idx[pred_flag_idx] as usize;
+    let neighbor_poc = slice_params.ref_pic_list_pocs[pred_flag_idx]
+        .get(neighbor_ref_idx)
+        .copied()?;
+    let curr_poc = slice_params.ref_pic_list_pocs[ref_idx_curr]
+        .get(ref_idx as usize)
+        .copied()?;
+    if neighbor_poc == curr_poc {
+        Some(mvf.mv[pred_flag_idx])
+    } else {
+        None
+    }
+}
+
+/// Check if a spatial neighbor at `(x_n, y_n)` has a MV on list `pred_flag_idx`,
+/// and if so return that MV scaled by POC distance. This is the "long-term
+/// compatible" fallback (FFmpeg `mv_mp_mode_mx_lt`). For short-term refs only.
+fn amvp_scaled_ref_mv(
+    state: &PictureState,
+    slice_params: &SliceParams,
+    x_n: i32,
+    y_n: i32,
+    pred_flag_idx: usize,
+    ref_idx_curr: usize,
+    ref_idx: i8,
+) -> Option<Mv> {
+    let mvf = tab_mvf_at(state, x_n, y_n);
+    if (mvf.pred_flag & (1 << pred_flag_idx)) == 0 {
+        return None;
+    }
+    let neighbor_ref_idx = mvf.ref_idx[pred_flag_idx] as usize;
+    let neighbor_ref_poc = slice_params.ref_pic_list_pocs[pred_flag_idx]
+        .get(neighbor_ref_idx)
+        .copied()?;
+    let curr_ref_poc = slice_params.ref_pic_list_pocs[ref_idx_curr]
+        .get(ref_idx as usize)
+        .copied()?;
+    let neighbor_mv = mvf.mv[pred_flag_idx];
+    if neighbor_ref_poc == curr_ref_poc {
+        // Same ref → no scaling needed (but this path is the "lt" fallback,
+        // FFmpeg still returns the MV here).
+        Some(neighbor_mv)
+    } else {
+        let td = slice_params.poc - neighbor_ref_poc;
+        let tb = slice_params.poc - curr_ref_poc;
+        Some(mv_scale(neighbor_mv, td, tb))
+    }
+}
+
+/// Try to find an AMVP spatial candidate from a set of positions, first
+/// checking for same-ref MVs, then falling back to scaled MVs. Returns
+/// `Some(mv)` if a candidate was found.
+///
+/// `positions` is the list of (x, y) neighbor positions to check (e.g.
+/// [A0, A1] for the left group, [B0, B1, B2] for the above group).
+fn amvp_spatial_candidate(
+    state: &PictureState,
+    slice_params: &SliceParams,
+    x0: i32,
+    y0: i32,
+    positions: &[(i32, i32)],
+    ref_idx_curr: usize,
+    ref_idx: i8,
+) -> (Option<Mv>, bool) {
+    let pred_flag_l0 = ref_idx_curr;
+    let pred_flag_l1 = 1 - ref_idx_curr;
+
+    // Pass 1: same-ref check (exact POC match, no scaling).
+    for &(x_n, y_n) in positions {
+        if !spatial_cand_available(state, x0, y0, x_n, y_n) {
+            continue;
+        }
+        if let Some(mv) = amvp_same_ref_mv(
+            state,
+            slice_params,
+            x_n,
+            y_n,
+            pred_flag_l0,
+            ref_idx_curr,
+            ref_idx,
+        ) {
+            return (Some(mv), true);
+        }
+        if let Some(mv) = amvp_same_ref_mv(
+            state,
+            slice_params,
+            x_n,
+            y_n,
+            pred_flag_l1,
+            ref_idx_curr,
+            ref_idx,
+        ) {
+            return (Some(mv), true);
+        }
+    }
+
+    // Pass 2: scaled-ref fallback.
+    for &(x_n, y_n) in positions {
+        if !spatial_cand_available(state, x0, y0, x_n, y_n) {
+            continue;
+        }
+        if let Some(mv) = amvp_scaled_ref_mv(
+            state,
+            slice_params,
+            x_n,
+            y_n,
+            pred_flag_l0,
+            ref_idx_curr,
+            ref_idx,
+        ) {
+            return (Some(mv), true);
+        }
+        if let Some(mv) = amvp_scaled_ref_mv(
+            state,
+            slice_params,
+            x_n,
+            y_n,
+            pred_flag_l1,
+            ref_idx_curr,
+            ref_idx,
+        ) {
+            return (Some(mv), true);
+        }
+    }
+
+    (None, false)
+}
+
+/// Build the 2-entry AMVP candidate list for a non-merge inter PU.
+///
+/// Implements HEVC spec 8.5.3.2.6 / FFmpeg `ff_hevc_luma_mv_mvp_mode`.
+///
+/// `ref_idx` is the decoded `ref_idx_lX` for the current list.
+/// `list_idx` is 0 for L0, 1 for L1.
+#[allow(clippy::too_many_arguments)]
+fn build_amvp_candidates(
+    state: &PictureState,
+    slice_params: &SliceParams,
+    x0: u32,
+    y0: u32,
+    n_pb_w: u32,
+    n_pb_h: u32,
+    ref_idx: i8,
+    list_idx: usize,
+) -> [Mv; 2] {
+    let mut mvp_list = [Mv::default(); 2];
+    let mut num_cand = 0usize;
+
+    let x0i = x0 as i32;
+    let y0i = y0 as i32;
+    let w = n_pb_w as i32;
+    let h = n_pb_h as i32;
+
+    // Left candidates: A0 (below-left), A1 (left).
+    let left_positions = [
+        (x0i - 1, y0i + h),     // A0
+        (x0i - 1, y0i + h - 1), // A1
+    ];
+
+    // Check if any left candidate is available (for isScaledFlag_L0).
+    let is_scaled_flag_l0 = left_positions.iter().any(|&(x_n, y_n)| {
+        // Bounds check for A0 (y0 + nPbH may exceed picture height).
+        if y_n >= state.height as i32 {
+            return false;
+        }
+        spatial_cand_available(state, x0i, y0i, x_n, y_n)
+    });
+
+    let (left_mv, left_available) = amvp_spatial_candidate(
+        state,
+        slice_params,
+        x0i,
+        y0i,
+        &left_positions,
+        list_idx,
+        ref_idx,
+    );
+
+    // Above candidates: B0 (above-right), B1 (above), B2 (above-left).
+    let above_positions = [
+        (x0i + w, y0i - 1),     // B0
+        (x0i + w - 1, y0i - 1), // B1
+        (x0i - 1, y0i - 1),     // B2
+    ];
+
+    let (above_mv, above_available) = amvp_spatial_candidate(
+        state,
+        slice_params,
+        x0i,
+        y0i,
+        &above_positions,
+        list_idx,
+        ref_idx,
+    );
+
+    // FFmpeg `scalef` block: when !isScaledFlag_L0, the above candidate
+    // is promoted to the left slot and then B candidates are re-tried with
+    // scaling only.
+    let (left_mv, left_available, above_mv, above_available) = if !is_scaled_flag_l0 {
+        if above_available {
+            // Promote above to left.
+            let new_left_mv = above_mv;
+            let new_left_available = true;
+            // Re-derive above with scaled-only pass from B0/B1/B2.
+            let pred_flag_l0 = list_idx;
+            let pred_flag_l1 = 1 - list_idx;
+            let mut new_above_mv = None;
+            for &(x_n, y_n) in &above_positions {
+                if !spatial_cand_available(state, x0i, y0i, x_n, y_n) {
+                    continue;
+                }
+                if let Some(mv) = amvp_scaled_ref_mv(
+                    state,
+                    slice_params,
+                    x_n,
+                    y_n,
+                    pred_flag_l0,
+                    list_idx,
+                    ref_idx,
+                ) {
+                    new_above_mv = Some(mv);
+                    break;
+                }
+                if let Some(mv) = amvp_scaled_ref_mv(
+                    state,
+                    slice_params,
+                    x_n,
+                    y_n,
+                    pred_flag_l1,
+                    list_idx,
+                    ref_idx,
+                ) {
+                    new_above_mv = Some(mv);
+                    break;
+                }
+            }
+            (
+                new_left_mv,
+                new_left_available,
+                new_above_mv,
+                new_above_mv.is_some(),
+            )
+        } else {
+            (left_mv, left_available, above_mv, above_available)
+        }
+    } else {
+        (left_mv, left_available, above_mv, above_available)
+    };
+
+    if left_available {
+        mvp_list[num_cand] = left_mv.unwrap_or_default();
+        num_cand += 1;
+    }
+
+    // Prune: only add above if different from left (or left wasn't available).
+    if above_available {
+        let above = above_mv.unwrap_or_default();
+        if !left_available || above != left_mv.unwrap_or_default() {
+            mvp_list[num_cand] = above;
+            num_cand += 1;
+        }
+    }
+
+    // Temporal candidate (spec 8.5.3.2.7).
+    // TODO(Phase 3d-5): implement temporal AMVP candidate from the
+    // collocated picture's tab_mvf via the DPB. For now we skip this and
+    // fall through to zero-MV fill.
+
+    // Zero-MV fill: pad to exactly 2 candidates.
+    // (mvp_list was initialized to Mv::default() = zero, so we just
+    // need num_cand == 2 conceptually; the array is already zero-filled.)
+    let _ = num_cand;
+
+    mvp_list
+}
+
 /// Decode a single prediction unit's merge/AMVP syntax (spec 7.3.8.6 /
 /// FFmpeg `hls_prediction_unit`). Returns the `merge_flag` value (needed
 /// for `rqt_root_cbf` gating).
@@ -801,8 +1123,22 @@ fn decode_prediction_unit(
             }
             current_mv.pred_flag |= 1; // PF_L0
             let mvd = decode_mvd_coding(cabac, contexts);
-            current_mv.mv[0] = mvd;
-            let _mvp_l0_flag = cabac.decode_bin(&mut contexts.state[ctx::MVP_LX_FLAG]);
+            let mvp_l0_flag = cabac.decode_bin(&mut contexts.state[ctx::MVP_LX_FLAG]);
+            let mvp_list = build_amvp_candidates(
+                state,
+                slice_params,
+                x0,
+                y0,
+                n_pb_w,
+                n_pb_h,
+                current_mv.ref_idx[0],
+                0,
+            );
+            let mvp = mvp_list[mvp_l0_flag as usize];
+            current_mv.mv[0] = Mv {
+                x: (mvp.x as i32 + mvd.x as i32).clamp(-32768, 32767) as i16,
+                y: (mvp.y as i32 + mvd.y as i32).clamp(-32768, 32767) as i16,
+            };
         }
 
         // L1.
@@ -811,14 +1147,29 @@ fn decode_prediction_unit(
                 current_mv.ref_idx[1] =
                     decode_ref_idx(cabac, contexts, slice_params.num_ref_idx_l1_active, true) as i8;
             }
-            if slice_params.mvd_l1_zero_flag && inter_pred_idc == InterPredIdc::PredBi {
+            let mvd = if slice_params.mvd_l1_zero_flag && inter_pred_idc == InterPredIdc::PredBi {
                 // mvd_l1_zero_flag: skip MVD coding for L1.
+                Mv::default()
             } else {
-                let mvd = decode_mvd_coding(cabac, contexts);
-                current_mv.mv[1] = mvd;
-            }
+                decode_mvd_coding(cabac, contexts)
+            };
             current_mv.pred_flag |= 2; // PF_L1
-            let _mvp_l1_flag = cabac.decode_bin(&mut contexts.state[ctx::MVP_LX_FLAG]);
+            let mvp_l1_flag = cabac.decode_bin(&mut contexts.state[ctx::MVP_LX_FLAG]);
+            let mvp_list = build_amvp_candidates(
+                state,
+                slice_params,
+                x0,
+                y0,
+                n_pb_w,
+                n_pb_h,
+                current_mv.ref_idx[1],
+                1,
+            );
+            let mvp = mvp_list[mvp_l1_flag as usize];
+            current_mv.mv[1] = Mv {
+                x: (mvp.x as i32 + mvd.x as i32).clamp(-32768, 32767) as i16,
+                y: (mvp.y as i32 + mvd.y as i32).clamp(-32768, 32767) as i16,
+            };
         }
     }
 
@@ -2519,6 +2870,8 @@ mod tests {
             num_ref_idx_l1_active: 0,
             mvd_l1_zero_flag: false,
             log2_parallel_merge_level: 2,
+            poc: 0,
+            ref_pic_list_pocs: [vec![], vec![]],
         };
         // The single CTU is at (0, 0) with log2_cb_size = ctb_log2_size_y = 4.
         decode_coding_quadtree(

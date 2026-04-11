@@ -234,13 +234,11 @@ pub struct Decoder {
     /// consumer yet other than the decoder's own bookkeeping.
     current_rps: ReferencePictureSets,
     /// Phase 3d-2: RefPicList0 for the current P/B slice, built per spec
-    /// 8.3.2 after RPS marking. Empty for I slices. No consumer yet
-    /// (Phase 3d-3 will wire it into the CU tree).
-    #[allow(dead_code)]
+    /// 8.3.2 after RPS marking. Empty for I slices. Consumed by Phase 3d-5
+    /// AMVP to populate `SliceParams::ref_pic_list_pocs`.
     current_ref_list_l0: Vec<Rc<DecodedPicture>>,
     /// Phase 3d-2: RefPicList1 for the current B slice. Empty for P and I
-    /// slices. No consumer yet.
-    #[allow(dead_code)]
+    /// slices. Consumed by Phase 3d-5 AMVP.
     current_ref_list_l1: Vec<Rc<DecodedPicture>>,
 }
 
@@ -519,7 +517,11 @@ impl Decoder {
                 None
             };
 
-        // Phase 3d-3: construct SliceParams for the CU tree.
+        // Phase 3d-3/3d-5: construct SliceParams for the CU tree.
+        // Include POC information so the AMVP candidate list builder can
+        // check same-ref and compute MV scaling.
+        let ref_list_l0_pocs: Vec<i32> = self.current_ref_list_l0.iter().map(|p| p.poc).collect();
+        let ref_list_l1_pocs: Vec<i32> = self.current_ref_list_l1.iter().map(|p| p.poc).collect();
         let slice_params = crate::cu_tree::SliceParams {
             slice_type: sh.slice_type,
             max_num_merge_cand: sh.max_num_merge_cand,
@@ -531,6 +533,8 @@ impl Decoder {
             },
             mvd_l1_zero_flag: sh.mvd_l1_zero_flag,
             log2_parallel_merge_level: (pps.log2_parallel_merge_level_minus2 + 2) as u8,
+            poc: sh.poc,
+            ref_pic_list_pocs: [ref_list_l0_pocs, ref_list_l1_pocs],
         };
 
         let mut more_data = true;
