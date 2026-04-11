@@ -530,6 +530,7 @@ impl Decoder {
                 0
             },
             mvd_l1_zero_flag: sh.mvd_l1_zero_flag,
+            log2_parallel_merge_level: (pps.log2_parallel_merge_level_minus2 + 2) as u8,
         };
 
         let mut more_data = true;

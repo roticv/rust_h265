@@ -70,7 +70,7 @@ pub struct Mv {
 }
 
 /// Per min-PU motion field entry, analogous to FFmpeg's `MvField`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MvField {
     pub mv: [Mv; 2],
     pub ref_idx: [i8; 2],
@@ -88,6 +88,9 @@ pub struct SliceParams {
     pub num_ref_idx_l0_active: u32,
     pub num_ref_idx_l1_active: u32,
     pub mvd_l1_zero_flag: bool,
+    /// `log2_parallel_merge_level_minus2 + 2` from PPS.
+    /// Used to suppress self-referencing merge candidates (spec 8.5.3.2.2).
+    pub log2_parallel_merge_level: u8,
 }
 
 /// Per-picture mutable state needed during slice decode.
@@ -497,6 +500,223 @@ fn decode_part_mode(
     PartMode::PartnLx2N
 }
 
+// ---------------------------------------------------------------------------
+// Merge candidate list construction (spec 8.5.3.2.2 / 8.5.3.2.3)
+// ---------------------------------------------------------------------------
+
+/// Check if two positions belong to the same parallel merge region.
+/// When `log2_parallel_merge_level > 2`, small PUs inside the region share
+/// a single merge candidate list and must not reference each other (spec
+/// 8.5.3.2.2, `is_diff_mer` in FFmpeg).
+fn is_diff_mer(log2_parallel_merge_level: u8, x_n: i32, y_n: i32, x_p: i32, y_p: i32) -> bool {
+    let pl = log2_parallel_merge_level;
+    (x_n >> pl) == (x_p >> pl) && (y_n >> pl) == (y_p >> pl)
+}
+
+/// Read the MvField from `tab_mvf` at luma sample position `(x, y)`.
+fn tab_mvf_at(state: &PictureState, x: i32, y: i32) -> MvField {
+    let x_pu = (x as u32 >> state.log2_min_pu_size) as usize;
+    let y_pu = (y as u32 >> state.log2_min_pu_size) as usize;
+    state.tab_mvf[y_pu * state.min_pu_width + x_pu]
+}
+
+/// Check whether the neighbor at `(x_n, y_n)` is available as a spatial
+/// merge candidate for a PU at `(x0, y0)`.  The position must be inside
+/// the picture, belong to an inter-coded PU (`pred_flag != 0`), be in the
+/// same slice and same tile, and already decoded (z-scan order).
+fn spatial_cand_available(state: &PictureState, x0: i32, y0: i32, x_n: i32, y_n: i32) -> bool {
+    // Out of picture bounds?
+    if x_n < 0 || y_n < 0 || x_n >= state.width as i32 || y_n >= state.height as i32 {
+        return false;
+    }
+    // Same slice?
+    let log2_ctb = state.log2_ctb_size;
+    let ctb_w = (state.width as usize).div_ceil(1 << log2_ctb);
+    let curr_ctb_rs = (y0 as usize >> log2_ctb) * ctb_w + (x0 as usize >> log2_ctb);
+    let n_ctb_rs = (y_n as usize >> log2_ctb) * ctb_w + (x_n as usize >> log2_ctb);
+    if state.tab_slice_addr_rs[n_ctb_rs] != state.tab_slice_addr_rs[curr_ctb_rs] {
+        return false;
+    }
+    // Same tile?
+    if state.tab_tile_id[n_ctb_rs] != state.tab_tile_id[curr_ctb_rs] {
+        return false;
+    }
+    // The PU at that position must be inter (pred_flag != 0).
+    let mvf = tab_mvf_at(state, x_n, y_n);
+    mvf.pred_flag != 0
+}
+
+/// Build the merge candidate list for a PU, per HEVC spec 8.5.3.2.2.
+///
+/// Returns a `Vec<MvField>` of length `max_num_merge_cand`.  The caller
+/// selects `candidates[merge_idx]` and writes it to `tab_mvf`.
+///
+/// `single_mcl_flag` is set when `log2_parallel_merge_level > 2` and
+/// `cb_size == 8`; in that case the candidate list is derived once for the
+/// whole CU (part_idx forced to 0, PU size = CU size).
+#[allow(clippy::too_many_arguments)]
+fn build_merge_candidates(
+    state: &PictureState,
+    slice_params: &SliceParams,
+    x0: u32,
+    y0: u32,
+    n_pb_w: u32,
+    n_pb_h: u32,
+    _log2_cb_size: u8,
+    part_mode: PartMode,
+    part_idx: u8,
+    single_mcl_flag: bool,
+) -> Vec<MvField> {
+    let max_cand = slice_params.max_num_merge_cand as usize;
+    let mut list: Vec<MvField> = Vec::with_capacity(max_cand);
+
+    let x0i = x0 as i32;
+    let y0i = y0 as i32;
+    let w = n_pb_w as i32;
+    let h = n_pb_h as i32;
+    let pl = slice_params.log2_parallel_merge_level;
+
+    // Spatial candidate positions (spec table 8-11).
+    let x_a1 = x0i - 1;
+    let y_a1 = y0i + h - 1;
+    let x_b1 = x0i + w - 1;
+    let y_b1 = y0i - 1;
+    let x_b0 = x0i + w;
+    let y_b0 = y0i - 1;
+    let x_a0 = x0i - 1;
+    let y_a0 = y0i + h;
+    let x_b2 = x0i - 1;
+    let y_b2 = y0i - 1;
+
+    // --- A1 (left) ---
+    let is_available_a1 = if !single_mcl_flag
+        && part_idx == 1
+        && matches!(
+            part_mode,
+            PartMode::PartNx2N | PartMode::PartnLx2N | PartMode::PartnRx2N
+        )
+        || is_diff_mer(pl, x_a1, y_a1, x0i, y0i)
+    {
+        false
+    } else {
+        spatial_cand_available(state, x0i, y0i, x_a1, y_a1)
+    };
+    if is_available_a1 {
+        list.push(tab_mvf_at(state, x_a1, y_a1));
+        if list.len() >= max_cand {
+            return list;
+        }
+    }
+
+    // --- B1 (above) ---
+    let is_available_b1 = if !single_mcl_flag
+        && part_idx == 1
+        && matches!(
+            part_mode,
+            PartMode::Part2NxN | PartMode::Part2NxnU | PartMode::Part2NxnD
+        )
+        || is_diff_mer(pl, x_b1, y_b1, x0i, y0i)
+    {
+        false
+    } else {
+        let avail = spatial_cand_available(state, x0i, y0i, x_b1, y_b1);
+        // Prune against A1.
+        avail
+            && !(is_available_a1 && tab_mvf_at(state, x_b1, y_b1) == tab_mvf_at(state, x_a1, y_a1))
+    };
+    if is_available_b1 {
+        list.push(tab_mvf_at(state, x_b1, y_b1));
+        if list.len() >= max_cand {
+            return list;
+        }
+    }
+
+    // --- B0 (above-right) ---
+    let is_available_b0 = spatial_cand_available(state, x0i, y0i, x_b0, y_b0)
+        && x_b0 < state.width as i32
+        && !is_diff_mer(pl, x_b0, y_b0, x0i, y0i)
+        && !(is_available_b1 && tab_mvf_at(state, x_b0, y_b0) == tab_mvf_at(state, x_b1, y_b1));
+    if is_available_b0 {
+        list.push(tab_mvf_at(state, x_b0, y_b0));
+        if list.len() >= max_cand {
+            return list;
+        }
+    }
+
+    // --- A0 (below-left) ---
+    let is_available_a0 = spatial_cand_available(state, x0i, y0i, x_a0, y_a0)
+        && y_a0 < state.height as i32
+        && !is_diff_mer(pl, x_a0, y_a0, x0i, y0i)
+        && !(is_available_a1 && tab_mvf_at(state, x_a0, y_a0) == tab_mvf_at(state, x_a1, y_a1));
+    if is_available_a0 {
+        list.push(tab_mvf_at(state, x_a0, y_a0));
+        if list.len() >= max_cand {
+            return list;
+        }
+    }
+
+    // --- B2 (above-left) — only if fewer than 4 candidates so far ---
+    if list.len() < 4 {
+        #[allow(clippy::nonminimal_bool)]
+        let is_available_b2 = spatial_cand_available(state, x0i, y0i, x_b2, y_b2)
+            && !is_diff_mer(pl, x_b2, y_b2, x0i, y0i)
+            && !(is_available_a1 && tab_mvf_at(state, x_b2, y_b2) == tab_mvf_at(state, x_a1, y_a1))
+            && !(is_available_b1 && tab_mvf_at(state, x_b2, y_b2) == tab_mvf_at(state, x_b1, y_b1));
+        if is_available_b2 {
+            list.push(tab_mvf_at(state, x_b2, y_b2));
+            if list.len() >= max_cand {
+                return list;
+            }
+        }
+    }
+
+    // --- Temporal merge candidate (spec 8.5.3.2.3) ---
+    // TODO(Phase 3d-4): implement temporal merge candidate from the
+    // collocated picture's tab_mvf via the DPB.  For now we skip this and
+    // fall through to zero-MV fill, which is correct for streams where all
+    // merge candidates come from spatial neighbors or where merge_idx
+    // selects a zero-MV candidate.
+
+    // --- Combined bi-predictive candidates (B-slice only) ---
+    // TODO(Phase 3e): implement combined bi-predictive merge candidates
+    // for B slices (spec 8.5.3.2.4).
+
+    // --- Zero MV fill ---
+    let nb_refs = if slice_params.slice_type == SliceType::P {
+        slice_params.num_ref_idx_l0_active
+    } else {
+        slice_params
+            .num_ref_idx_l0_active
+            .min(slice_params.num_ref_idx_l1_active)
+    };
+    let mut zero_idx: u32 = 0;
+    while list.len() < max_cand {
+        let ref0 = if zero_idx < nb_refs {
+            zero_idx as i8
+        } else {
+            0
+        };
+        let ref1 = if zero_idx < nb_refs {
+            zero_idx as i8
+        } else {
+            0
+        };
+        let pred = if slice_params.slice_type == SliceType::B {
+            3 // PF_BI = L0 + L1
+        } else {
+            1 // PF_L0
+        };
+        list.push(MvField {
+            mv: [Mv::default(), Mv::default()],
+            ref_idx: [ref0, ref1],
+            pred_flag: pred,
+        });
+        zero_idx += 1;
+    }
+
+    list
+}
+
 /// Decode a single prediction unit's merge/AMVP syntax (spec 7.3.8.6 /
 /// FFmpeg `hls_prediction_unit`). Returns the `merge_flag` value (needed
 /// for `rqt_root_cbf` gating).
@@ -510,9 +730,11 @@ fn decode_prediction_unit(
     y0: u32,
     n_pb_w: u32,
     n_pb_h: u32,
-    _log2_cb_size: u8,
+    log2_cb_size: u8,
     is_skip: bool,
     cb_depth: u8,
+    part_mode: PartMode,
+    part_idx: u8,
 ) -> Result<bool, DecodeError> {
     let mut current_mv = MvField::default();
     let merge_flag = if is_skip {
@@ -529,13 +751,39 @@ fn decode_prediction_unit(
             0
         };
 
-        // Phase 3d-4 will compute actual merge MVs from neighbors. For now,
-        // store a placeholder with merge_idx recorded.
-        // The merge candidate derivation is not implemented yet — store
-        // zero MV with L0 pred flag as a placeholder.
-        current_mv.pred_flag = 1; // L0
-        current_mv.ref_idx[0] = 0;
-        let _ = merge_idx; // Will be used in Phase 3d-4.
+        // Phase 3d-4: build the merge candidate list and select the
+        // candidate indicated by merge_idx.
+        let n_cs = 1u32 << log2_cb_size;
+        let single_mcl_flag = slice_params.log2_parallel_merge_level > 2 && n_cs == 8;
+        let (mx0, my0, mw, mh, m_part_idx) = if single_mcl_flag {
+            // When singleMCLFlag, derive candidates from the CU origin
+            // with PU size = CU size, part_idx = 0 (FFmpeg merge_mode).
+            // x0/y0 for the CU are the same as for part_idx=0.
+            // For the skip path this is always the CU origin anyway.
+            (x0, y0, n_cs, n_cs, 0u8)
+        } else {
+            (x0, y0, n_pb_w, n_pb_h, part_idx)
+        };
+        let candidates = build_merge_candidates(
+            state,
+            slice_params,
+            mx0,
+            my0,
+            mw,
+            mh,
+            log2_cb_size,
+            part_mode,
+            m_part_idx,
+            single_mcl_flag,
+        );
+        let idx = (merge_idx as usize).min(candidates.len().saturating_sub(1));
+        current_mv = candidates[idx];
+
+        // Spec: when bi-prediction and the PU is tiny (w+h == 12), demote
+        // to L0-only (FFmpeg ff_hevc_luma_mv_merge_mode).
+        if current_mv.pred_flag == 3 && (n_pb_w + n_pb_h) == 12 {
+            current_mv.pred_flag = 1; // PF_L0
+        }
     } else {
         // AMVP mode.
         let inter_pred_idc = if slice_params.slice_type == SliceType::B {
@@ -850,6 +1098,8 @@ fn decode_coding_unit(
             log2_cb_size,
             true,
             cb_depth,
+            PartMode::Part2Nx2N,
+            0,
         )?;
         // Write default intra pred modes (DC) for the skip CU so that
         // subsequent intra CUs' MPM derivation sees valid modes.
@@ -915,6 +1165,8 @@ fn decode_coding_unit(
                     log2_cb_size,
                     false,
                     cb_depth,
+                    part_mode,
+                    0,
                 )?;
             }
             PartMode::Part2NxN => {
@@ -930,6 +1182,8 @@ fn decode_coding_unit(
                     log2_cb_size,
                     false,
                     cb_depth,
+                    part_mode,
+                    0,
                 )?;
                 decode_prediction_unit(
                     cabac,
@@ -943,6 +1197,8 @@ fn decode_coding_unit(
                     log2_cb_size,
                     false,
                     cb_depth,
+                    part_mode,
+                    1,
                 )?;
             }
             PartMode::PartNx2N => {
@@ -958,6 +1214,8 @@ fn decode_coding_unit(
                     log2_cb_size,
                     false,
                     cb_depth,
+                    part_mode,
+                    0,
                 )?;
                 decode_prediction_unit(
                     cabac,
@@ -971,6 +1229,8 @@ fn decode_coding_unit(
                     log2_cb_size,
                     false,
                     cb_depth,
+                    part_mode,
+                    1,
                 )?;
             }
             PartMode::Part2NxnU => {
@@ -986,6 +1246,8 @@ fn decode_coding_unit(
                     log2_cb_size,
                     false,
                     cb_depth,
+                    part_mode,
+                    0,
                 )?;
                 decode_prediction_unit(
                     cabac,
@@ -999,6 +1261,8 @@ fn decode_coding_unit(
                     log2_cb_size,
                     false,
                     cb_depth,
+                    part_mode,
+                    1,
                 )?;
             }
             PartMode::Part2NxnD => {
@@ -1014,6 +1278,8 @@ fn decode_coding_unit(
                     log2_cb_size,
                     false,
                     cb_depth,
+                    part_mode,
+                    0,
                 )?;
                 decode_prediction_unit(
                     cabac,
@@ -1027,6 +1293,8 @@ fn decode_coding_unit(
                     log2_cb_size,
                     false,
                     cb_depth,
+                    part_mode,
+                    1,
                 )?;
             }
             PartMode::PartnLx2N => {
@@ -1042,6 +1310,8 @@ fn decode_coding_unit(
                     log2_cb_size,
                     false,
                     cb_depth,
+                    part_mode,
+                    0,
                 )?;
                 decode_prediction_unit(
                     cabac,
@@ -1055,6 +1325,8 @@ fn decode_coding_unit(
                     log2_cb_size,
                     false,
                     cb_depth,
+                    part_mode,
+                    1,
                 )?;
             }
             PartMode::PartnRx2N => {
@@ -1070,6 +1342,8 @@ fn decode_coding_unit(
                     log2_cb_size,
                     false,
                     cb_depth,
+                    part_mode,
+                    0,
                 )?;
                 decode_prediction_unit(
                     cabac,
@@ -1083,11 +1357,14 @@ fn decode_coding_unit(
                     log2_cb_size,
                     false,
                     cb_depth,
+                    part_mode,
+                    1,
                 )?;
             }
             PartMode::PartNxN => {
                 // NxN for inter: 4 sub-PUs, each cb_size/2 x cb_size/2.
                 let half = cb_size / 2;
+                let mut pidx = 0u8;
                 for pi in 0..2u32 {
                     for pj in 0..2u32 {
                         decode_prediction_unit(
@@ -1102,7 +1379,10 @@ fn decode_coding_unit(
                             log2_cb_size,
                             false,
                             cb_depth,
+                            part_mode,
+                            pidx,
                         )?;
+                        pidx += 1;
                     }
                 }
             }
@@ -2238,6 +2518,7 @@ mod tests {
             num_ref_idx_l0_active: sh.num_ref_idx_l0_active_minus1 + 1,
             num_ref_idx_l1_active: 0,
             mvd_l1_zero_flag: false,
+            log2_parallel_merge_level: 2,
         };
         // The single CTU is at (0, 0) with log2_cb_size = ctb_log2_size_y = 4.
         decode_coding_quadtree(
