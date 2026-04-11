@@ -457,6 +457,26 @@ impl Decoder {
                     "new first slice segment arrived while previous picture was incomplete",
                 ));
             }
+
+            // Phase 3d-6: build the reference picture lists at picture start
+            // (before the CTB loop) so that motion compensation can access
+            // the reference frame pixel data. Previously these were built at
+            // picture completion (too late for MC).
+            self.current_ref_list_l0.clear();
+            self.current_ref_list_l1.clear();
+            if sh.slice_type != SliceType::I {
+                let sps_for_rps = self.sps.as_ref().expect("sps present");
+                let sps_st_rps = sps_for_rps.st_ref_pic_sets.clone();
+                let log2_max_poc_lsb = sps_for_rps.log2_max_pic_order_cnt_lsb;
+                self.dpb.configure_from_sps(sps_for_rps);
+                let rps = Self::derive_rps_from_slice_header_parts(&sh, &sps_st_rps);
+                Self::apply_rps_marking(&rps, &self.dpb, log2_max_poc_lsb);
+                self.current_rps = rps;
+                let (l0, l1) = Self::build_ref_pic_lists(&self.current_rps, &self.dpb, &sh)?;
+                self.current_ref_list_l0 = l0;
+                self.current_ref_list_l1 = l1;
+            }
+
             // Populate `tab_tile_id` on the fresh picture state so intra
             // availability checks can see it.
             let mut ps = PictureState::new(sps);
@@ -535,6 +555,8 @@ impl Decoder {
             log2_parallel_merge_level: (pps.log2_parallel_merge_level_minus2 + 2) as u8,
             poc: sh.poc,
             ref_pic_list_pocs: [ref_list_l0_pocs, ref_list_l1_pocs],
+            ref_frames_l0: self.current_ref_list_l0.clone(),
+            ref_frames_l1: self.current_ref_list_l1.clone(),
         };
 
         let mut more_data = true;
@@ -2863,21 +2885,24 @@ mod tests {
             "frame 0 (IDR) is not byte-exact against FFmpeg reference"
         );
 
-        // Frame 1 (P-slice): should exist and have the right dimensions.
-        // Pixel values are NOT checked -- motion compensation is a placeholder.
-        if frames.len() >= 2 {
-            let frame1 = &frames[1];
-            assert_eq!(frame1.width as usize, w);
-            assert_eq!(frame1.height as usize, h);
-            assert_eq!(frame1.y.len(), y_size, "P-frame luma plane size");
-            assert_eq!(frame1.u.len(), uv_size, "P-frame Cb plane size");
-            assert_eq!(frame1.v.len(), uv_size, "P-frame Cr plane size");
-        } else {
-            eprintln!(
-                "only {} frame(s) decoded (expected 2) -- P-frame may have been \
-                 rejected or x265 produced an all-IDR stream",
-                frames.len()
-            );
-        }
+        // Frame 1 (P-slice): byte-exact against FFmpeg (Phase 3d-6 MC).
+        assert!(
+            frames.len() >= 2,
+            "expected 2 decoded frames, got {}",
+            frames.len()
+        );
+        let frame1 = &frames[1];
+        assert_eq!(frame1.width as usize, w);
+        assert_eq!(frame1.height as usize, h);
+
+        let ref_frame1 = &ref_yuv[frame_size..frame_size * 2];
+        let mut decoded1 = Vec::with_capacity(frame_size);
+        decoded1.extend_from_slice(&frame1.y);
+        decoded1.extend_from_slice(&frame1.u);
+        decoded1.extend_from_slice(&frame1.v);
+        assert_eq!(
+            decoded1, ref_frame1,
+            "frame 1 (P-slice) is not byte-exact against FFmpeg reference"
+        );
     }
 }

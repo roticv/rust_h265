@@ -3,17 +3,21 @@
 //! Phase 2c-1 scope: recursive `coding_quadtree` / `coding_unit` decoding for
 //! the I-slice intra path. Phase 3d-3 extends to inter CUs in P/B slices:
 //! `cu_skip_flag`, `pred_mode_flag`, merge/AMVP syntax, `mvd_coding`, and
-//! `rqt_root_cbf`. Motion compensation is NOT done here (Phase 3d-6) — the
-//! decoded MVs are stored in `tab_mvf` and a placeholder (128) prediction is
-//! used so that the CABAC stream is consumed correctly.
+//! `rqt_root_cbf`. Phase 3d-6 adds motion compensation: decoded MVs in
+//! `tab_mvf` are used to interpolate prediction samples from reference frames
+//! via `inter_pred::motion_compensation_cu`.
 //!
 //! The recursion structure mirrors FFmpeg `libavcodec/hevc/hevcdec.c`
 //! (`hls_coding_quadtree`, `hls_coding_unit`, `hls_prediction_unit`,
 //! `luma_intra_pred_mode`) so that decoded values match byte-for-byte.
 
+use std::rc::Rc;
+
 use crate::cabac::{CabacContexts, CabacReader};
 use crate::cabac_tables::ctx;
+use crate::dpb::DecodedPicture;
 use crate::error::DecodeError;
+use crate::inter_pred;
 use crate::intra_pred::{
     ReferenceAvailability, add_residual, build_reference_samples, filter_reference_samples,
     predict_angular, predict_dc, predict_planar,
@@ -96,6 +100,10 @@ pub struct SliceParams {
     /// POC values of RefPicList0 entries (one per active L0 reference).
     /// `ref_pic_list_pocs[0][i]` is the POC of the picture at L0 index `i`.
     pub ref_pic_list_pocs: [Vec<i32>; 2],
+    /// Phase 3d-6: actual reference frame pixel data for L0 MC.
+    pub ref_frames_l0: Vec<Rc<DecodedPicture>>,
+    /// Phase 3d-6: actual reference frame pixel data for L1 MC.
+    pub ref_frames_l1: Vec<Rc<DecodedPicture>>,
 }
 
 /// Per-picture mutable state needed during slice decode.
@@ -1324,35 +1332,6 @@ fn decode_mvd_sign(cabac: &mut CabacReader) -> i32 {
     if cabac.decode_bypass() != 0 { -1 } else { 1 }
 }
 
-/// Write mid-gray (128) placeholder prediction into all planes for an
-/// inter CU. Motion compensation is not yet implemented (Phase 3d-6),
-/// so this ensures that any decoded residual produces plausible pixel values.
-fn write_placeholder_prediction(state: &mut PictureState, x0: u32, y0: u32, log2_cb_size: u8) {
-    let size = 1usize << log2_cb_size;
-    // Luma.
-    let y_stride = state.y_stride;
-    let y_off = (y0 as usize) * y_stride + (x0 as usize);
-    for j in 0..size {
-        for i in 0..size {
-            if y_off + j * y_stride + i < state.y_plane.len() {
-                state.y_plane[y_off + j * y_stride + i] = 128;
-            }
-        }
-    }
-    // Chroma (4:2:0).
-    let c_size = size / 2;
-    let uv_stride = state.uv_stride;
-    let c_off = (y0 as usize / 2) * uv_stride + (x0 as usize / 2);
-    for j in 0..c_size {
-        for i in 0..c_size {
-            if c_off + j * uv_stride + i < state.u_plane.len() {
-                state.u_plane[c_off + j * uv_stride + i] = 128;
-                state.v_plane[c_off + j * uv_stride + i] = 128;
-            }
-        }
-    }
-}
-
 /// Mark inter CU boundaries for deblocking with bS=1 (inter-CU default).
 fn mark_inter_cu_boundaries(state: &mut PictureState, x0: u32, y0: u32, log2_size: u8) {
     let size = 1u32 << log2_size;
@@ -1455,8 +1434,16 @@ fn decode_coding_unit(
         // Write default intra pred modes (DC) for the skip CU so that
         // subsequent intra CUs' MPM derivation sees valid modes.
         write_intra_pred_mode(state, x0, y0, cb_size, INTRA_DC);
-        // Phase 3d-3: write placeholder (128) prediction for all planes.
-        write_placeholder_prediction(state, x0, y0, log2_cb_size);
+        // Phase 3d-6: actual motion compensation (replaces 128-fill placeholder).
+        inter_pred::motion_compensation_cu(
+            state,
+            &slice_params.ref_frames_l0,
+            &slice_params.ref_frames_l1,
+            x0,
+            y0,
+            cb_size,
+            PartMode::Part2Nx2N,
+        );
         // Deblocking for inter skip: mark edges with bS=1.
         mark_inter_cu_boundaries(state, x0, y0, log2_cb_size);
         state.cu_count += 1;
@@ -1739,8 +1726,16 @@ fn decode_coding_unit(
             }
         }
 
-        // Phase 3d-3: write placeholder (128) prediction for all planes.
-        write_placeholder_prediction(state, x0, y0, log2_cb_size);
+        // Phase 3d-6: actual motion compensation (replaces 128-fill placeholder).
+        inter_pred::motion_compensation_cu(
+            state,
+            &slice_params.ref_frames_l0,
+            &slice_params.ref_frames_l1,
+            x0,
+            y0,
+            cb_size,
+            part_mode,
+        );
     }
 
     // ---- Step 6: transform tree / residual ----
@@ -2872,6 +2867,8 @@ mod tests {
             log2_parallel_merge_level: 2,
             poc: 0,
             ref_pic_list_pocs: [vec![], vec![]],
+            ref_frames_l0: vec![],
+            ref_frames_l1: vec![],
         };
         // The single CTU is at (0, 0) with log2_cb_size = ctb_log2_size_y = 4.
         decode_coding_quadtree(

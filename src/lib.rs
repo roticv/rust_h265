@@ -19,6 +19,8 @@ pub mod decoder;
 pub mod dpb;
 pub mod error;
 #[allow(dead_code)]
+mod inter_pred;
+#[allow(dead_code)]
 mod intra_pred;
 #[allow(dead_code)]
 mod inverse_transform;
