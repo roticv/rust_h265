@@ -191,12 +191,20 @@ impl PictureState {
         let log2_ctb_size = sps.ctb_log2_size_y;
         let w = sps.pic_width_in_luma_samples;
         let h = sps.pic_height_in_luma_samples;
-        let min_cb_width = (w >> log2_min_cb_size) as usize;
-        let min_cb_height = (h >> log2_min_cb_size) as usize;
-        let min_pu_width = (w >> log2_min_pu_size) as usize;
-        let min_pu_height = (h >> log2_min_pu_size) as usize;
-        let y_stride = w as usize;
-        let uv_stride = (w / 2) as usize;
+        // Use CTU-aligned dimensions for per-min-CB and per-min-PU tables so
+        // that CUs in the last CTU row/column (which may extend past the
+        // picture boundary) don't write out of bounds.
+        let ctb_size = 1u32 << log2_ctb_size;
+        let w_aligned = w.div_ceil(ctb_size) * ctb_size;
+        let h_aligned = h.div_ceil(ctb_size) * ctb_size;
+        let min_cb_width = (w_aligned >> log2_min_cb_size) as usize;
+        let min_cb_height = (h_aligned >> log2_min_cb_size) as usize;
+        let min_pu_width = (w_aligned >> log2_min_pu_size) as usize;
+        let min_pu_height = (h_aligned >> log2_min_pu_size) as usize;
+        // Pixel planes use CTU-aligned dimensions so that CUs at the picture
+        // edge (which extend into the padding area) can read/write without OOB.
+        let y_stride = w_aligned as usize;
+        let uv_stride = (w_aligned / 2) as usize;
         Self {
             width: w,
             height: h,
@@ -210,9 +218,9 @@ impl PictureState {
             // Default IPM is INTRA_DC (matches FFmpeg
             // `intra_prediction_unit_default_value`).
             tab_ipm: vec![INTRA_DC; min_pu_width * min_pu_height],
-            y_plane: vec![0u8; (w * h) as usize],
-            u_plane: vec![0u8; ((w / 2) * (h / 2)) as usize],
-            v_plane: vec![0u8; ((w / 2) * (h / 2)) as usize],
+            y_plane: vec![0u8; (w_aligned * h_aligned) as usize],
+            u_plane: vec![0u8; ((w_aligned / 2) * (h_aligned / 2)) as usize],
+            v_plane: vec![0u8; ((w_aligned / 2) * (h_aligned / 2)) as usize],
             y_stride,
             uv_stride,
             last_luma_pred_mode: 0,
@@ -226,8 +234,8 @@ impl PictureState {
             last_qp_y: 0,
             last_luma_residual: None,
             tab_qp_y: vec![0u8; min_cb_width * min_cb_height],
-            bs_vertical: vec![0u8; ((w / 4) * (h / 4)) as usize],
-            bs_horizontal: vec![0u8; ((w / 4) * (h / 4)) as usize],
+            bs_vertical: vec![0u8; ((w_aligned / 4) * (h_aligned / 4)) as usize],
+            bs_horizontal: vec![0u8; ((w_aligned / 4) * (h_aligned / 4)) as usize],
             sao_params: {
                 let ctb_size = 1u32 << log2_ctb_size;
                 let pw = w.div_ceil(ctb_size) as usize;
