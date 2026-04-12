@@ -2820,8 +2820,11 @@ fn predict_intra_luma(
         avail,
     );
 
-    // Reference sample filtering for angular modes (not needed for PLANAR/DC).
-    if (2..=34).contains(&mode) {
+    // Reference sample filtering (spec 8.4.4.2.3). Applied for all non-DC
+    // modes at size > 4. The function handles the DC and size exclusions
+    // internally. PLANAR (mode 0) IS filtered — this was a prior bug where
+    // we only filtered modes 2..34.
+    if mode != 1 {
         filter_reference_samples(
             &mut top,
             &mut left,

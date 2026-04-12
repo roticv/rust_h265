@@ -2681,7 +2681,7 @@ mod tests {
         // "e12a27d0656e2dd3967e11934f32db1f5a03fec48da911429561b8417334690e"
         // Current decoder hash (known mismatch — decoder bugs in multi-CTU
         // P/B inter prediction produce slightly different output):
-        let expected = "7df93d09bce49b175e1abac0b9e5926416244d44b4f731a079df242b1c28f207";
+        let expected = "1034b19df9b199d7752b102c5119a0ed12d5383fa18593f888cf860c92044542";
         assert_eq!(
             hash, expected,
             "realworld_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2709,7 +2709,7 @@ mod tests {
         // "9cbafe78054edc6fc565f80c6339e36a3c536eb58da558f7b4a76523d26ff638"
         // Current decoder hash (known mismatch — same class of inter
         // prediction bugs as the 320x240 fixture):
-        let expected = "22e2f2d57d4eb9d6dec983097d27e8cc189c63072c45ad5b81d313d6959ac877";
+        let expected = "45632a9b422364f756e65d9e7f92eb4e419bd3c6a02d7b7cfd9fb365883ae84d";
         assert_eq!(
             hash, expected,
             "realworld_720p hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2736,7 +2736,7 @@ mod tests {
         // "5b7faa6a62ba7932fc643a3b668b1dfc06cae44bfec43651de4b59a1c3aa35fb"
         // Current decoder hash (known mismatch — motion compensation with
         // non-zero MVs in varied content produces slightly different output):
-        let expected = "714b2b494a273d0785637f87ce47d103447737c4c1ee21a78daa0d1c31cfa1ab";
+        let expected = "d367a7e9a3cf84514910aca46d4d113fab5c61ef55fec265e1ea70c3a9e3749d";
         assert_eq!(
             hash, expected,
             "motion_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2764,7 +2764,7 @@ mod tests {
         // "e672d49a06df7798d7c5c1610b5ccfe2e37772bbbf4eee3a2d3877838d12dc82"
         // Current decoder hash (known mismatch — deblock/SAO interaction with
         // inter-predicted multi-CTU content):
-        let expected = "9684b5f9729cd2329dae07e23a978190696b7557cb72cfb6eefcc68fa86413c8";
+        let expected = "e97f2d2b0da56467f14b1fabd10d07876c01a47a086e7568741ed902760686fe";
         assert_eq!(
             hash, expected,
             "deblock_sao_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2793,10 +2793,245 @@ mod tests {
         // "ff3e179ade08f6b3111c5b21d576605f5ee4d22b3ad5747f15c2d78dcbd2e512"
         // Current decoder hash (known mismatch — scaling list dequant +
         // sign hiding interaction in multi-CTU inter content):
-        let expected = "23d5aff86e534d57c140d0e3537d059b2641604c38740e97a13db2a1632ad1ba";
+        let expected = "859ae82174da245b14b2ceb2f07a0d8163d5392a3c44357607b782737238462f";
         assert_eq!(
             hash, expected,
             "signhide_scaling_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
+    }
+
+    /// Diagnostic test: compare against FFmpeg per-frame to find mismatches.
+    /// Requires ffmpeg on PATH. Run with `cargo test diag_realworld -- --ignored --nocapture`
+    #[test]
+    #[ignore = "diagnostic only, requires ffmpeg"]
+    fn diag_realworld_320x240_per_frame() {
+        use std::process::Command;
+
+        let fixture = "realworld_320x240.h265";
+        let fixture_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/").to_string() + fixture;
+        let width: usize = 320;
+        let height: usize = 240;
+        let frame_size = width * height * 3 / 2; // YUV420
+
+        // Decode with FFmpeg to get reference YUV in display order.
+        let ffmpeg_out = Command::new("ffmpeg")
+            .args([
+                "-i",
+                &fixture_path,
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "pipe:1",
+            ])
+            .output()
+            .expect("ffmpeg not found");
+        assert!(
+            ffmpeg_out.status.success(),
+            "ffmpeg failed: {}",
+            String::from_utf8_lossy(&ffmpeg_out.stderr)
+        );
+        let ref_yuv = ffmpeg_out.stdout;
+        let num_ref_frames = ref_yuv.len() / frame_size;
+        eprintln!(
+            "FFmpeg produced {} bytes = {} frames",
+            ref_yuv.len(),
+            num_ref_frames
+        );
+
+        // Decode with our decoder.
+        let h265 = std::fs::read(&fixture_path).unwrap();
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+        let mut frames: Vec<Frame> = Vec::new();
+
+        for nal in &nals {
+            if let Ok(Some(frame)) = decoder.decode_nal(nal) {
+                frames.push(frame);
+            }
+        }
+        while let Some(frame) = decoder.flush() {
+            frames.push(frame);
+        }
+
+        // Sort by POC for display-order comparison with FFmpeg.
+        frames.sort_by_key(|f| f.pic_order_cnt);
+
+        eprintln!("Our decoder produced {} frames", frames.len());
+        assert_eq!(frames.len(), num_ref_frames, "frame count mismatch");
+
+        let y_plane_size = width * height;
+        let uv_plane_size = (width / 2) * (height / 2);
+
+        let mut first_bad_frame: Option<usize> = None;
+
+        for (idx, frame) in frames.iter().enumerate() {
+            let ref_start = idx * frame_size;
+            let ref_y = &ref_yuv[ref_start..ref_start + y_plane_size];
+            let ref_u =
+                &ref_yuv[ref_start + y_plane_size..ref_start + y_plane_size + uv_plane_size];
+            let ref_v = &ref_yuv[ref_start + y_plane_size + uv_plane_size..ref_start + frame_size];
+
+            let mut y_mismatches = 0u64;
+            let mut u_mismatches = 0u64;
+            let mut v_mismatches = 0u64;
+            let mut first_y: Option<(usize, usize, u8, u8)> = None;
+            let mut first_u: Option<(usize, usize, u8, u8)> = None;
+            let mut first_v: Option<(usize, usize, u8, u8)> = None;
+            let mut max_y_diff: i32 = 0;
+            let mut max_u_diff: i32 = 0;
+            let mut max_v_diff: i32 = 0;
+
+            // Compare Y plane.
+            for j in 0..height {
+                for i in 0..width {
+                    let ours = frame.y[j * width + i];
+                    let theirs = ref_y[j * width + i];
+                    if ours != theirs {
+                        y_mismatches += 1;
+                        let diff = (ours as i32) - (theirs as i32);
+                        if diff.abs() > max_y_diff.abs() {
+                            max_y_diff = diff;
+                        }
+                        if first_y.is_none() {
+                            first_y = Some((i, j, ours, theirs));
+                        }
+                    }
+                }
+            }
+
+            // Compare U plane.
+            let cw = width / 2;
+            let ch = height / 2;
+            for j in 0..ch {
+                for i in 0..cw {
+                    let ours = frame.u[j * cw + i];
+                    let theirs = ref_u[j * cw + i];
+                    if ours != theirs {
+                        u_mismatches += 1;
+                        let diff = (ours as i32) - (theirs as i32);
+                        if diff.abs() > max_u_diff.abs() {
+                            max_u_diff = diff;
+                        }
+                        if first_u.is_none() {
+                            first_u = Some((i, j, ours, theirs));
+                        }
+                    }
+                }
+            }
+
+            // Compare V plane.
+            for j in 0..ch {
+                for i in 0..cw {
+                    let ours = frame.v[j * cw + i];
+                    let theirs = ref_v[j * cw + i];
+                    if ours != theirs {
+                        v_mismatches += 1;
+                        let diff = (ours as i32) - (theirs as i32);
+                        if diff.abs() > max_v_diff.abs() {
+                            max_v_diff = diff;
+                        }
+                        if first_v.is_none() {
+                            first_v = Some((i, j, ours, theirs));
+                        }
+                    }
+                }
+            }
+
+            let total = y_mismatches + u_mismatches + v_mismatches;
+            if total > 0 {
+                eprintln!(
+                    "Frame {} (POC {}): {} mismatches (Y={} U={} V={}), max_diff Y={} U={} V={}",
+                    idx,
+                    frame.pic_order_cnt,
+                    total,
+                    y_mismatches,
+                    u_mismatches,
+                    v_mismatches,
+                    max_y_diff,
+                    max_u_diff,
+                    max_v_diff
+                );
+                if let Some((x, y, ours, theirs)) = first_y {
+                    eprintln!(
+                        "  First Y mismatch: ({}, {}): ours={} ffmpeg={} diff={}",
+                        x,
+                        y,
+                        ours,
+                        theirs,
+                        ours as i32 - theirs as i32
+                    );
+                }
+                if let Some((x, y, ours, theirs)) = first_u {
+                    eprintln!(
+                        "  First U mismatch: ({}, {}): ours={} ffmpeg={} diff={}",
+                        x,
+                        y,
+                        ours,
+                        theirs,
+                        ours as i32 - theirs as i32
+                    );
+                }
+                if let Some((x, y, ours, theirs)) = first_v {
+                    eprintln!(
+                        "  First V mismatch: ({}, {}): ours={} ffmpeg={} diff={}",
+                        x,
+                        y,
+                        ours,
+                        theirs,
+                        ours as i32 - theirs as i32
+                    );
+                }
+                if first_bad_frame.is_none() {
+                    first_bad_frame = Some(idx);
+                }
+            } else {
+                eprintln!("Frame {} (POC {}) matches FFmpeg", idx, frame.pic_order_cnt);
+            }
+        }
+
+        // Dump a detailed map of mismatches in the first bad frame (frame 0).
+        if let Some(bad) = first_bad_frame {
+            let frame = &frames[bad];
+            let ref_start = bad * frame_size;
+            let ref_y = &ref_yuv[ref_start..ref_start + y_plane_size];
+
+            // Show the region around (1, 32) in detail.
+            eprintln!(
+                "\n=== Mismatch map for frame {} Y plane, rows 28..40, cols 0..20 ===",
+                bad
+            );
+            for j in 28usize..40.min(height) {
+                let mut line = format!("  y={:3}: ", j);
+                for i in 0usize..20.min(width) {
+                    let ours = frame.y[j * width + i];
+                    let theirs = ref_y[j * width + i];
+                    if ours == theirs {
+                        line += &format!("{:4}", ours);
+                    } else {
+                        let diff = ours as i32 - theirs as i32;
+                        line += &format!(" {:+3}", diff);
+                    }
+                }
+                eprintln!("{}", line);
+            }
+
+            // Check if the mismatch pattern aligns with block boundaries.
+            eprintln!("\n=== Row-by-row mismatch count (first 48 rows) ===");
+            for j in 0..48.min(height) {
+                let mut count = 0u32;
+                for i in 0..width {
+                    if frame.y[j * width + i] != ref_y[j * width + i] {
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    eprintln!("  y={:3}: {} mismatches", j, count);
+                }
+            }
+
+            panic!("First mismatched frame: {} (see stderr for details)", bad);
+        }
+        eprintln!("All {} frames match FFmpeg byte-exactly!", frames.len());
     }
 }
