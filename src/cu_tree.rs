@@ -108,6 +108,10 @@ pub struct SliceParams {
     pub collocated_ref: Option<Rc<DecodedPicture>>,
     /// Phase 3e: `slice_temporal_mvp_enabled_flag` from the slice header.
     pub slice_temporal_mvp_enabled_flag: bool,
+    /// Phase 3e: `collocated_from_l0_flag` from the slice header.
+    /// true = collocated picture is from L0 (collocated_list = 0),
+    /// false = from L1 (collocated_list = 1).
+    pub collocated_from_l0_flag: bool,
 }
 
 /// Per-picture mutable state needed during slice decode.
@@ -967,35 +971,36 @@ fn derive_temporal_colocated_mvs(
             )
         }
     } else {
-        // Mixed direction: use the collocated list (opposite of current).
-        // FFmpeg: if collocated_list == L1, use L0; else use L1.
-        // The collocated_list = !collocated_from_l0_flag.
-        // Here we just use L0 when collocated is from L1, L1 when from L0.
-        // But we don't have collocated_from_l0_flag here directly; the
-        // FFmpeg logic is: if s->sh.collocated_list == L1 => CHECK_MVSET(0),
-        // else CHECK_MVSET(1).  collocated_list = 1 means "from L1".
-        // We approximate: always use L0 for the bi-pred case when diffpic > 0
-        // (since the collocated picture is identified by
-        // collocated_from_l0_flag, and when that's true the collocated_list
-        // is L0, so we'd use L1... but we need the flag). Let's just try L0
-        // first then L1, which matches "collocated_list == L1" => use L0.
-        // Actually, the logic is simpler: collocated_from_l0_flag means the
-        // collocated picture comes from L0. FFmpeg stores
-        // `collocated_list = collocated_from_l0_flag ? 0 : 1`.
-        // Then: `if collocated_list == L1 => CHECK_MVSET(0)` means
-        // "if collocated is from L1, use L0 MV". So:
-        // - collocated from L0 (collocated_list=0): use L1 MV (CHECK_MVSET(1))
-        // - collocated from L1 (collocated_list=1): use L0 MV (CHECK_MVSET(0))
-        // We pass this info through. For now, default to L0 (CHECK_MVSET(0))
-        // which matches "collocated_list == L1" (the common B-frame case).
-        check_mvset(
-            temp_col.mv[0],
-            temp_col.ref_idx[0],
-            col_pic_poc,
-            &col_ref_pocs[0],
-            curr_poc,
-            curr_ref_poc,
-        )
+        // Mixed direction: use the opposite of the collocated list.
+        // FFmpeg: collocated_list = collocated_from_l0_flag ? 0 : 1.
+        // if collocated_list == L1 => CHECK_MVSET(0) (use L0 MV)
+        // if collocated_list == L0 => CHECK_MVSET(1) (use L1 MV)
+        let col_list = if slice_params.collocated_from_l0_flag {
+            0usize
+        } else {
+            1usize
+        };
+        if col_list == 1 {
+            // Collocated from L1 → use L0 MV of the collocated PU.
+            check_mvset(
+                temp_col.mv[0],
+                temp_col.ref_idx[0],
+                col_pic_poc,
+                &col_ref_pocs[0],
+                curr_poc,
+                curr_ref_poc,
+            )
+        } else {
+            // Collocated from L0 → use L1 MV of the collocated PU.
+            check_mvset(
+                temp_col.mv[1],
+                temp_col.ref_idx[1],
+                col_pic_poc,
+                &col_ref_pocs[1],
+                curr_poc,
+                curr_ref_poc,
+            )
+        }
     }
 }
 
@@ -1590,11 +1595,10 @@ fn decode_ref_idx(
     if max == 0 {
         return 0;
     }
-    let ctx_base = if is_l1 {
-        ctx::REF_IDX_L1
-    } else {
-        ctx::REF_IDX_L0
-    };
+    // HEVC spec: ref_idx_lX uses the same context model for both L0 and L1.
+    // FFmpeg always uses REF_IDX_L0_FLAG contexts regardless of the list.
+    let _ = is_l1;
+    let ctx_base = ctx::REF_IDX_L0;
     let max_ctx = max.min(2) as usize;
     let mut i = 0u32;
     while (i as usize) < max_ctx
@@ -3333,6 +3337,7 @@ mod tests {
             ref_frames_l1: vec![],
             collocated_ref: None,
             slice_temporal_mvp_enabled_flag: false,
+            collocated_from_l0_flag: true,
         };
         // The single CTU is at (0, 0) with log2_cb_size = ctb_log2_size_y = 4.
         decode_coding_quadtree(

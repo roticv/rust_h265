@@ -510,7 +510,7 @@ impl Decoder {
                     .is_multiple_of(pic_width_in_ctbs_for_init);
             if wpp_for_init && on_row_start && !tiles_for_init {
                 if pic_width_in_ctbs_for_init == 1 {
-                    CabacContexts::init(sh.slice_qp_y, sh.slice_type, false)
+                    CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag)
                 } else {
                     let saved = pic.saved_wpp_cabac_state.ok_or(DecodeError::InvalidSyntax(
                         "dependent WPP slice at row start without a saved WPP context state",
@@ -524,7 +524,7 @@ impl Decoder {
                 CabacContexts { state: saved }
             }
         } else {
-            CabacContexts::init(sh.slice_qp_y, sh.slice_type, false)
+            CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag)
         };
         let cabac_byte_offset = sh.header_size_bits / 8;
         let mut cabac = CabacReader::new(&nal.rbsp, cabac_byte_offset);
@@ -666,6 +666,7 @@ impl Decoder {
             ref_frames_l1: self.current_ref_list_l1.clone(),
             collocated_ref,
             slice_temporal_mvp_enabled_flag: sh.slice_temporal_mvp_enabled_flag,
+            collocated_from_l0_flag: sh.collocated_from_l0_flag,
         };
 
         let mut more_data = true;
@@ -718,13 +719,15 @@ impl Decoder {
 
                 if is_tile_start {
                     // Per-tile CABAC context reinit from the slice QP.
-                    contexts = CabacContexts::init(sh.slice_qp_y, sh.slice_type, false);
+                    contexts =
+                        CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag);
                 } else {
                     // WPP row start: fresh init on single-column pictures,
                     // otherwise load the state saved after the previous
                     // row's 2nd CTB.
                     if pic_width_in_ctbs == 1 {
-                        contexts = CabacContexts::init(sh.slice_qp_y, sh.slice_type, false);
+                        contexts =
+                            CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag);
                     } else if let Some(saved) = saved_state.as_ref() {
                         contexts.state.copy_from_slice(saved);
                     } else {
