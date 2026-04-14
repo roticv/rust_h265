@@ -154,6 +154,9 @@ pub struct PictureState {
     pub last_cbf_cr: bool,
     /// Signed CU QP delta as decoded for the most recent TU. 0 if not coded.
     pub last_cu_qp_delta: i32,
+    /// Reset at the top of each QP group in decode_coding_quadtree;
+    /// set to true once the first TU with non-zero CBF decodes cu_qp_delta.
+    pub is_cu_qp_delta_coded: bool,
     /// Effective QP after applying `last_cu_qp_delta` to `slice_qp_y`.
     pub last_qp_y: i32,
 
@@ -235,6 +238,7 @@ impl PictureState {
             last_cbf_cb: false,
             last_cbf_cr: false,
             last_cu_qp_delta: 0,
+            is_cu_qp_delta_coded: false,
             last_qp_y: 0,
             last_luma_residual: None,
             tab_qp_y: vec![0u8; min_cb_width * min_cb_height],
@@ -287,6 +291,19 @@ pub fn decode_coding_quadtree(
     cb_depth: u8,
 ) -> Result<bool, DecodeError> {
     let cb_size = 1u32 << log2_cb_size;
+
+    // Reset cu_qp_delta coding state at the top of each QP group
+    // (spec 7.3.8.4, FFmpeg hls_coding_quadtree). A QP group is a
+    // block of size CtbLog2SizeY - diff_cu_qp_delta_depth. When we
+    // enter a node at or above that size, reset the "already coded"
+    // sentinel so the first TU with non-zero CBF in this group will
+    // signal a fresh cu_qp_delta.
+    if pps.cu_qp_delta_enabled_flag
+        && log2_cb_size >= sps.ctb_log2_size_y - pps.diff_cu_qp_delta_depth as u8
+    {
+        state.is_cu_qp_delta_coded = false;
+        state.last_cu_qp_delta = 0;
+    }
 
     // Implicit-no-split when we're at min CB size or when the CU would
     // overflow the picture (spec 7.3.8.4).
@@ -362,7 +379,17 @@ pub fn decode_coding_quadtree(
                 cb_depth + 1,
             )?;
         }
-        more_data = md;
+        // FFmpeg hls_coding_quadtree: when the four sub-CUs all returned
+        // more_data=true, check whether there are still CUs beyond this
+        // split block inside the picture.  If the bottom-right corner of
+        // this block is at or past the picture edge in both dimensions,
+        // no terminate bin was decoded for the last leaf, so propagate
+        // "no more data" upward to the CTB loop.
+        if md {
+            more_data = (x1 + cb_size_split) < state.width || (y1 + cb_size_split) < state.height;
+        } else {
+            more_data = false;
+        }
     } else {
         decode_coding_unit(
             cabac,
@@ -391,9 +418,15 @@ pub fn decode_coding_quadtree(
         } else {
             more_data = true;
         }
+        // For leaf (non-split) CUs, record the coding-tree depth in
+        // `tab_ct_depth` for split_cu_flag context derivation of neighbors.
+        // This must NOT be called for the split (parent) node — only for
+        // leaves — otherwise the parent depth overwrites the children's
+        // finer depths (matching FFmpeg: set_ct_depth is inside
+        // hls_coding_unit, not hls_coding_quadtree).
+        set_ct_depth(state, x0, y0, log2_cb_size, cb_depth);
     }
 
-    set_ct_depth(state, x0, y0, log2_cb_size, cb_depth);
     Ok(more_data)
 }
 
@@ -2095,6 +2128,12 @@ fn decode_coding_unit(
             } else {
                 sps.max_transform_hierarchy_depth_inter
             };
+            // Inter CUs with non-2Nx2N partition and
+            // max_transform_hierarchy_depth_inter == 0 force an implicit TU
+            // split at trafo_depth 0 (FFmpeg `inter_split` variable).
+            let inter_split = sps.max_transform_hierarchy_depth_inter == 0
+                && pred_mode != PredMode::Intra
+                && part_mode != PartMode::Part2Nx2N;
 
             decode_transform_tree(
                 cabac,
@@ -2113,6 +2152,7 @@ fn decode_coding_unit(
                 0,
                 max_trafo_depth,
                 intra_split,
+                inter_split,
                 0,
                 TransformTreeCbf::default(),
             )?;
@@ -2261,9 +2301,6 @@ impl<'a> PcmBitReader<'a> {
 struct TransformTreeCbf {
     cbf_cb: bool,
     cbf_cr: bool,
-    /// "is_cu_qp_delta_coded" sentinel — set to `true` once the first TU in
-    /// the CU has decoded `cu_qp_delta`. Subsequent TUs skip the read.
-    cu_qp_delta_coded: bool,
 }
 
 /// Recursive transform tree decode (HEVC spec 7.3.8.10).
@@ -2286,6 +2323,7 @@ fn decode_transform_tree(
     trafo_depth: u8,
     max_trafo_depth: u32,
     intra_split: bool,
+    inter_split: bool,
     blk_idx: u8,
     parent_cbf: TransformTreeCbf,
 ) -> Result<TransformTreeCbf, DecodeError> {
@@ -2298,8 +2336,8 @@ fn decode_transform_tree(
         decode_split_transform_flag(cabac, contexts, log2_trafo_size) != 0
     } else {
         // Implicit split: oversized TU, intra_split forcing depth-1, or inter
-        // split (which we don't hit for I-slices).
-        log2_trafo_size > sps.max_tb_log2_size_y || (intra_split && trafo_depth == 0)
+        // split (max_transform_hierarchy_depth_inter==0 + non-2Nx2N partition).
+        log2_trafo_size > sps.max_tb_log2_size_y || (intra_split && trafo_depth == 0) || inter_split
     };
 
     state.last_split_transform_flag = split_transform_flag;
@@ -2321,11 +2359,7 @@ fn decode_transform_tree(
     state.last_cbf_cb = cbf_cb;
     state.last_cbf_cr = cbf_cr;
 
-    let inherited = TransformTreeCbf {
-        cbf_cb,
-        cbf_cr,
-        cu_qp_delta_coded: parent_cbf.cu_qp_delta_coded,
-    };
+    let inherited = TransformTreeCbf { cbf_cb, cbf_cr };
 
     if split_transform_flag {
         let trafo_size_split = 1u32 << (log2_trafo_size - 1);
@@ -2349,6 +2383,7 @@ fn decode_transform_tree(
             trafo_depth + 1,
             max_trafo_depth,
             intra_split,
+            false, // inter_split only at depth 0
             0,
             child_cbf,
         )?;
@@ -2369,6 +2404,7 @@ fn decode_transform_tree(
             trafo_depth + 1,
             max_trafo_depth,
             intra_split,
+            false,
             1,
             child_cbf,
         )?;
@@ -2389,6 +2425,7 @@ fn decode_transform_tree(
             trafo_depth + 1,
             max_trafo_depth,
             intra_split,
+            false,
             2,
             child_cbf,
         )?;
@@ -2409,6 +2446,7 @@ fn decode_transform_tree(
             trafo_depth + 1,
             max_trafo_depth,
             intra_split,
+            false,
             3,
             child_cbf,
         )?;
@@ -2533,12 +2571,12 @@ fn decode_transform_unit(
     };
     state.last_cbf_luma = cbf_luma;
 
-    let mut new_cbf = inherited;
+    let new_cbf = inherited;
     let do_chroma_inline = sps.chroma_format_idc == 1 && log2_trafo_size > 2;
     let do_chroma_deferred = sps.chroma_format_idc == 1 && log2_trafo_size == 2 && blk_idx == 3;
 
     if cbf_luma || inherited.cbf_cb || inherited.cbf_cr {
-        if pps.cu_qp_delta_enabled_flag && !inherited.cu_qp_delta_coded {
+        if pps.cu_qp_delta_enabled_flag && !state.is_cu_qp_delta_coded {
             let abs = decode_cu_qp_delta_abs(cabac, contexts) as i32;
             let signed = if abs != 0 {
                 let sign = decode_cu_qp_delta_sign_flag(cabac);
@@ -2550,7 +2588,7 @@ fn decode_transform_unit(
             if !(-26..=25).contains(&signed) {
                 return Err(DecodeError::InvalidSyntax("cu_qp_delta out of range"));
             }
-            new_cbf.cu_qp_delta_coded = true;
+            state.is_cu_qp_delta_coded = true;
         }
 
         let qp_y = slice_qp_y + state.last_cu_qp_delta;
