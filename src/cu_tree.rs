@@ -188,6 +188,19 @@ pub struct PictureState {
     /// Phase 3d-3: per min-CB skip flag, used for `cu_skip_flag` neighbor
     /// context derivation. Indexed the same as `tab_ct_depth`.
     pub tab_skip_flag: Vec<u8>,
+    /// Z-scan order address table for intra prediction availability.
+    /// `min_tb_addr_zs[y * min_tb_addr_zs_stride + x]` gives the Z-scan order
+    /// index for the min-TB at position (x, y) in min-TB units within the
+    /// picture. Used to determine whether bottom-left / upper-right reference
+    /// samples are available (decoded before the current block in Z-scan order).
+    /// Matches FFmpeg's `pps->min_tb_addr_zs`.
+    pub min_tb_addr_zs: Vec<i32>,
+    /// Stride (width in min-TB units + 1 for the -1 sentinel column) of the
+    /// Z-scan table.
+    pub min_tb_addr_zs_stride: usize,
+    /// tb_mask = (1 << (ctb_log2 - min_tb_log2)) * pic_width_in_ctbs - 1
+    /// Actually, the number of min-TBs across the picture width.
+    pub min_tb_width: usize,
 }
 
 impl PictureState {
@@ -264,7 +277,80 @@ impl PictureState {
             },
             tab_mvf: vec![MvField::default(); min_pu_width * min_pu_height],
             tab_skip_flag: vec![0u8; min_cb_width * min_cb_height],
+            min_tb_addr_zs: {
+                // Build Z-scan order table (HEVC spec 6.5.1, FFmpeg min_tb_addr_zs).
+                // tb_mask = number of min-TBs per CTB side - 1
+                let log2_diff = (log2_ctb_size - sps.min_tb_log2_size_y) as u32;
+                let tb_per_ctb = 1u32 << log2_diff; // min-TBs per CTB side
+                let tb_mask = tb_per_ctb - 1;
+                let ctb_size = 1u32 << log2_ctb_size;
+                let pic_w_in_ctbs = w.div_ceil(ctb_size);
+                let pic_h_in_ctbs = h.div_ceil(ctb_size);
+                let pic_w_in_tbs = pic_w_in_ctbs * tb_per_ctb;
+                let pic_h_in_tbs = pic_h_in_ctbs * tb_per_ctb;
+                // Table stride includes a -1 sentinel column at index -1,
+                // represented as column 0 in the raw array. Accessible range:
+                // y in -1..pic_h_in_tbs, x in -1..pic_w_in_tbs.
+                let stride = (pic_w_in_tbs + 1) as usize;
+                let rows = (pic_h_in_tbs + 1) as usize;
+                let mut tab = vec![-1i32; stride * rows];
+                // Fill the table (skip sentinel row 0 and column 0).
+                for y in 0..pic_h_in_tbs {
+                    for x in 0..pic_w_in_tbs {
+                        let tb_x = x >> log2_diff; // CTB column
+                        let tb_y = y >> log2_diff; // CTB row
+                        let rs = pic_w_in_ctbs * tb_y + tb_x;
+                        // For single-tile: ts = rs. For tiles: use
+                        // ctb_addr_rs_to_ts. We'll use rs directly (tiles
+                        // are handled via tab_tile_id checks elsewhere).
+                        let mut val = (rs << (log2_diff * 2)) as i32;
+                        // Z-order interleave of within-CTB coordinates.
+                        let lx = x & tb_mask;
+                        let ly = y & tb_mask;
+                        for i in 0..log2_diff {
+                            let m = 1u32 << i;
+                            if lx & m != 0 {
+                                val += (m * m) as i32;
+                            }
+                            if ly & m != 0 {
+                                val += (2 * m * m) as i32;
+                            }
+                        }
+                        // +1 offset for the sentinel row/column.
+                        tab[(y as usize + 1) * stride + (x as usize + 1)] = val;
+                    }
+                }
+                tab
+            },
+            min_tb_addr_zs_stride: {
+                let log2_diff = (log2_ctb_size - sps.min_tb_log2_size_y) as u32;
+                let tb_per_ctb = 1u32 << log2_diff;
+                let ctb_size = 1u32 << log2_ctb_size;
+                let pic_w_in_ctbs = w.div_ceil(ctb_size);
+                (pic_w_in_ctbs * tb_per_ctb + 1) as usize
+            },
+            min_tb_width: {
+                let log2_diff = (log2_ctb_size - sps.min_tb_log2_size_y) as u32;
+                let tb_per_ctb = 1u32 << log2_diff;
+                let ctb_size = 1u32 << log2_ctb_size;
+                let pic_w_in_ctbs = w.div_ceil(ctb_size);
+                (pic_w_in_ctbs * tb_per_ctb) as usize
+            },
         }
+    }
+
+    /// Look up the Z-scan order address for a min-TB at picture position
+    /// `(x_tb, y_tb)` in min-TB units. Returns -1 for out-of-bounds (sentinel).
+    pub fn zscan_addr(&self, x_tb: i32, y_tb: i32) -> i32 {
+        // +1 offset accounts for the sentinel row/column at index 0.
+        let col = (x_tb + 1) as usize;
+        let row = (y_tb + 1) as usize;
+        if col >= self.min_tb_addr_zs_stride
+            || row * self.min_tb_addr_zs_stride >= self.min_tb_addr_zs.len()
+        {
+            return -1;
+        }
+        self.min_tb_addr_zs[row * self.min_tb_addr_zs_stride + col]
     }
 }
 
@@ -2933,8 +3019,6 @@ fn compute_luma_avail(state: &PictureState, x0: u32, y0: u32, size: u32) -> Refe
         }
         let n_ctb_rs = (y >> log2_ctb) * pic_w_in_ctbs + (x >> log2_ctb);
         if n_ctb_rs != cur_ctb_rs {
-            // Slice-boundary check: neighbor in a different slice →
-            // unavailable (spec 6.4.4 / 8.4.2).
             let neighbor_slice_addr = state
                 .tab_slice_addr_rs
                 .get(n_ctb_rs as usize)
@@ -2943,10 +3027,6 @@ fn compute_luma_avail(state: &PictureState, x0: u32, y0: u32, size: u32) -> Refe
             if neighbor_slice_addr < 0 || neighbor_slice_addr != cur_slice_addr {
                 return false;
             }
-            // Phase 3c-2 tile-boundary check: intra prediction MUST NOT use
-            // samples from a different tile regardless of the loop filter
-            // flag (spec 6.4.4). `tab_tile_id` is 0 everywhere for
-            // single-tile pictures, so this is a no-op there.
             let neighbor_tile_id = state
                 .tab_tile_id
                 .get(n_ctb_rs as usize)
@@ -2963,22 +3043,18 @@ fn compute_luma_avail(state: &PictureState, x0: u32, y0: u32, size: u32) -> Refe
     let up_left = x0 > 0 && y0 > 0 && pixel_decoded(x0 - 1, y0 - 1);
 
     // Up row exists iff the row above is decoded for x in [x0..x0+size).
-    // For raster scan in a single slice, that's true iff y0 > 0.
     let up = y0 > 0 && pixel_decoded(x0, y0 - 1);
 
-    // Up-right: pixels at (x0 + size .. x0 + 2*size, y0 - 1).
-    // Strict: any of them must be decoded. Simplification: require the
-    // FIRST one to be decoded (raster scan means later columns weren't yet
-    // decoded at the same y).
+    // Up-right: pixels at (x0 + size, y0 - 1).
     let up_right = y0 > 0 && pixel_decoded(x0 + size, y0 - 1);
 
     // Left column exists iff the column to the left is decoded.
     let left = x0 > 0 && pixel_decoded(x0 - 1, y0);
 
-    // Bottom-left: pixels at (x0 - 1, y0 + size .. y0 + 2*size). For raster
-    // scan these are NEVER decoded yet (they're in a row strictly below us).
-    // Be conservative and report unavailable.
-    let _ = pixel_decoded; // silence unused warning if we add more
+    // Bottom-left: for raster scan these are NEVER decoded yet (they're in a
+    // row strictly below us). TODO: implement Z-scan order availability for
+    // CTU=64 where within-CTB bottom-left may be available.
+    let _ = pixel_decoded;
     let bottom_left = false;
 
     ReferenceAvailability {
