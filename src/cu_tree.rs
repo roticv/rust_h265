@@ -82,6 +82,35 @@ pub struct MvField {
     pub pred_flag: u8,
 }
 
+impl MvField {
+    /// Spec-compliant merge candidate comparison (FFmpeg `compare_mv_ref_idx`).
+    /// Only compares the active reference list components based on `pred_flag`.
+    /// Inactive list fields (mv[1]/ref_idx[1] for L0-only, etc.) are ignored.
+    fn merge_eq(&self, other: &Self) -> bool {
+        if self.pred_flag != other.pred_flag {
+            return false;
+        }
+        match self.pred_flag {
+            3 => {
+                // Bi-prediction: compare both lists.
+                self.ref_idx[0] == other.ref_idx[0]
+                    && self.mv[0] == other.mv[0]
+                    && self.ref_idx[1] == other.ref_idx[1]
+                    && self.mv[1] == other.mv[1]
+            }
+            1 => {
+                // L0 only.
+                self.ref_idx[0] == other.ref_idx[0] && self.mv[0] == other.mv[0]
+            }
+            2 => {
+                // L1 only.
+                self.ref_idx[1] == other.ref_idx[1] && self.mv[1] == other.mv[1]
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Slice-level parameters needed by the CU tree for inter decoding.
 /// Threaded through `decode_coding_quadtree` / `decode_coding_unit` so the
 /// syntax decoders can see `slice_type`, `max_num_merge_cand`, etc.
@@ -761,6 +790,10 @@ fn build_merge_candidates(
     }
 
     // --- B1 (above) ---
+    // is_available_b1 is the RAW spatial availability (without A1 prune).
+    // Used by B0 and B2 for their prune checks. The A1 prune only gates
+    // whether B1 is added to the list. Matches FFmpeg where is_available_b1
+    // stays true even when B1 is not added due to the A1 prune.
     let is_available_b1 = if !single_mcl_flag
         && part_idx == 1
         && matches!(
@@ -771,12 +804,12 @@ fn build_merge_candidates(
     {
         false
     } else {
-        let avail = spatial_cand_available(state, x0i, y0i, x_b1, y_b1);
-        // Prune against A1.
-        avail
-            && !(is_available_a1 && tab_mvf_at(state, x_b1, y_b1) == tab_mvf_at(state, x_a1, y_a1))
+        spatial_cand_available(state, x0i, y0i, x_b1, y_b1)
     };
-    if is_available_b1 {
+    if is_available_b1
+        && !(is_available_a1
+            && tab_mvf_at(state, x_b1, y_b1).merge_eq(&tab_mvf_at(state, x_a1, y_a1)))
+    {
         list.push(tab_mvf_at(state, x_b1, y_b1));
         if list.len() >= max_cand {
             return list;
@@ -787,7 +820,8 @@ fn build_merge_candidates(
     let is_available_b0 = spatial_cand_available(state, x0i, y0i, x_b0, y_b0)
         && x_b0 < state.width as i32
         && !is_diff_mer(pl, x_b0, y_b0, x0i, y0i)
-        && !(is_available_b1 && tab_mvf_at(state, x_b0, y_b0) == tab_mvf_at(state, x_b1, y_b1));
+        && !(is_available_b1
+            && tab_mvf_at(state, x_b0, y_b0).merge_eq(&tab_mvf_at(state, x_b1, y_b1)));
     if is_available_b0 {
         list.push(tab_mvf_at(state, x_b0, y_b0));
         if list.len() >= max_cand {
@@ -799,7 +833,8 @@ fn build_merge_candidates(
     let is_available_a0 = spatial_cand_available(state, x0i, y0i, x_a0, y_a0)
         && y_a0 < state.height as i32
         && !is_diff_mer(pl, x_a0, y_a0, x0i, y0i)
-        && !(is_available_a1 && tab_mvf_at(state, x_a0, y_a0) == tab_mvf_at(state, x_a1, y_a1));
+        && !(is_available_a1
+            && tab_mvf_at(state, x_a0, y_a0).merge_eq(&tab_mvf_at(state, x_a1, y_a1)));
     if is_available_a0 {
         list.push(tab_mvf_at(state, x_a0, y_a0));
         if list.len() >= max_cand {
@@ -812,8 +847,10 @@ fn build_merge_candidates(
         #[allow(clippy::nonminimal_bool)]
         let is_available_b2 = spatial_cand_available(state, x0i, y0i, x_b2, y_b2)
             && !is_diff_mer(pl, x_b2, y_b2, x0i, y0i)
-            && !(is_available_a1 && tab_mvf_at(state, x_b2, y_b2) == tab_mvf_at(state, x_a1, y_a1))
-            && !(is_available_b1 && tab_mvf_at(state, x_b2, y_b2) == tab_mvf_at(state, x_b1, y_b1));
+            && !(is_available_a1
+                && tab_mvf_at(state, x_b2, y_b2).merge_eq(&tab_mvf_at(state, x_a1, y_a1)))
+            && !(is_available_b1
+                && tab_mvf_at(state, x_b2, y_b2).merge_eq(&tab_mvf_at(state, x_b1, y_b1)));
         if is_available_b2 {
             list.push(tab_mvf_at(state, x_b2, y_b2));
             if list.len() >= max_cand {
@@ -2211,11 +2248,8 @@ fn decode_coding_unit(
         {
             cabac.decode_bin(&mut contexts.state[ctx::NO_RESIDUAL_DATA_FLAG]) != 0
         } else {
-            // Intra CUs always have a transform tree.
-            // PART_2Nx2N + merge: rqt_root_cbf was not coded.
             pred_mode == PredMode::Intra || (part_mode == PartMode::Part2Nx2N && merge_flag_for_rqt)
         };
-
         if rqt_root_cbf {
             let max_trafo_depth = if pred_mode == PredMode::Intra {
                 sps.max_transform_hierarchy_depth_intra + if intra_split { 1 } else { 0 }
@@ -2665,7 +2699,6 @@ fn decode_transform_unit(
     let cbf_luma = if is_intra || trafo_depth != 0 || inherited.cbf_cb || inherited.cbf_cr {
         decode_cbf_luma(cabac, contexts, trafo_depth) != 0
     } else {
-        // Inter, trafo_depth == 0, no chroma cbf: luma cbf must be 1.
         true
     };
     state.last_cbf_luma = cbf_luma;

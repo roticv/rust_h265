@@ -658,9 +658,19 @@ pub fn motion_compensation_pu(
     } else {
         // Uni-prediction: write directly into the picture planes.
         let (ref_list, mv, ref_idx, use_l0) = if is_l0 {
-            (&ref_frames_l0[mvf.ref_idx[0] as usize], mvf.mv[0], mvf.ref_idx[0] as usize, true)
+            (
+                &ref_frames_l0[mvf.ref_idx[0] as usize],
+                mvf.mv[0],
+                mvf.ref_idx[0] as usize,
+                true,
+            )
         } else {
-            (&ref_frames_l1[mvf.ref_idx[1] as usize], mvf.mv[1], mvf.ref_idx[1] as usize, false)
+            (
+                &ref_frames_l1[mvf.ref_idx[1] as usize],
+                mvf.mv[1],
+                mvf.ref_idx[1] as usize,
+                false,
+            )
         };
 
         if !weighted_pred_flag {
@@ -747,10 +757,18 @@ pub fn motion_compensation_pu(
             // Luma: MC into i16 intermediate, then apply weight.
             let mut pred_y = vec![0i16; w * h];
             mc_luma_i16(
-                &mut pred_y, w,
-                &ref_list.y, ref_list.width as usize,
-                pic_w, pic_h,
-                x0 as i32, y0 as i32, w, h, mv.x, mv.y,
+                &mut pred_y,
+                w,
+                &ref_list.y,
+                ref_list.width as usize,
+                pic_w,
+                pic_h,
+                x0 as i32,
+                y0 as i32,
+                w,
+                h,
+                mv.x,
+                mv.y,
             );
             // Apply weighted prediction: spec 8.5.3.3.4.1
             // For uni-pred weighted: log2WD = luma_log2_weight_denom + (bit_depth - 8)
@@ -782,19 +800,41 @@ pub fn motion_compensation_pu(
             let ref_h_c = (ref_list.height / 2) as i32;
             let ref_uv_stride = (ref_list.width / 2) as usize;
             let c_shift = 6 + chroma_denom as i32;
-            let c_round = if c_shift > 0 { 1i32 << (c_shift - 1) } else { 0 };
+            let c_round = if c_shift > 0 {
+                1i32 << (c_shift - 1)
+            } else {
+                0
+            };
 
             let mut pred_u = vec![0i16; w_c * h_c];
             let mut pred_v = vec![0i16; w_c * h_c];
             mc_chroma_i16(
-                &mut pred_u, w_c,
-                &ref_list.u, ref_uv_stride, ref_w_c, ref_h_c,
-                (x0 / 2) as i32, (y0 / 2) as i32, w_c, h_c, mv.x, mv.y,
+                &mut pred_u,
+                w_c,
+                &ref_list.u,
+                ref_uv_stride,
+                ref_w_c,
+                ref_h_c,
+                (x0 / 2) as i32,
+                (y0 / 2) as i32,
+                w_c,
+                h_c,
+                mv.x,
+                mv.y,
             );
             mc_chroma_i16(
-                &mut pred_v, w_c,
-                &ref_list.v, ref_uv_stride, ref_w_c, ref_h_c,
-                (x0 / 2) as i32, (y0 / 2) as i32, w_c, h_c, mv.x, mv.y,
+                &mut pred_v,
+                w_c,
+                &ref_list.v,
+                ref_uv_stride,
+                ref_w_c,
+                ref_h_c,
+                (x0 / 2) as i32,
+                (y0 / 2) as i32,
+                w_c,
+                h_c,
+                mv.x,
+                mv.y,
             );
 
             let c_off = (y0 as usize / 2) * uv_stride + (x0 as usize / 2);
@@ -805,12 +845,14 @@ pub fn motion_compensation_pu(
                     if dst_idx < state.u_plane.len() {
                         let wu = chroma_w[0] as i32;
                         let ou = chroma_o[0] as i32;
-                        state.u_plane[dst_idx] =
-                            (((pred_u[idx] as i32 * wu + c_round) >> c_shift) + ou).clamp(0, 255) as u8;
+                        state.u_plane[dst_idx] = (((pred_u[idx] as i32 * wu + c_round) >> c_shift)
+                            + ou)
+                            .clamp(0, 255) as u8;
                         let wv = chroma_w[1] as i32;
                         let ov = chroma_o[1] as i32;
-                        state.v_plane[dst_idx] =
-                            (((pred_v[idx] as i32 * wv + c_round) >> c_shift) + ov).clamp(0, 255) as u8;
+                        state.v_plane[dst_idx] = (((pred_v[idx] as i32 * wv + c_round) >> c_shift)
+                            + ov)
+                            .clamp(0, 255) as u8;
                     }
                 }
             }
@@ -919,15 +961,23 @@ pub fn motion_compensation_cu(
     macro_rules! mc_pu {
         ($x:expr, $y:expr, $w:expr, $h:expr) => {
             motion_compensation_pu(
-                state, ref_frames_l0, ref_frames_l1,
-                $x, $y, $w, $h,
-                weighted_pred_flag, pred_weight_table,
+                state,
+                ref_frames_l0,
+                ref_frames_l1,
+                $x,
+                $y,
+                $w,
+                $h,
+                weighted_pred_flag,
+                pred_weight_table,
             )
         };
     }
 
     match part_mode {
-        PartMode::Part2Nx2N => { mc_pu!(x0, y0, cb_size, cb_size); }
+        PartMode::Part2Nx2N => {
+            mc_pu!(x0, y0, cb_size, cb_size);
+        }
         PartMode::Part2NxN => {
             let half = cb_size / 2;
             mc_pu!(x0, y0, cb_size, half);

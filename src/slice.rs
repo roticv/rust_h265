@@ -725,7 +725,9 @@ fn parse_pred_weight_table(
     if chroma_format_idc != 0 {
         chroma_log2_weight_denom += r.read_se()?;
         if !(0..=7).contains(&chroma_log2_weight_denom) {
-            return Err(DecodeError::InvalidSyntax("chroma_log2_weight_denom out of range"));
+            return Err(DecodeError::InvalidSyntax(
+                "chroma_log2_weight_denom out of range",
+            ));
         }
     }
     wt.chroma_log2_weight_denom = chroma_log2_weight_denom as u8;
@@ -790,13 +792,15 @@ fn parse_pred_weight_table(
                 wt.luma_weight_l1[i] = luma_denom;
                 wt.luma_offset_l1[i] = 0;
             }
-            if chroma_format_idc != 0 && i < chroma_weight_l1_flag.len() && chroma_weight_l1_flag[i] {
+            if chroma_format_idc != 0 && i < chroma_weight_l1_flag.len() && chroma_weight_l1_flag[i]
+            {
                 for j in 0..2 {
                     let delta_w = r.read_se()? as i16;
                     let delta_o = r.read_se()? as i32;
                     wt.chroma_weight_l1[i][j] = chroma_denom + delta_w;
                     wt.chroma_offset_l1[i][j] = (delta_o
-                        - ((128i32 * wt.chroma_weight_l1[i][j] as i32) >> wt.chroma_log2_weight_denom)
+                        - ((128i32 * wt.chroma_weight_l1[i][j] as i32)
+                            >> wt.chroma_log2_weight_denom)
                         + 128)
                         .clamp(-128, 127) as i16;
                 }

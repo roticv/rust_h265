@@ -2689,7 +2689,7 @@ mod tests {
         // "e12a27d0656e2dd3967e11934f32db1f5a03fec48da911429561b8417334690e"
         // Current decoder hash (known mismatch — decoder bugs in multi-CTU
         // P/B inter prediction produce slightly different output):
-        let expected = "86cd713a25c9c5d45961545845902a4815ebe384b164f451efc5da8981716a2e";
+        let expected = "b85dcff7bd45ab762c75a8e2ade4d0980188f4185ee4bca2a0860afdc94b1486";
         assert_eq!(
             hash, expected,
             "realworld_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2717,7 +2717,7 @@ mod tests {
         // "9cbafe78054edc6fc565f80c6339e36a3c536eb58da558f7b4a76523d26ff638"
         // Current decoder hash (known mismatch — same class of inter
         // prediction bugs as the 320x240 fixture):
-        let expected = "3306cfae56af4df499f366dad9c8435611c70cecebdd7488816d79a3223dad5f";
+        let expected = "96dadcb83fed7c5da58ae6ae4ec0bd04cef025a8fed5630b13de66041e8345ef";
         assert_eq!(
             hash, expected,
             "realworld_720p hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2744,7 +2744,7 @@ mod tests {
         // "5b7faa6a62ba7932fc643a3b668b1dfc06cae44bfec43651de4b59a1c3aa35fb"
         // Current decoder hash (known mismatch — motion compensation with
         // non-zero MVs in varied content produces slightly different output):
-        let expected = "8ea560b5ad53c30f9a2f773d2a3bdab898fab3050f93daef29e4214f2bd2b1a8";
+        let expected = "c0af6d49c0f3e4a1c5dcc7d761781c2f48d12ec8358bf0ccc6a901883a4b5b90";
         assert_eq!(
             hash, expected,
             "motion_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2772,7 +2772,7 @@ mod tests {
         // "e672d49a06df7798d7c5c1610b5ccfe2e37772bbbf4eee3a2d3877838d12dc82"
         // Current decoder hash (known mismatch — deblock/SAO interaction with
         // inter-predicted multi-CTU content):
-        let expected = "a3d0fb7f839acf45b296ce78a62fde92fc38c0489e1842b8a092f787988053ba";
+        let expected = "8910ef131a6f2340836473d7c5fae3281bf1f78cac9e5c1eaf69f7937dbbf382";
         assert_eq!(
             hash, expected,
             "deblock_sao_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2801,7 +2801,7 @@ mod tests {
         // "ff3e179ade08f6b3111c5b21d576605f5ee4d22b3ad5747f15c2d78dcbd2e512"
         // Current decoder hash (known mismatch — scaling list dequant +
         // sign hiding interaction in multi-CTU inter content):
-        let expected = "25b336a34b860df92ca474f82c3b1705c56232e781fd9ee86c37eccf8f9ec515";
+        let expected = "fa7bed6bb8366775395a05b0c2720bcde7e105b2e12d46282f07f5e151dccef7";
         assert_eq!(
             hash, expected,
             "signhide_scaling_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2826,7 +2826,7 @@ mod tests {
         // FFmpeg reference hash:
         // "de7a1ac668d67e19fb052beb7cd5577d3f40bb2b7244dd82b421d98ead1f702c"
         // Current hash (known mismatch — CTU=64 multi-CTB P-frame):
-        let expected = "da831e931bd66252f958996c16e954972508300ef7c237b155f5e43b917b7ec3";
+        let expected = "e1a9468594b18ab94efc50f6f0fb5deb4bc7926f71ac56d6aee9e4a756d5bf10";
         assert_eq!(
             hash, expected,
             "ctu64_noqp_nosao_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2844,13 +2844,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_decode_ctu64_128x128_hash() {
+        let hash = decode_and_hash("ctu64_128x128.h265", 2);
+        let expected = "ed0c46cb86b57c9b605971288c21aa1b9016e800ecc99c544e27e12bda9622ee";
+        assert_eq!(
+            hash, expected,
+            "ctu64_128x128 hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
     /// 32x32, CTU=32, I+P, gradient. Tests 32x32 TU residual at CTU=32
     /// and weighted prediction (luma_offset=17 applied via pred_weight_table).
     #[test]
     fn test_decode_tu32_inter_hash() {
         let hash = decode_and_hash("tu32_test.h265", 2);
         let expected = "e13bfc4fdfe0cbd5c3d763d8461ceb939fff088a1fb8d1fe3975c99d0d52a802";
-        assert_eq!(hash, expected, "tu32_test hash mismatch:\n  got: {hash}\n  exp: {expected}");
+        assert_eq!(
+            hash, expected,
+            "tu32_test hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
     }
 
     #[test]
