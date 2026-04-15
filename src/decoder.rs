@@ -2526,11 +2526,10 @@ mod tests {
         }
     }
 
-    /// Phase 3f: 1080p hash-only test.
+    /// Phase 3f: 1080p hash test.
     ///
     /// Decodes a 1920x1080 10-frame P-only sequence and verifies all 10
-    /// frames decode without crashing. SHA-256 hash is logged but not
-    /// asserted (known mismatch vs FFmpeg, to be fixed).
+    /// frames decode correctly (byte-exact with FFmpeg).
     ///
     /// Fixture: `testdata/1080p.h265`
     /// Generated with:
@@ -2685,10 +2684,6 @@ mod tests {
     #[test]
     fn test_decode_realworld_320x240_byte_exact() {
         let hash = decode_and_hash("realworld_320x240.h265", 30);
-        // FFmpeg reference hash (target for byte-exact conformance):
-        // "e12a27d0656e2dd3967e11934f32db1f5a03fec48da911429561b8417334690e"
-        // Current decoder hash (known mismatch — decoder bugs in multi-CTU
-        // P/B inter prediction produce slightly different output):
         let expected = "e12a27d0656e2dd3967e11934f32db1f5a03fec48da911429561b8417334690e";
         assert_eq!(
             hash, expected,
@@ -2713,10 +2708,6 @@ mod tests {
     #[test]
     fn test_decode_realworld_720p_hash() {
         let hash = decode_and_hash("realworld_720p.h265", 10);
-        // FFmpeg reference hash (target for byte-exact conformance):
-        // "9cbafe78054edc6fc565f80c6339e36a3c536eb58da558f7b4a76523d26ff638"
-        // Current decoder hash (known mismatch — same class of inter
-        // prediction bugs as the 320x240 fixture):
         let expected = "9cbafe78054edc6fc565f80c6339e36a3c536eb58da558f7b4a76523d26ff638";
         assert_eq!(
             hash, expected,
@@ -2740,8 +2731,6 @@ mod tests {
     #[test]
     fn test_decode_motion_320x240_hash() {
         let hash = decode_and_hash("motion_320x240.h265", 20);
-        // FFmpeg reference hash (target for byte-exact conformance):
-        // "5b7faa6a62ba7932fc643a3b668b1dfc06cae44bfec43651de4b59a1c3aa35fb"
         let expected = "5b7faa6a62ba7932fc643a3b668b1dfc06cae44bfec43651de4b59a1c3aa35fb";
         assert_eq!(
             hash, expected,
@@ -2766,10 +2755,8 @@ mod tests {
     #[test]
     fn test_decode_deblock_sao_320x240_hash() {
         let hash = decode_and_hash("deblock_sao_320x240.h265", 10);
-        // FFmpeg reference hash (target for byte-exact conformance):
+        // Known mismatch — deblock/SAO interaction. FFmpeg reference:
         // "e672d49a06df7798d7c5c1610b5ccfe2e37772bbbf4eee3a2d3877838d12dc82"
-        // Current decoder hash (known mismatch — deblock/SAO interaction with
-        // inter-predicted multi-CTU content):
         let expected = "a4d3520c78a31f036ffa5a08c6e785f996abcf0caefce78f575c11a4cec69bc1";
         assert_eq!(
             hash, expected,
@@ -2795,8 +2782,6 @@ mod tests {
     #[test]
     fn test_decode_signhide_scaling_320x240_hash() {
         let hash = decode_and_hash("signhide_scaling_320x240.h265", 10);
-        // FFmpeg reference hash (target for byte-exact conformance):
-        // "ff3e179ade08f6b3111c5b21d576605f5ee4d22b3ad5747f15c2d78dcbd2e512"
         let expected = "ff3e179ade08f6b3111c5b21d576605f5ee4d22b3ad5747f15c2d78dcbd2e512";
         assert_eq!(
             hash, expected,
