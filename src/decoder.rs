@@ -2689,7 +2689,7 @@ mod tests {
         // "e12a27d0656e2dd3967e11934f32db1f5a03fec48da911429561b8417334690e"
         // Current decoder hash (known mismatch — decoder bugs in multi-CTU
         // P/B inter prediction produce slightly different output):
-        let expected = "b85dcff7bd45ab762c75a8e2ade4d0980188f4185ee4bca2a0860afdc94b1486";
+        let expected = "e12a27d0656e2dd3967e11934f32db1f5a03fec48da911429561b8417334690e";
         assert_eq!(
             hash, expected,
             "realworld_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2717,7 +2717,7 @@ mod tests {
         // "9cbafe78054edc6fc565f80c6339e36a3c536eb58da558f7b4a76523d26ff638"
         // Current decoder hash (known mismatch — same class of inter
         // prediction bugs as the 320x240 fixture):
-        let expected = "96dadcb83fed7c5da58ae6ae4ec0bd04cef025a8fed5630b13de66041e8345ef";
+        let expected = "9cbafe78054edc6fc565f80c6339e36a3c536eb58da558f7b4a76523d26ff638";
         assert_eq!(
             hash, expected,
             "realworld_720p hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2742,9 +2742,7 @@ mod tests {
         let hash = decode_and_hash("motion_320x240.h265", 20);
         // FFmpeg reference hash (target for byte-exact conformance):
         // "5b7faa6a62ba7932fc643a3b668b1dfc06cae44bfec43651de4b59a1c3aa35fb"
-        // Current decoder hash (known mismatch — motion compensation with
-        // non-zero MVs in varied content produces slightly different output):
-        let expected = "c0af6d49c0f3e4a1c5dcc7d761781c2f48d12ec8358bf0ccc6a901883a4b5b90";
+        let expected = "5b7faa6a62ba7932fc643a3b668b1dfc06cae44bfec43651de4b59a1c3aa35fb";
         assert_eq!(
             hash, expected,
             "motion_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2772,7 +2770,7 @@ mod tests {
         // "e672d49a06df7798d7c5c1610b5ccfe2e37772bbbf4eee3a2d3877838d12dc82"
         // Current decoder hash (known mismatch — deblock/SAO interaction with
         // inter-predicted multi-CTU content):
-        let expected = "8910ef131a6f2340836473d7c5fae3281bf1f78cac9e5c1eaf69f7937dbbf382";
+        let expected = "a4d3520c78a31f036ffa5a08c6e785f996abcf0caefce78f575c11a4cec69bc1";
         assert_eq!(
             hash, expected,
             "deblock_sao_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2799,9 +2797,7 @@ mod tests {
         let hash = decode_and_hash("signhide_scaling_320x240.h265", 10);
         // FFmpeg reference hash (target for byte-exact conformance):
         // "ff3e179ade08f6b3111c5b21d576605f5ee4d22b3ad5747f15c2d78dcbd2e512"
-        // Current decoder hash (known mismatch — scaling list dequant +
-        // sign hiding interaction in multi-CTU inter content):
-        let expected = "fa7bed6bb8366775395a05b0c2720bcde7e105b2e12d46282f07f5e151dccef7";
+        let expected = "ff3e179ade08f6b3111c5b21d576605f5ee4d22b3ad5747f15c2d78dcbd2e512";
         assert_eq!(
             hash, expected,
             "signhide_scaling_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"

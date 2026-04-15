@@ -1071,7 +1071,6 @@ fn derive_temporal_colocated_mvs(
     };
 
     if temp_col.pred_flag == 0 {
-        // Intra PU — no temporal candidate.
         return None;
     }
 
@@ -1321,6 +1320,7 @@ fn amvp_spatial_candidate(
     positions: &[(i32, i32)],
     ref_idx_curr: usize,
     ref_idx: i8,
+    same_ref_only: bool,
 ) -> (Option<Mv>, bool) {
     let pred_flag_l0 = ref_idx_curr;
     let pred_flag_l1 = 1 - ref_idx_curr;
@@ -1354,7 +1354,15 @@ fn amvp_spatial_candidate(
         }
     }
 
-    // Pass 2: scaled-ref fallback.
+    // Pass 2: scaled-ref fallback. Skipped for the above (B) group when
+    // isScaledFlag_L0 is true, per HEVC spec 8.5.3.2.6 step 3: the B
+    // candidates are only checked with "LtRefPicList" scaling (steps 3.a–c)
+    // when isScaledFlagLX is 0. When isScaledFlagLX is 1, steps 3.a–c
+    // are skipped and the B candidates use only the same-ref check from
+    // step 2.
+    if same_ref_only {
+        return (None, false);
+    }
     for &(x_n, y_n) in positions {
         if !spatial_cand_available(state, x0, y0, x_n, y_n) {
             continue;
@@ -1434,6 +1442,7 @@ fn build_amvp_candidates(
         &left_positions,
         list_idx,
         ref_idx,
+        false, // left group always tries both passes
     );
 
     // Above candidates: B0 (above-right), B1 (above), B2 (above-left).
@@ -1451,6 +1460,7 @@ fn build_amvp_candidates(
         &above_positions,
         list_idx,
         ref_idx,
+        is_scaled_flag_l0, // above group: same-ref only when isScaledFlag_L0
     );
 
     // FFmpeg `scalef` block: when !isScaledFlag_L0, the above candidate
