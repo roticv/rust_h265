@@ -2822,7 +2822,7 @@ mod tests {
         // "de7a1ac668d67e19fb052beb7cd5577d3f40bb2b7244dd82b421d98ead1f702c"
         // Current decoder hash (known mismatch — CTU=64 intra prediction
         // reference sample availability for up-right/bottom-left):
-        let expected = "ee9da79c3f1d0d412e96e42fbb0a27420c9abf47c2c17d583c05d53b2ba605b7";
+        let expected = "da831e931bd66252f958996c16e954972508300ef7c237b155f5e43b917b7ec3";
         assert_eq!(
             hash, expected,
             "ctu64_noqp_nosao_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
@@ -2837,6 +2837,104 @@ mod tests {
         assert_eq!(
             hash, expected,
             "flat64 hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic — requires /tmp/grad64_ffmpeg.yuv from FFmpeg"]
+    fn diag_grad64_pixel() {
+        let ref_yuv = std::fs::read("/tmp/grad64_ffmpeg.yuv").expect("read ref yuv");
+        let h265 =
+            std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/grad64.h265")).unwrap();
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+        let mut frame = None;
+        for nal in &nals {
+            if let Ok(Some(f)) = decoder.decode_nal(nal) {
+                frame = Some(f);
+            }
+        }
+        if frame.is_none() {
+            if let Some(f) = decoder.flush() {
+                frame = Some(f);
+            }
+        }
+        let frame = frame.expect("no frame decoded");
+        let w = 64usize;
+        let h = 64usize;
+        // Compare Y plane
+        let mut first_y: Option<(usize, usize, u8, u8)> = None;
+        let mut y_count = 0u32;
+        for j in 0..h {
+            for i in 0..w {
+                let ours = frame.y[j * w + i];
+                let theirs = ref_yuv[j * w + i];
+                if ours != theirs {
+                    y_count += 1;
+                    if first_y.is_none() {
+                        first_y = Some((i, j, ours, theirs));
+                    }
+                }
+            }
+        }
+        eprintln!("Y mismatches: {y_count}");
+        if let Some((x, y, ours, theirs)) = first_y {
+            eprintln!(
+                "First Y mismatch at ({x},{y}): ours={ours} ffmpeg={theirs} diff={}",
+                ours as i32 - theirs as i32
+            );
+            // Dump 8x8 region around first mismatch
+            let rx = (x / 8) * 8;
+            let ry = (y / 8) * 8;
+            eprintln!("8x8 block ({},{})-({},{}):", rx, ry, rx + 7, ry + 7);
+            for jj in ry..ry + 8 {
+                let mut line = format!("  y={jj:2}: ");
+                for ii in rx..(rx + 16).min(w) {
+                    let o = frame.y[jj * w + ii];
+                    let r = ref_yuv[jj * w + ii];
+                    if o == r {
+                        line += &format!("{o:4}");
+                    } else {
+                        line += &format!("{:+4}", o as i32 - r as i32);
+                    }
+                }
+                eprintln!("{line}");
+            }
+        }
+        if y_count > 0 {
+            // Show per-8x8 block mismatch counts
+            eprintln!("\nPer-8x8 block Y mismatch counts:");
+            for by in 0..h / 8 {
+                for bx in 0..w / 8 {
+                    let mut cnt = 0u32;
+                    for jj in 0..8 {
+                        for ii in 0..8 {
+                            let y = by * 8 + jj;
+                            let x = bx * 8 + ii;
+                            if frame.y[y * w + x] != ref_yuv[y * w + x] {
+                                cnt += 1;
+                            }
+                        }
+                    }
+                    if cnt > 0 {
+                        eprint!("  ({},{}): {cnt}", bx * 8, by * 8);
+                    }
+                }
+            }
+            eprintln!();
+        }
+        assert_eq!(y_count, 0, "{y_count} Y mismatches");
+    }
+
+    /// 64x64, 1 I-frame, CTU=64, 2D gradient content — byte-exact.
+    /// Tests PART_NxN per-sub-CU intra mode lookup via tab_ipm.
+    #[test]
+    fn test_decode_ctu64_grad64_hash() {
+        let hash = decode_and_hash("grad64.h265", 1);
+        let expected = "9ca645aeecb7492ec294734478e5e8683ed8e872228977e35dd42ca054b9025d";
+        assert_eq!(
+            hash, expected,
+            "grad64 hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
     }
 

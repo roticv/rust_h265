@@ -2642,7 +2642,12 @@ fn decode_transform_unit(
 
     // ---- Step 1: luma intra prediction (only for intra CUs).
     if is_intra {
-        let luma_mode = state.last_luma_pred_mode;
+        // For PART_NxN (intra_split), each sub-CU has its own mode stored
+        // in tab_ipm. Look it up from the TU position rather than using the
+        // CU-level `last_luma_pred_mode` which only holds mode[0].
+        let x_pu = (x0 >> state.log2_min_pu_size) as usize;
+        let y_pu = (y0 >> state.log2_min_pu_size) as usize;
+        let luma_mode = state.tab_ipm[y_pu * state.min_pu_width + x_pu];
         predict_intra_luma(state, sps, x0, y0, log2_trafo_size, luma_mode)?;
     }
 
@@ -2683,7 +2688,10 @@ fn decode_transform_unit(
         // ---- Step 3: luma residual_coding + IDCT + reconstruction.
         if cbf_luma {
             let scan_idx = if is_intra {
-                pick_scan_order(log2_trafo_size, state.last_luma_pred_mode)
+                let x_pu = (x0 >> state.log2_min_pu_size) as usize;
+                let y_pu = (y0 >> state.log2_min_pu_size) as usize;
+                let luma_mode = state.tab_ipm[y_pu * state.min_pu_width + x_pu];
+                pick_scan_order(log2_trafo_size, luma_mode)
             } else {
                 ScanOrder::Diag
             };
@@ -2952,6 +2960,12 @@ fn predict_intra_luma(
     // modes at size > 4. The function handles the DC and size exclusions
     // internally. PLANAR (mode 0) IS filtered — this was a prior bug where
     // we only filtered modes 2..34.
+    if (x0 == 56 || x0 == 60) && y0 == 32 && log2_size == 2 {
+        eprintln!(
+            "RS_PRED ({x0},{y0}) sz={size} mode={mode} ref: tl={} top={},{},{},{} left={},{},{},{}",
+            top[0], top[1], top[2], top[3], top[4], left[1], left[2], left[3], left[4]
+        );
+    }
     if mode != 1 {
         filter_reference_samples(
             &mut top,
@@ -2962,6 +2976,14 @@ fn predict_intra_luma(
             0, // c_idx = 0 (luma)
             sps.chroma_format_idc,
         );
+    }
+
+    if x0 == 56 && y0 == 32 && log2_size == 2 {
+        eprintln!("  filtered top[0..9] = {:?}", &top[..9.min(top.len())]);
+        eprintln!("  filtered left[0..9] = {:?}", &left[..9.min(left.len())]);
+    }
+    if x0 >= 48 && x0 <= 60 && y0 >= 32 && y0 <= 40 && log2_size == 2 {
+        eprintln!("PRED_LUMA_PRE ({x0},{y0}) mode={mode}");
     }
 
     let dst_stride = state.y_stride;
@@ -3100,6 +3122,12 @@ fn compute_luma_avail(state: &PictureState, x0: u32, y0: u32, size: u32) -> Refe
     let up = cand_up && y0 > 0;
     let left = cand_left && x0 > 0;
     let up_left = cand_up_left && x0 > 0 && y0 > 0;
+
+    if x0 >= 32 && y0 >= 32 && x0 < 64 && y0 < 48 {
+        eprintln!(
+            "AVAIL ({x0},{y0}) sz={size} up_left={up_left} up={up} up_right={up_right} left={left} bottom_left={bottom_left} | cand: up={cand_up} left={cand_left} ur={cand_up_right} bl={cand_bottom_left} | x0b={x0b} y0b={y0b} | xtb={x_tb} ytb={y_tb} cur_z={cur_z}"
+        );
+    }
 
     ReferenceAvailability {
         up_left,
