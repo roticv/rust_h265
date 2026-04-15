@@ -444,6 +444,7 @@ impl Decoder {
             sh.collocated_ref_idx = parent.collocated_ref_idx;
             sh.max_num_merge_cand = parent.max_num_merge_cand;
             sh.ref_pic_list_modification = parent.ref_pic_list_modification.clone();
+            sh.pred_weight_table = parent.pred_weight_table.clone();
             sh.poc = parent.poc;
         }
 
@@ -667,6 +668,9 @@ impl Decoder {
             collocated_ref,
             slice_temporal_mvp_enabled_flag: sh.slice_temporal_mvp_enabled_flag,
             collocated_from_l0_flag: sh.collocated_from_l0_flag,
+            weighted_pred_flag: (pps.weighted_pred_flag && sh.slice_type == SliceType::P)
+                || (pps.weighted_bipred_flag && sh.slice_type == SliceType::B),
+            pred_weight_table: sh.pred_weight_table.clone(),
         };
 
         let mut more_data = true;
@@ -1257,6 +1261,7 @@ mod tests {
             collocated_ref_idx: 0,
             max_num_merge_cand: 5,
             ref_pic_list_modification,
+            pred_weight_table: crate::slice::PredWeightTable::default(),
             nal_unit_type: NalUnitType::TrailR,
             temporal_id: 0,
             poc: 10,
@@ -2818,10 +2823,9 @@ mod tests {
     #[test]
     fn test_decode_ctu64_320x240_hash() {
         let hash = decode_and_hash("ctu64_noqp_nosao_320x240.h265", 5);
-        // FFmpeg reference hash (target for byte-exact conformance):
+        // FFmpeg reference hash:
         // "de7a1ac668d67e19fb052beb7cd5577d3f40bb2b7244dd82b421d98ead1f702c"
-        // Current decoder hash (known mismatch — CTU=64 intra prediction
-        // reference sample availability for up-right/bottom-left):
+        // Current hash (known mismatch — CTU=64 multi-CTB P-frame):
         let expected = "da831e931bd66252f958996c16e954972508300ef7c237b155f5e43b917b7ec3";
         assert_eq!(
             hash, expected,
@@ -2838,6 +2842,15 @@ mod tests {
             hash, expected,
             "flat64 hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
+    }
+
+    /// 32x32, CTU=32, I+P, gradient. Tests 32x32 TU residual at CTU=32
+    /// and weighted prediction (luma_offset=17 applied via pred_weight_table).
+    #[test]
+    fn test_decode_tu32_inter_hash() {
+        let hash = decode_and_hash("tu32_test.h265", 2);
+        let expected = "e13bfc4fdfe0cbd5c3d763d8461ceb939fff088a1fb8d1fe3975c99d0d52a802";
+        assert_eq!(hash, expected, "tu32_test hash mismatch:\n  got: {hash}\n  exp: {expected}");
     }
 
     #[test]

@@ -478,6 +478,8 @@ pub fn motion_compensation_pu(
     y0: u32,
     n_pb_w: u32,
     n_pb_h: u32,
+    weighted_pred_flag: bool,
+    pred_weight_table: &crate::slice::PredWeightTable,
 ) {
     // Read the MV field from the top-left min-PU of this PU.
     let x_pu = (x0 >> state.log2_min_pu_size) as usize;
@@ -655,75 +657,164 @@ pub fn motion_compensation_pu(
         }
     } else {
         // Uni-prediction: write directly into the picture planes.
-        let (ref_list, mv) = if is_l0 {
-            (&ref_frames_l0[mvf.ref_idx[0] as usize], mvf.mv[0])
+        let (ref_list, mv, ref_idx, use_l0) = if is_l0 {
+            (&ref_frames_l0[mvf.ref_idx[0] as usize], mvf.mv[0], mvf.ref_idx[0] as usize, true)
         } else {
-            (&ref_frames_l1[mvf.ref_idx[1] as usize], mvf.mv[1])
+            (&ref_frames_l1[mvf.ref_idx[1] as usize], mvf.mv[1], mvf.ref_idx[1] as usize, false)
         };
 
-        // Luma MC.
-        let y_off = (y0 as usize) * y_stride + (x0 as usize);
-        mc_luma(
-            &mut state.y_plane[y_off..],
-            y_stride,
-            &ref_list.y,
-            ref_list.width as usize,
-            pic_w,
-            pic_h,
-            x0 as i32,
-            y0 as i32,
-            w,
-            h,
-            mv.x,
-            mv.y,
-        );
+        if !weighted_pred_flag {
+            // Non-weighted: write prediction samples directly.
+            let y_off = (y0 as usize) * y_stride + (x0 as usize);
+            mc_luma(
+                &mut state.y_plane[y_off..],
+                y_stride,
+                &ref_list.y,
+                ref_list.width as usize,
+                pic_w,
+                pic_h,
+                x0 as i32,
+                y0 as i32,
+                w,
+                h,
+                mv.x,
+                mv.y,
+            );
 
-        // Chroma MC (4:2:0).
-        let w_c = w / 2;
-        let h_c = h / 2;
-        let x0_c = (x0 / 2) as i32;
-        let y0_c = (y0 / 2) as i32;
-        let ref_w_c = (ref_list.width / 2) as i32;
-        let ref_h_c = (ref_list.height / 2) as i32;
-        let ref_uv_stride = (ref_list.width / 2) as usize;
-        // Chroma MV for 4:2:0: the luma MV (in quarter-pel luma units) maps
-        // directly to eighth-pel chroma units. The integer part is `mv >> 3`
-        // and the 3-bit fractional part is `mv & 7`. We pass the LUMA MV
-        // unchanged — `mc_chroma` uses `>> 3` / `& 7` internally.
-        // This matches FFmpeg: `mx = av_zero_extend(mv->x, 2 + hshift)`,
-        // `x_off = (x0 >> hshift) + (mv->x >> (2 + hshift))`.
-        let mv_x_c = mv.x as i32;
-        let mv_y_c = mv.y as i32;
+            let w_c = w / 2;
+            let h_c = h / 2;
+            let x0_c = (x0 / 2) as i32;
+            let y0_c = (y0 / 2) as i32;
+            let ref_w_c = (ref_list.width / 2) as i32;
+            let ref_h_c = (ref_list.height / 2) as i32;
+            let ref_uv_stride = (ref_list.width / 2) as usize;
+            let mv_x_c = mv.x as i32;
+            let mv_y_c = mv.y as i32;
 
-        let c_off = (y0 as usize / 2) * uv_stride + (x0 as usize / 2);
-        mc_chroma(
-            &mut state.u_plane[c_off..],
-            uv_stride,
-            &ref_list.u,
-            ref_uv_stride,
-            ref_w_c,
-            ref_h_c,
-            x0_c,
-            y0_c,
-            w_c,
-            h_c,
-            mv_x_c as i16,
-            mv_y_c as i16,
-        );
-        mc_chroma(
-            &mut state.v_plane[c_off..],
-            uv_stride,
-            &ref_list.v,
-            ref_uv_stride,
-            ref_w_c,
-            ref_h_c,
-            x0_c,
-            y0_c,
-            w_c,
-            h_c,
-            mv_x_c as i16,
-            mv_y_c as i16,
-        );
+            let c_off = (y0 as usize / 2) * uv_stride + (x0 as usize / 2);
+            mc_chroma(
+                &mut state.u_plane[c_off..],
+                uv_stride,
+                &ref_list.u,
+                ref_uv_stride,
+                ref_w_c,
+                ref_h_c,
+                x0_c,
+                y0_c,
+                w_c,
+                h_c,
+                mv_x_c as i16,
+                mv_y_c as i16,
+            );
+            mc_chroma(
+                &mut state.v_plane[c_off..],
+                uv_stride,
+                &ref_list.v,
+                ref_uv_stride,
+                ref_w_c,
+                ref_h_c,
+                x0_c,
+                y0_c,
+                w_c,
+                h_c,
+                mv_x_c as i16,
+                mv_y_c as i16,
+            );
+        } else {
+            // Weighted uni-prediction: compute MC at i16 precision, then apply
+            // weight/offset per HEVC spec 8.5.3.3.4.1 / FFmpeg put_hevc_qpel_uni_w.
+            let wt = pred_weight_table;
+            let (luma_w, luma_o, chroma_w, chroma_o, luma_denom, chroma_denom) = if use_l0 {
+                (
+                    wt.luma_weight_l0[ref_idx] as i32,
+                    wt.luma_offset_l0[ref_idx] as i32,
+                    wt.chroma_weight_l0[ref_idx],
+                    wt.chroma_offset_l0[ref_idx],
+                    wt.luma_log2_weight_denom,
+                    wt.chroma_log2_weight_denom,
+                )
+            } else {
+                (
+                    wt.luma_weight_l1[ref_idx] as i32,
+                    wt.luma_offset_l1[ref_idx] as i32,
+                    wt.chroma_weight_l1[ref_idx],
+                    wt.chroma_offset_l1[ref_idx],
+                    wt.luma_log2_weight_denom,
+                    wt.chroma_log2_weight_denom,
+                )
+            };
+
+            // Luma: MC into i16 intermediate, then apply weight.
+            let mut pred_y = vec![0i16; w * h];
+            mc_luma_i16(
+                &mut pred_y, w,
+                &ref_list.y, ref_list.width as usize,
+                pic_w, pic_h,
+                x0 as i32, y0 as i32, w, h, mv.x, mv.y,
+            );
+            // Apply weighted prediction: spec 8.5.3.3.4.1
+            // For uni-pred weighted: log2WD = luma_log2_weight_denom + (bit_depth - 8)
+            // For 8-bit: log2WD = luma_log2_weight_denom
+            // FFmpeg's put_hevc_qpel_uni_w uses:
+            //   (((val >> (14 - 8)) * weight + (1 << (log2WD + 14 - 8 - 1))) >> (log2WD + 14 - 8)) + offset
+            // The i16 intermediate from mc_luma_i16 is at "shift-6" precision:
+            //   integer-pel: pixel << 6
+            //   sub-pel: raw filter output (also effectively << 6 for single-pass)
+            // So we need: clip((pred_i16 * weight + round) >> (6 + denom)) + offset
+            let shift = 6 + luma_denom as i32;
+            let round = if shift > 0 { 1i32 << (shift - 1) } else { 0 };
+            let y_off = (y0 as usize) * y_stride + (x0 as usize);
+            for j in 0..h {
+                for i in 0..w {
+                    let val = pred_y[j * w + i] as i32;
+                    let weighted = ((val * luma_w + round) >> shift) + luma_o;
+                    let dst_idx = y_off + j * y_stride + i;
+                    if dst_idx < state.y_plane.len() {
+                        state.y_plane[dst_idx] = weighted.clamp(0, 255) as u8;
+                    }
+                }
+            }
+
+            // Chroma: similar weighted path.
+            let w_c = w / 2;
+            let h_c = h / 2;
+            let ref_w_c = (ref_list.width / 2) as i32;
+            let ref_h_c = (ref_list.height / 2) as i32;
+            let ref_uv_stride = (ref_list.width / 2) as usize;
+            let c_shift = 6 + chroma_denom as i32;
+            let c_round = if c_shift > 0 { 1i32 << (c_shift - 1) } else { 0 };
+
+            let mut pred_u = vec![0i16; w_c * h_c];
+            let mut pred_v = vec![0i16; w_c * h_c];
+            mc_chroma_i16(
+                &mut pred_u, w_c,
+                &ref_list.u, ref_uv_stride, ref_w_c, ref_h_c,
+                (x0 / 2) as i32, (y0 / 2) as i32, w_c, h_c, mv.x, mv.y,
+            );
+            mc_chroma_i16(
+                &mut pred_v, w_c,
+                &ref_list.v, ref_uv_stride, ref_w_c, ref_h_c,
+                (x0 / 2) as i32, (y0 / 2) as i32, w_c, h_c, mv.x, mv.y,
+            );
+
+            let c_off = (y0 as usize / 2) * uv_stride + (x0 as usize / 2);
+            for j in 0..h_c {
+                for i in 0..w_c {
+                    let idx = j * w_c + i;
+                    let dst_idx = c_off + j * uv_stride + i;
+                    if dst_idx < state.u_plane.len() {
+                        let wu = chroma_w[0] as i32;
+                        let ou = chroma_o[0] as i32;
+                        state.u_plane[dst_idx] =
+                            (((pred_u[idx] as i32 * wu + c_round) >> c_shift) + ou).clamp(0, 255) as u8;
+                        let wv = chroma_w[1] as i32;
+                        let ov = chroma_o[1] as i32;
+                        state.v_plane[dst_idx] =
+                            (((pred_v[idx] as i32 * wv + c_round) >> c_shift) + ov).clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -819,112 +910,59 @@ pub fn motion_compensation_cu(
     y0: u32,
     cb_size: u32,
     part_mode: crate::cu_tree::PartMode,
+    weighted_pred_flag: bool,
+    pred_weight_table: &crate::slice::PredWeightTable,
 ) {
     use crate::cu_tree::PartMode;
 
-    match part_mode {
-        PartMode::Part2Nx2N => {
+    // Local helper to reduce repetition when threading weight params.
+    macro_rules! mc_pu {
+        ($x:expr, $y:expr, $w:expr, $h:expr) => {
             motion_compensation_pu(
-                state,
-                ref_frames_l0,
-                ref_frames_l1,
-                x0,
-                y0,
-                cb_size,
-                cb_size,
-            );
-        }
+                state, ref_frames_l0, ref_frames_l1,
+                $x, $y, $w, $h,
+                weighted_pred_flag, pred_weight_table,
+            )
+        };
+    }
+
+    match part_mode {
+        PartMode::Part2Nx2N => { mc_pu!(x0, y0, cb_size, cb_size); }
         PartMode::Part2NxN => {
             let half = cb_size / 2;
-            motion_compensation_pu(state, ref_frames_l0, ref_frames_l1, x0, y0, cb_size, half);
-            motion_compensation_pu(
-                state,
-                ref_frames_l0,
-                ref_frames_l1,
-                x0,
-                y0 + half,
-                cb_size,
-                half,
-            );
+            mc_pu!(x0, y0, cb_size, half);
+            mc_pu!(x0, y0 + half, cb_size, half);
         }
         PartMode::PartNx2N => {
             let half = cb_size / 2;
-            motion_compensation_pu(state, ref_frames_l0, ref_frames_l1, x0, y0, half, cb_size);
-            motion_compensation_pu(
-                state,
-                ref_frames_l0,
-                ref_frames_l1,
-                x0 + half,
-                y0,
-                half,
-                cb_size,
-            );
+            mc_pu!(x0, y0, half, cb_size);
+            mc_pu!(x0 + half, y0, half, cb_size);
         }
         PartMode::Part2NxnU => {
             let q = cb_size / 4;
-            motion_compensation_pu(state, ref_frames_l0, ref_frames_l1, x0, y0, cb_size, q);
-            motion_compensation_pu(
-                state,
-                ref_frames_l0,
-                ref_frames_l1,
-                x0,
-                y0 + q,
-                cb_size,
-                cb_size - q,
-            );
+            mc_pu!(x0, y0, cb_size, q);
+            mc_pu!(x0, y0 + q, cb_size, cb_size - q);
         }
         PartMode::Part2NxnD => {
             let tq = cb_size * 3 / 4;
-            motion_compensation_pu(state, ref_frames_l0, ref_frames_l1, x0, y0, cb_size, tq);
-            motion_compensation_pu(
-                state,
-                ref_frames_l0,
-                ref_frames_l1,
-                x0,
-                y0 + tq,
-                cb_size,
-                cb_size - tq,
-            );
+            mc_pu!(x0, y0, cb_size, tq);
+            mc_pu!(x0, y0 + tq, cb_size, cb_size - tq);
         }
         PartMode::PartnLx2N => {
             let q = cb_size / 4;
-            motion_compensation_pu(state, ref_frames_l0, ref_frames_l1, x0, y0, q, cb_size);
-            motion_compensation_pu(
-                state,
-                ref_frames_l0,
-                ref_frames_l1,
-                x0 + q,
-                y0,
-                cb_size - q,
-                cb_size,
-            );
+            mc_pu!(x0, y0, q, cb_size);
+            mc_pu!(x0 + q, y0, cb_size - q, cb_size);
         }
         PartMode::PartnRx2N => {
             let tq = cb_size * 3 / 4;
-            motion_compensation_pu(state, ref_frames_l0, ref_frames_l1, x0, y0, tq, cb_size);
-            motion_compensation_pu(
-                state,
-                ref_frames_l0,
-                ref_frames_l1,
-                x0 + tq,
-                y0,
-                cb_size - tq,
-                cb_size,
-            );
+            mc_pu!(x0, y0, tq, cb_size);
+            mc_pu!(x0 + tq, y0, cb_size - tq, cb_size);
         }
         PartMode::PartNxN => {
             let half = cb_size / 2;
             for pi in 0..2u32 {
                 for pj in 0..2u32 {
-                    motion_compensation_pu(
-                        state,
-                        ref_frames_l0,
-                        ref_frames_l1,
-                        x0 + pj * half,
-                        y0 + pi * half,
-                        half,
-                        half,
-                    );
+                    mc_pu!(x0 + pj * half, y0 + pi * half, half, half);
                 }
             }
         }

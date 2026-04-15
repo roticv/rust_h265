@@ -59,6 +59,49 @@ pub struct RefPicListModification {
     pub list_entry_l1: Vec<u32>,
 }
 
+/// Maximum number of reference pictures per list for weight table storage.
+const MAX_REFS: usize = 16;
+
+/// Prediction weight table (spec 7.3.6.3 / 7.4.6.3).
+///
+/// Weights are stored in the "effective" form used by FFmpeg:
+///   `weight = (1 << log2_weight_denom) + delta_weight`
+/// with offset as-is for luma, and with the chroma offset already adjusted
+/// per spec equation 7-59 (the `- (128 * weight >> denom) + 128` formula).
+///
+/// Default (when the `luma_weight_flag` / `chroma_weight_flag` is 0):
+///   weight = `1 << log2_weight_denom`, offset = 0.
+#[derive(Debug, Clone)]
+pub struct PredWeightTable {
+    pub luma_log2_weight_denom: u8,
+    pub chroma_log2_weight_denom: u8,
+    pub luma_weight_l0: [i16; MAX_REFS],
+    pub luma_offset_l0: [i16; MAX_REFS],
+    pub chroma_weight_l0: [[i16; 2]; MAX_REFS],
+    pub chroma_offset_l0: [[i16; 2]; MAX_REFS],
+    pub luma_weight_l1: [i16; MAX_REFS],
+    pub luma_offset_l1: [i16; MAX_REFS],
+    pub chroma_weight_l1: [[i16; 2]; MAX_REFS],
+    pub chroma_offset_l1: [[i16; 2]; MAX_REFS],
+}
+
+impl Default for PredWeightTable {
+    fn default() -> Self {
+        Self {
+            luma_log2_weight_denom: 0,
+            chroma_log2_weight_denom: 0,
+            luma_weight_l0: [0; MAX_REFS],
+            luma_offset_l0: [0; MAX_REFS],
+            chroma_weight_l0: [[0; 2]; MAX_REFS],
+            chroma_offset_l0: [[0; 2]; MAX_REFS],
+            luma_weight_l1: [0; MAX_REFS],
+            luma_offset_l1: [0; MAX_REFS],
+            chroma_weight_l1: [[0; 2]; MAX_REFS],
+            chroma_offset_l1: [[0; 2]; MAX_REFS],
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SliceHeader {
     pub first_slice_segment_in_pic_flag: bool,
@@ -138,6 +181,10 @@ pub struct SliceHeader {
     /// `lists_modification_present_flag = 0`), matching the spec's inferred
     /// values.
     pub ref_pic_list_modification: RefPicListModification,
+    /// Weighted prediction table — populated when `weighted_pred_flag` (P) or
+    /// `weighted_bipred_flag` (B) is set in the PPS. Otherwise all weights are
+    /// `1 << denom` and all offsets are 0.
+    pub pred_weight_table: PredWeightTable,
     /// NAL unit type copy — needed for POC derivation downstream.
     pub nal_unit_type: NalUnitType,
     /// NAL temporal id — used by the DPB's "prev_tid0" tracking. Always 0
@@ -247,6 +294,7 @@ pub fn parse_slice_segment_header(
     let mut collocated_from_l0_flag = true;
     let mut collocated_ref_idx: u32 = 0;
     let mut max_num_merge_cand: u32 = 5;
+    let mut pred_weight_table = PredWeightTable::default();
     let mut ref_pic_list_modification = RefPicListModification::default();
 
     if !dependent_slice_segment_flag {
@@ -448,10 +496,7 @@ pub fn parse_slice_segment_header(
             if (pps.weighted_pred_flag && slice_type == SliceType::P)
                 || (pps.weighted_bipred_flag && slice_type == SliceType::B)
             {
-                // Parse-and-discard the pred_weight_table (Phase 3d-1
-                // doesn't use the values, but we need to advance past them
-                // so downstream parsing is byte-aligned).
-                parse_pred_weight_table(
+                pred_weight_table = parse_pred_weight_table(
                     &mut r,
                     slice_type,
                     num_ref_idx_l0_active_minus1 + 1,
@@ -587,6 +632,7 @@ pub fn parse_slice_segment_header(
         collocated_ref_idx,
         max_num_merge_cand,
         ref_pic_list_modification,
+        pred_weight_table,
         nal_unit_type,
         temporal_id: 0,
         // IDR pictures have POC = 0 regardless of slice_pic_order_cnt_lsb
@@ -659,19 +705,34 @@ fn parse_lt_ref_pic_set(
     Ok(set)
 }
 
-/// Parse `pred_weight_table()` (spec 7.3.6.3). Values are consumed to
-/// advance the bit position but not stored — Phase 3d-1 doesn't use them.
+/// Parse `pred_weight_table()` (spec 7.3.6.3) and return the populated table.
 fn parse_pred_weight_table(
     r: &mut BitstreamReader,
     slice_type: SliceType,
     nb_ref_l0: u32,
     nb_ref_l1: u32,
     chroma_format_idc: u32,
-) -> Result<(), DecodeError> {
-    let _luma_log2_weight_denom = r.read_ue()?;
-    if chroma_format_idc != 0 {
-        let _delta_chroma_log2_weight_denom = r.read_se()?;
+) -> Result<PredWeightTable, DecodeError> {
+    let mut wt = PredWeightTable::default();
+
+    let luma_log2_weight_denom = r.read_ue()?;
+    if luma_log2_weight_denom > 7 {
+        return Err(DecodeError::InvalidSyntax("luma_log2_weight_denom > 7"));
     }
+    wt.luma_log2_weight_denom = luma_log2_weight_denom as u8;
+
+    let mut chroma_log2_weight_denom = luma_log2_weight_denom as i32;
+    if chroma_format_idc != 0 {
+        chroma_log2_weight_denom += r.read_se()?;
+        if !(0..=7).contains(&chroma_log2_weight_denom) {
+            return Err(DecodeError::InvalidSyntax("chroma_log2_weight_denom out of range"));
+        }
+    }
+    wt.chroma_log2_weight_denom = chroma_log2_weight_denom as u8;
+
+    let luma_denom = 1i16 << wt.luma_log2_weight_denom;
+    let chroma_denom = 1i16 << wt.chroma_log2_weight_denom;
+
     // L0 weights.
     let mut luma_weight_l0_flag: Vec<bool> = Vec::with_capacity(nb_ref_l0 as usize);
     for _ in 0..nb_ref_l0 {
@@ -685,14 +746,27 @@ fn parse_pred_weight_table(
     }
     for i in 0..nb_ref_l0 as usize {
         if luma_weight_l0_flag[i] {
-            let _delta_luma_weight_l0 = r.read_se()?;
-            let _luma_offset_l0 = r.read_se()?;
+            let delta = r.read_se()? as i16;
+            wt.luma_weight_l0[i] = luma_denom + delta;
+            wt.luma_offset_l0[i] = r.read_se()? as i16;
+        } else {
+            wt.luma_weight_l0[i] = luma_denom;
+            wt.luma_offset_l0[i] = 0;
         }
-        if chroma_format_idc != 0 && chroma_weight_l0_flag[i] {
-            for _ in 0..2 {
-                let _delta_chroma_weight_l0 = r.read_se()?;
-                let _delta_chroma_offset_l0 = r.read_se()?;
+        if chroma_format_idc != 0 && i < chroma_weight_l0_flag.len() && chroma_weight_l0_flag[i] {
+            for j in 0..2 {
+                let delta_w = r.read_se()? as i16;
+                let delta_o = r.read_se()? as i32;
+                wt.chroma_weight_l0[i][j] = chroma_denom + delta_w;
+                // Spec equation 7-59: effective offset includes the shift-back
+                wt.chroma_offset_l0[i][j] = (delta_o
+                    - ((128i32 * wt.chroma_weight_l0[i][j] as i32) >> wt.chroma_log2_weight_denom)
+                    + 128)
+                    .clamp(-128, 127) as i16;
             }
+        } else {
+            wt.chroma_weight_l0[i] = [chroma_denom, chroma_denom];
+            wt.chroma_offset_l0[i] = [0, 0];
         }
     }
     // L1 weights (B-slice only).
@@ -709,18 +783,30 @@ fn parse_pred_weight_table(
         }
         for i in 0..nb_ref_l1 as usize {
             if luma_weight_l1_flag[i] {
-                let _delta_luma_weight_l1 = r.read_se()?;
-                let _luma_offset_l1 = r.read_se()?;
+                let delta = r.read_se()? as i16;
+                wt.luma_weight_l1[i] = luma_denom + delta;
+                wt.luma_offset_l1[i] = r.read_se()? as i16;
+            } else {
+                wt.luma_weight_l1[i] = luma_denom;
+                wt.luma_offset_l1[i] = 0;
             }
-            if chroma_format_idc != 0 && chroma_weight_l1_flag[i] {
-                for _ in 0..2 {
-                    let _delta_chroma_weight_l1 = r.read_se()?;
-                    let _delta_chroma_offset_l1 = r.read_se()?;
+            if chroma_format_idc != 0 && i < chroma_weight_l1_flag.len() && chroma_weight_l1_flag[i] {
+                for j in 0..2 {
+                    let delta_w = r.read_se()? as i16;
+                    let delta_o = r.read_se()? as i32;
+                    wt.chroma_weight_l1[i][j] = chroma_denom + delta_w;
+                    wt.chroma_offset_l1[i][j] = (delta_o
+                        - ((128i32 * wt.chroma_weight_l1[i][j] as i32) >> wt.chroma_log2_weight_denom)
+                        + 128)
+                        .clamp(-128, 127) as i16;
                 }
+            } else {
+                wt.chroma_weight_l1[i] = [chroma_denom, chroma_denom];
+                wt.chroma_offset_l1[i] = [0, 0];
             }
         }
     }
-    Ok(())
+    Ok(wt)
 }
 
 /// Helper for `byte_alignment()` since the bitstream reader does not expose

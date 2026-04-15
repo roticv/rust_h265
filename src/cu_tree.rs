@@ -112,6 +112,10 @@ pub struct SliceParams {
     /// true = collocated picture is from L0 (collocated_list = 0),
     /// false = from L1 (collocated_list = 1).
     pub collocated_from_l0_flag: bool,
+    /// Whether weighted prediction is active for this slice.
+    pub weighted_pred_flag: bool,
+    /// Prediction weight table (only meaningful when `weighted_pred_flag`).
+    pub pred_weight_table: crate::slice::PredWeightTable,
 }
 
 /// Per-picture mutable state needed during slice decode.
@@ -1901,6 +1905,8 @@ fn decode_coding_unit(
             y0,
             cb_size,
             PartMode::Part2Nx2N,
+            slice_params.weighted_pred_flag,
+            &slice_params.pred_weight_table,
         );
         // Deblocking for inter skip: mark edges with bS=1.
         mark_inter_cu_boundaries(state, x0, y0, log2_cb_size);
@@ -2193,6 +2199,8 @@ fn decode_coding_unit(
             y0,
             cb_size,
             part_mode,
+            slice_params.weighted_pred_flag,
+            &slice_params.pred_weight_table,
         );
     }
 
@@ -3524,6 +3532,8 @@ mod tests {
             collocated_ref: None,
             slice_temporal_mvp_enabled_flag: false,
             collocated_from_l0_flag: true,
+            weighted_pred_flag: false,
+            pred_weight_table: crate::slice::PredWeightTable::default(),
         };
         // The single CTU is at (0, 0) with log2_cb_size = ctb_log2_size_y = 4.
         decode_coding_quadtree(
