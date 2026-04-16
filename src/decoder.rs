@@ -3026,6 +3026,32 @@ mod tests {
         );
     }
 
+    /// 128×128, 10 frames with `--bframes 3 --ref 4`: exercises the
+    /// I-B-B-B-P reference picture ordering, which stresses the DPB's
+    /// reference list construction and the hierarchical-B POC scheduling.
+    /// Prior to the WPP/AQ fixes, B-pyramids with `--bframes ≥ 2` hit
+    /// CABAC desyncs partway through decode.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=128x128:rate=30:duration=1" \
+    ///   -frames:v 10 -pix_fmt yuv420p -f rawvideo /tmp/in.yuv
+    /// x265 --input /tmp/in.yuv --input-res 128x128 --fps 30 --frames 10 \
+    ///   --preset ultrafast --ctu 16 --keyint 30 --no-open-gop \
+    ///   --bframes 3 --ref 4 --qp 26 --no-cutree --no-aq \
+    ///   --no-sao --no-deblock --no-info --no-psnr --no-ssim --no-wpp \
+    ///   -o bframes3_128x128.h265
+    /// ```
+    #[test]
+    fn test_decode_bframes3_128x128_hash() {
+        let hash = decode_and_hash("bframes3_128x128.h265", 10);
+        let expected = "0c56f162732109b9e03899b73cadbb64ad6759c48814e60bad58767c08ec3c80";
+        assert_eq!(
+            hash, expected,
+            "bframes3_128x128 hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
     /// 320x240, 5 frames (I+B+P+B+P) with CTU=64, no SAO, no deblock,
     /// constant QP (cu_qp_delta_enabled_flag=0).
     /// Tests the critical CTU=64 fixes: set_ct_depth for leaf CUs only
