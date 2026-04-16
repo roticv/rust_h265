@@ -46,10 +46,10 @@ cargo run --release --example bench_realworld
 
 | Fixture | Resolution | Frames | ours | ff-t1 | ff-tN | gap (ff-t1) |
 |---|---:|---:|---:|---:|---:|---:|
-| `bbb_1080p_5s_safe` | 1920×1080 | 120 | 240 Mpx/s (116 fps) | 1168 Mpx/s (563 fps) | 4290 Mpx/s | **4.9× slower** |
-| `bbb_720p_10s_safe` | 1280×720 | 240 | 211 Mpx/s (229 fps) | 941 Mpx/s | 3749 Mpx/s | **4.5× slower** |
-| `bbb_1080p_5s_medium` | 1920×1080 | 120 | 172 Mpx/s (83 fps) | 932 Mpx/s | 2513 Mpx/s | **5.4× slower** |
-| `bbb_1080p_5s_slow` | 1920×1080 | 120 | **N/A** (decode error) | 928 Mpx/s | 2464 Mpx/s | — |
+| `bbb_1080p_5s_safe` | 1920×1080 | 120 | 242 Mpx/s (117 fps) | 1147 Mpx/s (553 fps) | 3888 Mpx/s | **4.7× slower** |
+| `bbb_720p_10s_safe` | 1280×720 | 240 | 207 Mpx/s (225 fps) | 933 Mpx/s | 3749 Mpx/s | **4.5× slower** |
+| `bbb_1080p_5s_medium` | 1920×1080 | 120 | 172 Mpx/s (83 fps) | 928 Mpx/s | 2488 Mpx/s | **5.4× slower** |
+| `bbb_1080p_5s_slow` | 1920×1080 | 120 | 179 Mpx/s (86 fps) | 915 Mpx/s | 2488 Mpx/s | **5.1× slower** |
 
 ### Headline
 
@@ -62,14 +62,19 @@ The gap is **consistent (4.5–4.8×)** between 720p and 1080p real content, and
 matches the synthetic-fixture 1080p gap (4.5×). This is strong evidence that
 the dominant bottleneck is the same across content types.
 
-### Compatibility gaps on real-world encodes
+### Compatibility
 
-`preset medium` is now byte-exact against FFmpeg (see "Bug fix" below).
-`preset slow` still fails with `InvalidSyntax("cu_qp_delta out of range")`
-after 1 frame — a CABAC desync in the P-frame, likely a separate missing
-feature that only `preset slow` exercises (possibly something in its
-hierarchical-B ref-list construction or scene-cut handling). Tracked in
-TODO under known remaining issues.
+All four fixtures (`safe` / `medium` / `slow` presets + the 720p `safe`
+encode) are byte-exact against FFmpeg. The `safe` preset is
+`--preset ultrafast --no-sao --no-deblock` plus a few other simplifications
+used to make byte-exact comparison tractable with very small fixtures;
+`medium` and `slow` are stock x265 presets with SAO + deblock enabled.
+
+Two correctness bugs surfaced during this benchmarking work, both fixed
+below: one in WPP entry-point handling (triggered by real 1080p content
+with EPBs in slice data), and one pair in the inter 4×4 luma TU path
+(triggered by `--tu-inter-depth ≥ 2`, which `preset slow` enables by
+default).
 
 ### Bug fix: emulation-prevention-byte compensation for WPP entry points
 
@@ -90,6 +95,37 @@ time by subtracting the count of EPBs falling inside each substream's
 NAL-space byte range (matching FFmpeg `hevcdec.c:2987-3016`). Covered by
 `test_decode_wpp_ctu16_hash` (384×216 CTU=16 WPP with bframes=1, byte-exact
 against FFmpeg).
+
+### Bug fix: inter 4×4 luma TU path (`--tu-inter-depth ≥ 2`)
+
+`preset slow` enables `--tu-inter-depth 2`, which lets the encoder split an
+8×8 inter luma TU into four 4×4 sub-TUs. Two latent bugs sat on that code
+path and only fired together under real 1080p slow-preset content:
+
+1. **Inter chroma residual at `blk_idx == 3` was silently skipped.** When
+   luma splits to 4×4, spec 7.3.8.11 moves chroma residual to the parent
+   TU's position + size. Our `decode_transform_unit` handled this in the
+   intra branch but not the inter branch — so inter 4×4-split luma TUs
+   with non-zero inherited `cbf_cb` / `cbf_cr` never called
+   `residual_coding()`, leaving the chroma coefficients unread and
+   misaligning the CABAC state for the rest of the slice. Symptom:
+   `InvalidSyntax("cu_qp_delta out of range")` a few hundred bins later.
+
+2. **4×4 inter luma TUs incorrectly used the intra DST.** Spec 8.6.4.2
+   reserves the 4×4 DST ("transform_4x4_luma") for **intra** luma TUs;
+   inter 4×4 luma must use the regular 4×4 DCT. `apply_residual_to_luma`
+   hard-coded `is_luma_intra_4x4 = log2_size == 2`, so it dispatched to
+   DST for every 4×4 luma TU — correct for intra, silently wrong for
+   inter. Visible as ±1–3 Y-plane residual errors on every inter 4×4 TU,
+   cascading through MC into all dependent frames.
+
+Fixes: extend the inter branch in `decode_transform_unit` with an
+`else if do_chroma_deferred` arm mirroring FFmpeg `hls_transform_unit:
+1456-1478`, and thread `is_intra` into `apply_residual_to_luma` so DST
+dispatch is gated on `log2_size == 2 && is_intra`. Covered by
+`test_decode_tu_inter_4x4_hash` (128×128, 6 frames,
+`--preset medium --tu-inter-depth 3`, ~1.6 KB). `bbb_1080p_5s_slow` is
+now byte-exact against FFmpeg.
 
 ### Real vs synthetic throughput
 
@@ -155,27 +191,21 @@ overhead — is second-order.
 
 ## Priorities
 
-Correctness first, performance second:
+All four real-world fixtures decode byte-exact. Remaining focus is
+performance:
 
-1. **Close the real-world compatibility gaps.** Diagnose and fix the two
-   errors above so the bench harness reports real numbers for `preset
-   medium` / `preset slow` content. Both errors point at features the
-   decoder doesn't fully handle yet — and the one that trips first on
-   `preset medium` is likely a picture-completion / slice-ordering bug,
-   not a CABAC desync.
-
-2. **Profile the 1080p safe-preset fixture.** With a 1 s+ decode time
+1. **Profile the 1080p safe-preset fixture.** With a 1 s+ decode time
    (`bbb_1080p_5s_safe` at 120 frames × ~8 ms each), `samply` or
    `cargo flamegraph` should cleanly reveal the pixel-budget ordering —
    likely IDCT → MC filters → deblock → intra angular. That confirms
    which hot path is worth SIMD-ing first.
 
-3. **Cheap scalar wins before SIMD.** Bounds-check removal in proven hot
+2. **Cheap scalar wins before SIMD.** Bounds-check removal in proven hot
    loops (`get_unchecked` with documented invariants) and stack-allocated
    fixed-size buffers for IDCT coefficients (≤ 32×32) typically pay back
    a lot before you reach for intrinsics.
 
-4. **SIMD, in order of pixel budget.** IDCT first (2 M coefficients per
+3. **SIMD, in order of pixel budget.** IDCT first (2 M coefficients per
    1080p frame), then MC luma filter, then MC chroma filter, then deblock.
 
 ## Appendix: tool usage

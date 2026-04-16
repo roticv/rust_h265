@@ -3073,7 +3073,7 @@ fn decode_transform_unit(
                 scan_idx,
                 is_intra,
             )?;
-            apply_residual_to_luma(state, x0, y0, log2_trafo_size, &block);
+            apply_residual_to_luma(state, x0, y0, log2_trafo_size, &block, is_intra);
             state.last_luma_residual = Some(block);
         }
 
@@ -3129,7 +3129,15 @@ fn decode_transform_unit(
                 )?;
             }
         } else {
-            // Inter chroma residual.
+            // Inter chroma residual. Two paths per spec 7.3.8.11:
+            //  * `do_chroma_inline` — standard case, chroma TU is half the
+            //    luma TU size.
+            //  * `do_chroma_deferred` — luma has split to 4×4 at blk_idx 3,
+            //    so chroma residual lives at the parent's position and size.
+            //    FFmpeg `hls_transform_unit` handles this unconditionally
+            //    (whether intra or inter); our previous code only handled
+            //    the intra side, so inter CUs with 4×4 luma TUs were
+            //    silently skipping the chroma residual_coding() calls.
             if do_chroma_inline && (inherited.cbf_cb || inherited.cbf_cr) {
                 decode_chroma_residuals(
                     cabac,
@@ -3141,6 +3149,22 @@ fn decode_transform_unit(
                     y0,
                     log2_trafo_size_c,
                     log2_trafo_size,
+                    qp_y,
+                    inherited.cbf_cb,
+                    inherited.cbf_cr,
+                    false,
+                )?;
+            } else if do_chroma_deferred && (inherited.cbf_cb || inherited.cbf_cr) {
+                decode_chroma_residuals(
+                    cabac,
+                    contexts,
+                    state,
+                    sps,
+                    pps,
+                    x_base,
+                    y_base,
+                    log2_trafo_size_c,
+                    log2_trafo_size + 1,
                     qp_y,
                     inherited.cbf_cb,
                     inherited.cbf_cr,
@@ -3691,10 +3715,15 @@ fn apply_residual_to_luma(
     y0: u32,
     log2_size: u8,
     block: &ResidualBlock,
+    is_intra: bool,
 ) {
     let size = 1usize << log2_size;
     let mut residual_pixels = block.coeffs.clone();
-    let is_luma_intra_4x4 = log2_size == 2;
+    // Spec 8.6.4.2: 4×4 DST is only used for INTRA luma. Inter 4×4 uses
+    // regular DCT. Previously this flag was `log2_size == 2`, which silently
+    // miscompiled inter 4×4 luma TUs (only reachable with
+    // `max_transform_hierarchy_depth_inter >= 2`, i.e. x265 --preset slow).
+    let is_luma_intra_4x4 = log2_size == 2 && is_intra;
     apply_inverse_transform(
         &mut residual_pixels,
         log2_size,

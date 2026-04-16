@@ -3175,6 +3175,36 @@ mod tests {
         );
     }
 
+    /// 128×128, 6 frames of mandelbrot zoom (high-motion inter content),
+    /// `--preset medium --tu-inter-depth 3`. The deep inter TU split produces
+    /// 4×4 inter luma TUs, which must use the regular DCT (not the 4×4
+    /// intra-luma DST). The earlier `apply_residual_to_luma` unconditionally
+    /// dispatched to DST on any 4×4 luma TU — correct for intra, silently
+    /// wrong for inter. Also exercises the `do_chroma_deferred` inter-path
+    /// at `blk_idx == 3`, which previously skipped chroma residual_coding
+    /// entirely and desynced CABAC. Without either fix, this fixture diverges
+    /// from FFmpeg in the P-frames.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "mandelbrot=size=128x128:rate=30:start_scale=5" \
+    ///   -frames:v 6 -pix_fmt yuv420p -f rawvideo /tmp/in.yuv
+    /// x265 --input /tmp/in.yuv --input-res 128x128 --fps 30 --frames 6 \
+    ///   --preset medium --ctu 32 --keyint 30 --no-open-gop --bframes 0 \
+    ///   --tu-inter-depth 3 --max-tu-size 32 --qp 32 --no-cutree --no-aq \
+    ///   --no-sao --no-deblock --no-wpp --no-info --no-psnr --no-ssim \
+    ///   -o tu_inter4x4_motion.h265
+    /// ```
+    #[test]
+    fn test_decode_tu_inter_4x4_hash() {
+        let hash = decode_and_hash("tu_inter4x4_motion.h265", 6);
+        let expected = "1a58b820e57a2cc7c5f02fd0af49c7a8df575eea08776ad6d1d8e37adebfeade";
+        assert_eq!(
+            hash, expected,
+            "tu_inter4x4_motion hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
     #[test]
     #[ignore = "diagnostic — requires /tmp/grad64_ffmpeg.yuv from FFmpeg"]
     fn diag_grad64_pixel() {
