@@ -577,6 +577,16 @@ impl Decoder {
             let mut ps = PictureState::new(sps);
             let n = ps.tab_tile_id.len();
             ps.tab_tile_id.copy_from_slice(&tile_tables.tile_id[..n]);
+            // QP-prediction state (spec 8.6.1 / FFmpeg hevcdec.c:3066-3069):
+            // at the first independent segment of a picture, seed `qpy_pred`
+            // and `last_qp_y` from `slice_qp` and arm `first_qp_group` so the
+            // first QP group predicts from `slice_qp` (fallback when left /
+            // above neighbors are unavailable). When `cu_qp_delta_enabled_flag
+            // = 0` nothing else updates `last_qp_y`, so it correctly stays at
+            // `slice_qp` for every CU.
+            ps.qpy_pred = sh.slice_qp_y;
+            ps.last_qp_y = sh.slice_qp_y;
+            ps.first_qp_group = !sh.dependent_slice_segment_flag;
             self.current_picture = Some(PictureInProgress {
                 state: ps,
                 last_slice_header: sh.clone(),
@@ -613,6 +623,17 @@ impl Decoder {
             .as_mut()
             .expect("current_picture set above");
         let state = &mut pic.state;
+
+        // QP-prediction state per slice segment (spec 8.6.1 / FFmpeg
+        // hevcdec.c:3066-3069). `first_qp_group` resets at every segment
+        // start — to true for independent segments (fallback to slice_qp),
+        // to false for dependent ones (inherit parent's `qpy_pred`). When
+        // `cu_qp_delta_enabled_flag = 0` nothing else mutates `last_qp_y`,
+        // so re-seed it to `slice_qp` for independent segments.
+        state.first_qp_group = !sh.dependent_slice_segment_flag;
+        if !pps.cu_qp_delta_enabled_flag && !sh.dependent_slice_segment_flag {
+            state.last_qp_y = sh.slice_qp_y;
+        }
 
         let wpp = pps.entropy_coding_sync_enabled_flag;
         let tiles_on = pps.tiles_enabled_flag;
@@ -740,6 +761,11 @@ impl Decoder {
                         ));
                     }
                 }
+                // Spec 8.6.1 / FFmpeg hls_decode_neighbour:2712-2720: WPP row
+                // starts and tile boundaries reset the first-QP-group flag so
+                // the next CU with `cu_qp_delta_enabled_flag` predicts from
+                // `slice_qp` rather than the previous region's trailing QP.
+                state.first_qp_group = true;
             }
 
             let x_ctb = col * ctb_size;
@@ -2942,6 +2968,32 @@ mod tests {
         assert_eq!(
             hash, expected,
             "signhide_scaling_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// Single 64x64 I-frame with `--aq-mode 1 --qg-size 32`: exercises the
+    /// HEVC spec 8.6.1 QP prediction path. Each 32x32 QP group carries its
+    /// own `cu_qp_delta`, requiring `get_qPy_pred` / `set_qPy` to average
+    /// the left + above QPs from `tab_qp_y` (with `qpy_pred` as fallback
+    /// when neighbors are unavailable).
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=64x64:rate=30:duration=0.1" \
+    ///   -frames:v 1 -pix_fmt yuv420p -f rawvideo /tmp/in.yuv
+    /// x265 --input /tmp/in.yuv --input-res 64x64 --fps 30 --frames 1 \
+    ///   --preset ultrafast --ctu 64 --keyint 30 --no-open-gop \
+    ///   --aq-mode 1 --aq-strength 1.0 --no-cutree --qg-size 32 \
+    ///   --no-sao --no-deblock --no-info --no-psnr --no-ssim --no-wpp \
+    ///   -o aq_intra_64.h265
+    /// ```
+    #[test]
+    fn test_decode_aq_intra_64_hash() {
+        let hash = decode_and_hash("aq_intra_64.h265", 1);
+        let expected = "8ba0a950e270204375060527f592b5a0bfc3ad49d51919269d91239d7f09fbcf";
+        assert_eq!(
+            hash, expected,
+            "aq_intra_64 hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
     }
 

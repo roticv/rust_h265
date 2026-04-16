@@ -190,8 +190,18 @@ pub struct PictureState {
     /// Reset at the top of each QP group in decode_coding_quadtree;
     /// set to true once the first TU with non-zero CBF decodes cu_qp_delta.
     pub is_cu_qp_delta_coded: bool,
-    /// Effective QP after applying `last_cu_qp_delta` to `slice_qp_y`.
+    /// Effective QP after applying `last_cu_qp_delta` to the predicted QP
+    /// (spec 8.6.1). Equals `slice_qp_y` while `cu_qp_delta_enabled_flag=0`.
     pub last_qp_y: i32,
+    /// Predicted QP (`qPy_pred`) inherited across QP groups (spec 8.6.1 /
+    /// FFmpeg `HEVCLocalContext::qPy_pred`). Updated at the end of each
+    /// QP-group-aligned CU / split node; consulted when the left/above
+    /// neighbor used by `get_qPy_pred` is unavailable.
+    pub qpy_pred: i32,
+    /// Set at slice start (for non-dependent segments) and at WPP/tile
+    /// row starts. Forces `get_qPy_pred` to fall back to `slice_qp` for
+    /// the first QP group of the reset region (spec 8.6.1).
+    pub first_qp_group: bool,
 
     /// Phase 2c-3 sentinel — most recently decoded luma residual block.
     pub last_luma_residual: Option<ResidualBlock>,
@@ -294,6 +304,8 @@ impl PictureState {
             last_cu_qp_delta: 0,
             is_cu_qp_delta_coded: false,
             last_qp_y: 0,
+            qpy_pred: 0,
+            first_qp_group: false,
             last_luma_residual: None,
             tab_qp_y: vec![0u8; min_cb_width * min_cb_height],
             bs_vertical: vec![0u8; ((w_aligned / 4) * (h_aligned / 4)) as usize],
@@ -519,6 +531,10 @@ pub fn decode_coding_quadtree(
         } else {
             more_data = false;
         }
+        // Spec 8.6.1 / FFmpeg hls_coding_quadtree:2671-2673: at the
+        // bottom-right of a QP-group-aligned split node, snapshot
+        // `last_qp_y` into `qpy_pred` for the next group.
+        maybe_save_qpy_pred(state, sps, pps, x0, y0, log2_cb_size);
     } else {
         decode_coding_unit(
             cabac,
@@ -2188,10 +2204,16 @@ fn decode_coding_unit(
             slice_params.weighted_pred_flag,
             &slice_params.pred_weight_table,
         );
-        // Skip CUs have no residual and no cu_qp_delta. Write the current QP
-        // (slice QP + accumulated delta) into the QP table for deblocking.
-        let qp_y = slice_qp_y + state.last_cu_qp_delta;
-        write_qp_y_table(state, x0, y0, log2_cb_size, qp_y);
+        // Skip CUs have no residual and no cu_qp_delta. Mirror FFmpeg
+        // hls_coding_unit:2588-2595: if the QP group's delta hasn't been
+        // decoded yet, still invoke `set_qPy` with delta=0 so `last_qp_y`
+        // reflects the spatial prediction (qpy_a + qpy_b + 1) >> 1. Then
+        // record the resulting QP in `tab_qp_y` for deblocking.
+        if pps.cu_qp_delta_enabled_flag && !state.is_cu_qp_delta_coded {
+            set_qpy(state, sps, pps, slice_qp_y, x0, y0);
+        }
+        write_qp_y_table(state, x0, y0, log2_cb_size, state.last_qp_y);
+        maybe_save_qpy_pred(state, sps, pps, x0, y0, log2_cb_size);
         // Deblocking for inter skip/no-residual: compute bS per spec 8.7.2.
         compute_deblocking_boundary_strengths(state, slice_params, x0, y0, log2_cb_size);
         state.cu_count += 1;
@@ -2533,12 +2555,31 @@ fn decode_coding_unit(
                 slice_params,
             )?;
         } else {
-            // No residual: write QP for deblocking and compute bS per spec 8.7.2.
-            let qp_y = slice_qp_y + state.last_cu_qp_delta;
-            write_qp_y_table(state, x0, y0, log2_cb_size, qp_y);
+            // No residual: the end-of-CU block below still runs the
+            // fallback set_qPy and writes tab_qp_y. We only need to
+            // compute boundary strengths here (for inter no-residual).
             compute_deblocking_boundary_strengths(state, slice_params, x0, y0, log2_cb_size);
         }
     }
+
+    // Spec 8.6.1 / FFmpeg hls_coding_unit:2588-2589: at the end of every
+    // CU, if `cu_qp_delta` has not yet been coded for the current QP
+    // group, invoke `set_qPy` with delta=0 to refresh `last_qp_y` from
+    // the spatial prediction. QP groups whose residuals happen to be
+    // entirely zero still propagate the correct QP forward through the
+    // `qpy_pred` chain.
+    if pps.cu_qp_delta_enabled_flag && !state.is_cu_qp_delta_coded {
+        set_qpy(state, sps, pps, slice_qp_y, x0, y0);
+    }
+    // FFmpeg hls_coding_unit:2591-2595: stamp the CU's QP into
+    // `tab_qp_y` for all min-CBs the CU covers. Happens AFTER the
+    // fallback set_qPy so `last_qp_y` reflects the prediction.
+    write_qp_y_table(state, x0, y0, log2_cb_size, state.last_qp_y);
+
+    // Spec 8.6.1 / FFmpeg hls_coding_unit:2597-2600: at the bottom-right
+    // boundary of a QP group, snapshot `last_qp_y` into `qpy_pred` so the
+    // next group's `get_qPy_pred` can fall back to it.
+    maybe_save_qpy_pred(state, sps, pps, x0, y0, log2_cb_size);
 
     state.cu_count += 1;
     Ok(())
@@ -2995,10 +3036,16 @@ fn decode_transform_unit(
                 return Err(DecodeError::InvalidSyntax("cu_qp_delta out of range"));
             }
             state.is_cu_qp_delta_coded = true;
+            // Spec 8.6.1: apply the delta to the spatial prediction and
+            // update `last_qp_y`. Mirrors FFmpeg
+            // hls_transform_unit:1345-1346. We pass the parent-TU origin
+            // (`x_base`, `y_base`) rather than the CU root because the
+            // derivation only depends on the QP-group-aligned coordinates,
+            // which are the same for any position inside the same QP group.
+            set_qpy(state, sps, pps, slice_qp_y, x_base, y_base);
         }
 
-        let qp_y = slice_qp_y + state.last_cu_qp_delta;
-        state.last_qp_y = qp_y;
+        let qp_y = state.last_qp_y;
 
         // ---- Step 3: luma residual_coding + IDCT + reconstruction.
         if cbf_luma {
@@ -3107,12 +3154,12 @@ fn decode_transform_unit(
     }
 
     // ---- Step 5: deblocking bookkeeping.
-    let qp_y = if cbf_luma || inherited.cbf_cb || inherited.cbf_cr {
-        state.last_qp_y
-    } else {
-        slice_qp_y + state.last_cu_qp_delta
-    };
-    write_qp_y_table(state, x0, y0, log2_trafo_size, qp_y);
+    // NOTE: `tab_qp_y` is written at CU granularity in
+    // `decode_coding_unit` (mirroring FFmpeg `hls_coding_unit:2591-2595`),
+    // AFTER the fallback `set_qPy(delta=0)` has resolved a stable
+    // `last_qp_y` for the whole CU. Writing per-TU here would stamp the
+    // previous CU's QP into `tab_qp_y` for any TU that arrives before
+    // `cu_qp_delta` is decoded.
     if is_intra {
         mark_intra_tu_boundaries(state, x0, y0, log2_trafo_size);
     } else {
@@ -3121,6 +3168,99 @@ fn decode_transform_unit(
     }
 
     Ok(new_cbf)
+}
+
+/// HEVC spec 8.6.1 `get_qPy_pred`. Derives the predicted QP at the current
+/// CU by averaging the QPs of the neighboring CU to the left and above
+/// (taken at the origin of the enclosing QP group). If either neighbor is
+/// unavailable (outside the CTB, or before the first QP-coded CU), the
+/// saved `qpy_pred` from the previous group is used as fallback. Mirrors
+/// FFmpeg `filter.c:get_qPy_pred`.
+///
+/// Side effect: updates `state.first_qp_group` to `!is_cu_qp_delta_coded`
+/// when the function falls into the first-group / picture-origin branch,
+/// matching FFmpeg's behavior so that multi-CU QP groups that never decode
+/// a delta keep the flag set for the next group.
+fn get_qpy_pred(
+    state: &mut PictureState,
+    sps: &Sps,
+    pps: &Pps,
+    slice_qp: i32,
+    x_base: u32,
+    y_base: u32,
+) -> i32 {
+    let ctb_mask: u32 = (1u32 << sps.ctb_log2_size_y) - 1;
+    let min_qp_log2 = sps.ctb_log2_size_y - pps.diff_cu_qp_delta_depth as u8;
+    let min_qp_mask: u32 = (1u32 << min_qp_log2) - 1;
+    let x_qg = x_base & !min_qp_mask;
+    let y_qg = y_base & !min_qp_mask;
+    let x_cb = (x_qg >> state.log2_min_cb_size) as usize;
+    let y_cb = (y_qg >> state.log2_min_cb_size) as usize;
+    let available_a = (x_base & ctb_mask) != 0 && (x_qg & ctb_mask) != 0;
+    let available_b = (y_base & ctb_mask) != 0 && (y_qg & ctb_mask) != 0;
+
+    let qpy_pred_fallback = if state.first_qp_group || (x_qg == 0 && y_qg == 0) {
+        state.first_qp_group = !state.is_cu_qp_delta_coded;
+        slice_qp
+    } else {
+        state.qpy_pred
+    };
+
+    let qpy_a = if !available_a {
+        qpy_pred_fallback
+    } else {
+        state.tab_qp_y[(x_cb - 1) + y_cb * state.min_cb_width] as i32
+    };
+    let qpy_b = if !available_b {
+        qpy_pred_fallback
+    } else {
+        state.tab_qp_y[x_cb + (y_cb - 1) * state.min_cb_width] as i32
+    };
+
+    (qpy_a + qpy_b + 1) >> 1
+}
+
+/// HEVC spec 8.6.1 `set_qPy`. Computes the effective luma QP for a CU as
+/// `qPy_pred + cu_qp_delta` with modular wrap into `[-qp_bd_offset, 51]`,
+/// then stashes the result in `state.last_qp_y`. Mirrors FFmpeg
+/// `filter.c:ff_hevc_set_qPy`. We only support 8-bit (`qp_bd_offset = 0`),
+/// so the modular wrap reduces to mod-52.
+fn set_qpy(
+    state: &mut PictureState,
+    sps: &Sps,
+    pps: &Pps,
+    slice_qp: i32,
+    x_base: u32,
+    y_base: u32,
+) {
+    let qp_pred = get_qpy_pred(state, sps, pps, slice_qp, x_base, y_base);
+    let delta = state.last_cu_qp_delta;
+    state.last_qp_y = if delta != 0 {
+        // 8-bit: qp_bd_offset = 0, so modulo is plain mod-52.
+        let off = 0i32;
+        (qp_pred + delta + 52 + 2 * off).rem_euclid(52 + off) - off
+    } else {
+        qp_pred
+    };
+}
+
+/// End of a QP-group-aligned CU or split node: save `last_qp_y` as the
+/// `qpy_pred` fallback for the next group (spec 8.6.1 / FFmpeg
+/// hevcdec.c:2597-2600 and 2671-2673).
+fn maybe_save_qpy_pred(
+    state: &mut PictureState,
+    sps: &Sps,
+    pps: &Pps,
+    x0: u32,
+    y0: u32,
+    log2_cb_size: u8,
+) {
+    let min_qp_log2 = sps.ctb_log2_size_y - pps.diff_cu_qp_delta_depth as u8;
+    let mask: u32 = (1u32 << min_qp_log2) - 1;
+    let cb_size = 1u32 << log2_cb_size;
+    if ((x0 + cb_size) & mask) == 0 && ((y0 + cb_size) & mask) == 0 {
+        state.qpy_pred = state.last_qp_y;
+    }
 }
 
 /// Write `qp_y` into the per-min-CB QP table for all min-CB positions
