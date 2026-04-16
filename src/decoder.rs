@@ -2958,6 +2958,16 @@ mod tests {
     ///   -o ctu64_noqp_nosao_320x240.h265
     /// ```
     #[test]
+    fn test_decode_ctu64_wpp_hash() {
+        let hash = decode_and_hash("ctu64_wpp.h265", 5);
+        let expected = "de7a1ac668d67e19fb052beb7cd5577d3f40bb2b7244dd82b421d98ead1f702c";
+        assert_eq!(
+            hash, expected,
+            "ctu64_wpp hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    #[test]
     fn test_decode_ctu64_320x240_hash() {
         let hash = decode_and_hash("ctu64_noqp_nosao_320x240.h265", 5);
         let expected = "98341166e6c5235b88fe3e9dcc5532084462f704969d608a949d6cc015c09621";

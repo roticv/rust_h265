@@ -3051,6 +3051,7 @@ fn decode_transform_unit(
                     x0,
                     y0,
                     log2_trafo_size_c,
+                    log2_trafo_size,
                     qp_y,
                     inherited.cbf_cb,
                     inherited.cbf_cr,
@@ -3068,6 +3069,7 @@ fn decode_transform_unit(
                     x_base,
                     y_base,
                     log2_trafo_size_c,
+                    log2_trafo_size + 1,
                     qp_y,
                     inherited.cbf_cb,
                     inherited.cbf_cr,
@@ -3086,6 +3088,7 @@ fn decode_transform_unit(
                     x0,
                     y0,
                     log2_trafo_size_c,
+                    log2_trafo_size,
                     qp_y,
                     inherited.cbf_cb,
                     inherited.cbf_cr,
@@ -3149,6 +3152,7 @@ fn decode_chroma_residuals(
     x0: u32,
     y0: u32,
     log2_trafo_size_c: u8,
+    log2_trafo_size_luma: u8,
     qp_y: i32,
     cbf_cb: bool,
     cbf_cr: bool,
@@ -3183,7 +3187,15 @@ fn decode_chroma_residuals(
         } else {
             ResidualPlane::Cr
         };
-        let scan_idx = ScanOrder::Diag; // chroma always uses diagonal scan
+        // Spec 7.4.9.11 / FFmpeg hevcdec.c:1377-1383: for intra TUs the
+        // chroma scan_idx_c is selected based on chroma intra mode, but only
+        // when the LUMA `log2_trafo_size < 4` (i.e. luma 4x4 or 8x8). For
+        // larger luma TBs, chroma scan stays diagonal.
+        let scan_idx = if is_intra && log2_trafo_size_luma < 4 {
+            pick_scan_order(log2_trafo_size_c, state.last_chroma_pred_mode)
+        } else {
+            ScanOrder::Diag
+        };
         let block = decode_residual_coding(
             cabac,
             contexts,
