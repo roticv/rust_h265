@@ -2997,6 +2997,35 @@ mod tests {
         );
     }
 
+    /// 320×240 I+B+P+B+P with `--aq-mode 1 --qg-size 32`: exercises the
+    /// `transform_tree` sibling cbf-inheritance fix (siblings at the same
+    /// split depth must see the ORIGINAL parent's `cbf_cb/cbf_cr`, not
+    /// each other's). Before the fix, subsequent siblings inherited the
+    /// previous sibling's cbf, which caused `cbf_cr` to be skipped
+    /// whenever the first sibling decoded `cbf_cr = 0` — a CABAC desync
+    /// that only surfaced in large AQ-enabled P-frames (small fixtures
+    /// happened to not exercise the split+cbf_cb=1+cbf_cr=0 combination).
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=320x240:rate=30:duration=0.2" \
+    ///   -frames:v 5 -pix_fmt yuv420p -f rawvideo /tmp/in.yuv
+    /// x265 --input /tmp/in.yuv --input-res 320x240 --fps 30 --frames 5 \
+    ///   --preset ultrafast --ctu 64 --keyint 30 --no-open-gop --bframes 1 \
+    ///   --aq-mode 1 --aq-strength 1.0 --no-cutree --qg-size 32 \
+    ///   --no-sao --no-deblock --no-info --no-psnr --no-ssim --no-wpp \
+    ///   -o aq_p_320x240.h265
+    /// ```
+    #[test]
+    fn test_decode_aq_p_320x240_hash() {
+        let hash = decode_and_hash("aq_p_320x240.h265", 5);
+        let expected = "7bb34e31bfbe81e9a18c35af020c853f1bed56e8b28c67b1809f63e2e4dde98a";
+        assert_eq!(
+            hash, expected,
+            "aq_p_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
     /// 320x240, 5 frames (I+B+P+B+P) with CTU=64, no SAO, no deblock,
     /// constant QP (cu_qp_delta_enabled_flag=0).
     /// Tests the critical CTU=64 fixes: set_ct_depth for leaf CUs only

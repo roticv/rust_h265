@@ -2785,8 +2785,13 @@ fn decode_transform_tree(
         let trafo_size_split = 1u32 << (log2_trafo_size - 1);
         let x1 = x0 + trafo_size_split;
         let y1 = y0 + trafo_size_split;
-        let mut child_cbf = inherited;
-        child_cbf = decode_transform_tree(
+        // All four sub-trees see the SAME parent cbf (the values decoded at
+        // THIS level), not their sibling's decoded cbf. FFmpeg
+        // `hls_transform_tree:1613-1616` SUBDIVIDE macro passes the same
+        // `cbf_cb, cbf_cr` arrays to each sibling. Using a sibling's return
+        // as the next sibling's parent_cbf causes `cbf_cr` to be skipped
+        // whenever the first sibling's subtree decodes cbf_cr=0.
+        let _ = decode_transform_tree(
             cabac,
             contexts,
             state,
@@ -2805,10 +2810,10 @@ fn decode_transform_tree(
             intra_split,
             false, // inter_split only at depth 0
             0,
-            child_cbf,
+            inherited,
             slice_params,
         )?;
-        child_cbf = decode_transform_tree(
+        let _ = decode_transform_tree(
             cabac,
             contexts,
             state,
@@ -2827,10 +2832,10 @@ fn decode_transform_tree(
             intra_split,
             false,
             1,
-            child_cbf,
+            inherited,
             slice_params,
         )?;
-        child_cbf = decode_transform_tree(
+        let _ = decode_transform_tree(
             cabac,
             contexts,
             state,
@@ -2849,7 +2854,7 @@ fn decode_transform_tree(
             intra_split,
             false,
             2,
-            child_cbf,
+            inherited,
             slice_params,
         )?;
         let final_cbf = decode_transform_tree(
@@ -2871,7 +2876,7 @@ fn decode_transform_tree(
             intra_split,
             false,
             3,
-            child_cbf,
+            inherited,
             slice_params,
         )?;
         Ok(final_cbf)
