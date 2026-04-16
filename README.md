@@ -2,7 +2,14 @@
 
 A pure Rust H.265 / HEVC video decoder.
 
-> **Status:** early / greenfield. The crate has not been scaffolded yet — there is no decodable bitstream support today. This README describes the intended design and API, modeled on the sibling [`rust_h264`](https://github.com/roticv/rust_h264) project.
+> **Status:** functional. Main-profile 8-bit 4:2:0 HEVC decodes end-to-end
+> with CTU 16/32/64, I/P/B slices (including hierarchical B), WPP, tiles,
+> dependent slice segments, SAO, deblocking, AQ (`cu_qp_delta`), scaling
+> lists, sign-data hiding, weighted prediction, and PCM. 104 tests pass.
+> Byte-exact against FFmpeg on every in-tree fixture plus real 1080p Big
+> Buck Bunny transcoded with x265 presets `ultrafast` / `medium` / `slow`.
+> No threading or SIMD yet — currently ~4.7× slower than single-threaded
+> FFmpeg on real 1080p content; see [`BENCHMARK.md`](BENCHMARK.md).
 
 While working on `rust_media` it became clear that there isn't a sufficiently good open source software HEVC decoder that ships as a standalone library. FFmpeg has one, but it isn't split out. Most devices have hardware HEVC decoders, but a portable software fallback is still useful when you want one binary that runs anywhere.
 
@@ -11,13 +18,13 @@ A pure Rust H.264 decoder ([`rust_h264`](https://github.com/roticv/rust_h264)) a
 ## Design
 
 - **Input:** Annex B bytestream (start code delimited `00 00 00 01` / `00 00 01`). HVCC (length-prefixed, used in MP4) is **not** supported — callers must convert to Annex B before feeding data to the decoder.
-- **Streaming:** The decoder will expose a streaming API. NAL units are fed incrementally and decoded frames are emitted as they become available.
-- **Performance:** The decoder aims to be fast, with FFmpeg's software HEVC decoder as the target benchmark.
-- **Pure Rust, mostly safe:** `unsafe` is reserved for hot SIMD paths where it's justified.
+- **Streaming:** `Decoder::decode_nal(&[u8]) -> Result<Option<Frame>, DecodeError>` plus `flush()`. NAL units are fed incrementally and decoded frames are emitted as they become available, in **decode order** (callers re-sort by POC for display).
+- **Performance:** The decoder aims to be fast, with FFmpeg's software HEVC decoder as the target benchmark. Current gap vs single-threaded FFmpeg is ~4.7× on real 1080p content; no NEON / SSE kernels yet.
+- **Pure Rust, no `unsafe`** in the current codebase. `unsafe` will be reserved for SIMD paths once they land.
 
-## Planned usage
+## Usage
 
-The intended public API mirrors `rust_h264`:
+The public API mirrors `rust_h264`:
 
 ```rust
 use rust_h265::decoder::Decoder;
@@ -123,13 +130,33 @@ These do not change how you call the decoder; they change what the decoder has t
 
 ## Tools
 
-The plan is to mirror the example tools in `rust_h264`:
+```sh
+# Decode to raw YUV420p in display order (sorted by POC):
+cargo run --release --example dump_frames -- input.h265 out.yuv
+
+# Throughput measurement on a single file:
+cargo run --release --example bench_decode -- input.h265 --warmup 2 --repeat 10
+
+# Real-world benchmark matrix (downloads Big Buck Bunny, transcodes with
+# x265 at several presets, runs both rust_h265 and FFmpeg on each):
+cargo run --release --example bench_realworld
+```
+
+Planned but not yet implemented:
 
 - `examples/play.rs` — decode and display an H.265 bitstream in a window (`cargo run --example play -- input.h265 [--fps 30] [--loop]`).
-- `examples/dump_frames.rs` — decode to raw YUV420 output in display order.
-- `examples/bench_decode.rs` — measure decode throughput against FFmpeg.
 
-None of these exist yet.
+## Testing
+
+```sh
+cargo test --release
+```
+
+In-tree fixtures under `testdata/` cover the feature matrix (all fixtures
+byte-exact against FFmpeg); tests that need >1 MB of reference output
+(e.g. 1080p) use a SHA-256 hash of the decoded planes. The
+`bench_realworld` example covers real 1080p / 720p Big Buck Bunny content
+end-to-end and requires a working `ffmpeg` and `x265` in `$PATH`.
 
 ## License
 
