@@ -530,6 +530,26 @@ impl Decoder {
         let cabac_byte_offset = sh.header_size_bits / 8;
         let mut cabac = CabacReader::new(&nal.rbsp, cabac_byte_offset);
 
+        // Spec 7.4.7.1: `entry_point_offset_minus1[i]` values are in NAL-unit
+        // byte-space (they count the emulation-prevention bytes 0x03 present
+        // in the raw NAL). To index into our RBSP (where EPBs have been
+        // stripped), we subtract the EPBs that fall inside each NAL-space
+        // target. Pre-compute the NAL-space position of the slice_segment_data
+        // start — this is the RBSP cabac_byte_offset plus the count of EPBs
+        // that fall inside the slice header.
+        let nal_slice_data_start = {
+            let mut nss = cabac_byte_offset as u32;
+            for &p in &nal.epb_positions {
+                if (p as u32) < nss {
+                    nss += 1;
+                } else {
+                    break;
+                }
+            }
+            nss
+        };
+        let epb_positions: &[u32] = &nal.epb_positions;
+
         let ctb_size = 1u32 << sps.ctb_log2_size_y;
         let pic_width_in_ctbs = sps.pic_width_in_ctbs_y();
         let pic_height_in_ctbs = sps.pic_height_in_ctbs_y();
@@ -739,7 +759,18 @@ impl Decoder {
                         "slice missing entry_point_offset for substream",
                     ));
                 }
-                let byte_offset = cabac_byte_offset + sh.entry_point_offsets[ep_idx - 1] as usize;
+                // entry_point_offsets[i] is the cumulative NAL-space offset
+                // from slice_segment_data start (spec 7.4.7.1). Convert to
+                // RBSP-space by subtracting the count of EPBs in the NAL
+                // range [nal_slice_data_start, nal_slice_data_start + offset).
+                let nal_offset_from_start = sh.entry_point_offsets[ep_idx - 1];
+                let nal_target = nal_slice_data_start + nal_offset_from_start;
+                let epbs_in_data_prefix = epb_positions
+                    .iter()
+                    .filter(|&&p| p >= nal_slice_data_start && p < nal_target)
+                    .count() as u32;
+                let rbsp_offset_from_start = nal_offset_from_start - epbs_in_data_prefix;
+                let byte_offset = cabac_byte_offset + rbsp_offset_from_start as usize;
                 cabac.reinit_at(byte_offset);
 
                 if is_tile_start {
@@ -3049,6 +3080,33 @@ mod tests {
         assert_eq!(
             hash, expected,
             "bframes3_128x128 hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// 384×216 CTU=16 WPP with `--bframes 1 --ref 4`: exercises the
+    /// entry-point-offset emulation-prevention-byte compensation (HEVC spec
+    /// 7.4.7.1). Small CTU sizes + multi-CTB-row pictures produce long
+    /// slice data that tends to contain one or more `00 00 03` sequences,
+    /// so every WPP row reinit must convert the NAL-space
+    /// `entry_point_offset_minus1[]` values to RBSP-space by subtracting the
+    /// count of EPBs falling inside each substream.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=384x216:rate=24:duration=0.5" \
+    ///   -frames:v 12 -pix_fmt yuv420p -f rawvideo /tmp/in.yuv
+    /// x265 --input /tmp/in.yuv --input-res 384x216 --fps 24 --frames 12 \
+    ///   --preset ultrafast --ctu 16 --keyint 30 --no-open-gop \
+    ///   --bframes 1 --ref 4 --qp 26 --no-cutree \
+    ///   --wpp -o wpp_ctu16.h265
+    /// ```
+    #[test]
+    fn test_decode_wpp_ctu16_hash() {
+        let hash = decode_and_hash("wpp_ctu16.h265", 12);
+        let expected = "acd550e2f1b1e94ec10da401af621c2eb955a2a475d3797850b2d3dda1ede71b";
+        assert_eq!(
+            hash, expected,
+            "wpp_ctu16 hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
     }
 

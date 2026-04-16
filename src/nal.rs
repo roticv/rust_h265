@@ -139,6 +139,14 @@ pub struct NalUnit<'a> {
     /// prevention bytes removed). Borrowed from the input when no EPB are
     /// present, owned otherwise.
     pub rbsp: Cow<'a, [u8]>,
+    /// NAL-space byte positions (relative to the NAL payload start — i.e.
+    /// after the 2-byte NAL header) at which an emulation prevention byte
+    /// (0x03) was removed. Empty when no EPBs were present. HEVC spec
+    /// 7.4.7.1 `entry_point_offset_minus1[]` is defined in NAL-space units
+    /// (it counts EPBs); consumers that index into `rbsp` using those
+    /// offsets must subtract the count of EPBs whose position is ≤ the
+    /// target NAL offset to convert NAL → RBSP addresses.
+    pub epb_positions: Vec<u32>,
 }
 
 /// Split an Annex B bytestream into NAL units.
@@ -187,11 +195,12 @@ pub fn parse_annex_b(data: &[u8]) -> Vec<NalUnit<'_>> {
                 // malformed headers rather than panicking.
                 if temporal_id_plus1 > 0 {
                     let temporal_id = temporal_id_plus1 - 1;
-                    let rbsp = remove_emulation_prevention(&nal_data[2..]);
+                    let (rbsp, epb_positions) = remove_emulation_prevention(&nal_data[2..]);
                     nals.push(NalUnit {
                         nal_unit_type,
                         nuh_layer_id,
                         temporal_id,
+                        epb_positions,
                         rbsp,
                     });
                 }
@@ -227,28 +236,33 @@ fn find_start_code(data: &[u8], offset: usize) -> Option<(usize, usize)> {
 
 /// Remove emulation prevention bytes (0x03 in `00 00 03` sequences).
 /// Returns a borrowed slice when no emulation prevention bytes are found
-/// (the common case), avoiding allocation entirely.
-fn remove_emulation_prevention(data: &[u8]) -> Cow<'_, [u8]> {
+/// (the common case), avoiding allocation entirely. Also returns the
+/// NAL-space byte positions where each EPB was located (empty on the
+/// fast path).
+fn remove_emulation_prevention(data: &[u8]) -> (Cow<'_, [u8]>, Vec<u32>) {
     // Fast path: scan for 00 00 03. If none found, return borrowed slice.
     let has_epb = data.windows(3).any(|w| w[0] == 0 && w[1] == 0 && w[2] == 3);
     if !has_epb {
-        return Cow::Borrowed(data);
+        return (Cow::Borrowed(data), Vec::new());
     }
 
     // Slow path: copy with emulation prevention removal.
     let mut rbsp = Vec::with_capacity(data.len());
+    let mut epb_positions = Vec::new();
     let mut i = 0;
     while i < data.len() {
         if i + 2 < data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 3 {
             rbsp.push(0);
             rbsp.push(0);
+            // Record the NAL-space position of the removed 0x03 byte.
+            epb_positions.push((i + 2) as u32);
             i += 3; // skip the 0x03 byte
         } else {
             rbsp.push(data[i]);
             i += 1;
         }
     }
-    Cow::Owned(rbsp)
+    (Cow::Owned(rbsp), epb_positions)
 }
 
 #[cfg(test)]
