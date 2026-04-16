@@ -203,6 +203,11 @@ pub struct PictureState {
     pub bs_vertical: Vec<u8>,
     /// Phase 3b-1 deblocking: per-4×4 boundary strength for horizontal edges.
     pub bs_horizontal: Vec<u8>,
+    /// Phase 3b-1 deblocking: per min-TB cbf_luma flag. Indexed by
+    /// `(y >> log2_min_tb_size) * min_tb_width + (x >> log2_min_tb_size)`.
+    pub tab_cbf_luma: Vec<u8>,
+    /// log2 of minimum transform block size (for deblocking cbf_luma table).
+    pub log2_min_tb_size: u32,
     /// Phase 3b-2 SAO: per-CTB SAO parameters, indexed by CTB raster address.
     pub sao_params: Vec<crate::sao::SaoParams>,
     /// Phase 3c-1 multi-slice: per-CTB slice address (`slice_segment_address`
@@ -254,6 +259,9 @@ impl PictureState {
         let min_cb_height = (h_aligned >> log2_min_cb_size) as usize;
         let min_pu_width = (w_aligned >> log2_min_pu_size) as usize;
         let min_pu_height = (h_aligned >> log2_min_pu_size) as usize;
+        let log2_min_tb_size = sps.min_tb_log2_size_y as u32;
+        let min_tb_width = (w_aligned >> log2_min_tb_size) as usize;
+        let min_tb_height = (h_aligned >> log2_min_tb_size) as usize;
         // Pixel planes use CTU-aligned dimensions so that CUs at the picture
         // edge (which extend into the padding area) can read/write without OOB.
         let y_stride = w_aligned as usize;
@@ -290,6 +298,8 @@ impl PictureState {
             tab_qp_y: vec![0u8; min_cb_width * min_cb_height],
             bs_vertical: vec![0u8; ((w_aligned / 4) * (h_aligned / 4)) as usize],
             bs_horizontal: vec![0u8; ((w_aligned / 4) * (h_aligned / 4)) as usize],
+            tab_cbf_luma: vec![0u8; min_tb_width * min_tb_height],
+            log2_min_tb_size,
             sao_params: {
                 let ctb_size = 1u32 << log2_ctb_size;
                 let pw = w.div_ceil(ctb_size) as usize;
@@ -1841,29 +1851,252 @@ fn decode_mvd_sign(cabac: &mut CabacReader) -> i32 {
     if cabac.decode_bypass() != 0 { -1 } else { 1 }
 }
 
-/// Mark inter CU boundaries for deblocking with bS=1 (inter-CU default).
-fn mark_inter_cu_boundaries(state: &mut PictureState, x0: u32, y0: u32, log2_size: u8) {
+/// Compute inter boundary strength by comparing MVs and reference pictures,
+/// per HEVC spec 8.7.2.5 / FFmpeg `boundary_strength`.
+///
+/// Returns 0 if MVs are close enough (diff < 4 in quarter-pel units), 1 otherwise.
+fn inter_boundary_strength(
+    curr: &MvField,
+    neigh: &MvField,
+    curr_ref_pocs: &[Vec<i32>; 2],
+    neigh_ref_pocs: &[Vec<i32>; 2],
+) -> u8 {
+    // Both bi-pred
+    if curr.pred_flag == 3 && neigh.pred_flag == 3 {
+        let curr_l0_poc = curr_ref_pocs[0]
+            .get(curr.ref_idx[0] as usize)
+            .copied()
+            .unwrap_or(-1);
+        let curr_l1_poc = curr_ref_pocs[1]
+            .get(curr.ref_idx[1] as usize)
+            .copied()
+            .unwrap_or(-1);
+        let neigh_l0_poc = neigh_ref_pocs[0]
+            .get(neigh.ref_idx[0] as usize)
+            .copied()
+            .unwrap_or(-1);
+        let neigh_l1_poc = neigh_ref_pocs[1]
+            .get(neigh.ref_idx[1] as usize)
+            .copied()
+            .unwrap_or(-1);
+
+        // Same L0 and L1 references for both (all four point to same ref)
+        if curr_l0_poc == neigh_l0_poc && curr_l0_poc == curr_l1_poc && neigh_l0_poc == neigh_l1_poc
+        {
+            // Either ordering must satisfy the threshold
+            let order_a = (neigh.mv[0].x - curr.mv[0].x).abs() >= 4
+                || (neigh.mv[0].y - curr.mv[0].y).abs() >= 4
+                || (neigh.mv[1].x - curr.mv[1].x).abs() >= 4
+                || (neigh.mv[1].y - curr.mv[1].y).abs() >= 4;
+            let order_b = (neigh.mv[1].x - curr.mv[0].x).abs() >= 4
+                || (neigh.mv[1].y - curr.mv[0].y).abs() >= 4
+                || (neigh.mv[0].x - curr.mv[1].x).abs() >= 4
+                || (neigh.mv[0].y - curr.mv[1].y).abs() >= 4;
+            if order_a && order_b { 1 } else { 0 }
+        } else if curr_l0_poc == neigh_l0_poc && curr_l1_poc == neigh_l1_poc {
+            if (neigh.mv[0].x - curr.mv[0].x).abs() >= 4
+                || (neigh.mv[0].y - curr.mv[0].y).abs() >= 4
+                || (neigh.mv[1].x - curr.mv[1].x).abs() >= 4
+                || (neigh.mv[1].y - curr.mv[1].y).abs() >= 4
+            {
+                1
+            } else {
+                0
+            }
+        } else if curr_l1_poc == neigh_l0_poc && curr_l0_poc == neigh_l1_poc {
+            if (neigh.mv[1].x - curr.mv[0].x).abs() >= 4
+                || (neigh.mv[1].y - curr.mv[0].y).abs() >= 4
+                || (neigh.mv[0].x - curr.mv[1].x).abs() >= 4
+                || (neigh.mv[0].y - curr.mv[1].y).abs() >= 4
+            {
+                1
+            } else {
+                0
+            }
+        } else {
+            1
+        }
+    } else if curr.pred_flag != 3 && neigh.pred_flag != 3 {
+        // Both uni-pred (one MV each)
+        let (a, ref_a_poc) = if curr.pred_flag & 1 != 0 {
+            (
+                curr.mv[0],
+                curr_ref_pocs[0]
+                    .get(curr.ref_idx[0] as usize)
+                    .copied()
+                    .unwrap_or(-1),
+            )
+        } else {
+            (
+                curr.mv[1],
+                curr_ref_pocs[1]
+                    .get(curr.ref_idx[1] as usize)
+                    .copied()
+                    .unwrap_or(-1),
+            )
+        };
+        let (b, ref_b_poc) = if neigh.pred_flag & 1 != 0 {
+            (
+                neigh.mv[0],
+                neigh_ref_pocs[0]
+                    .get(neigh.ref_idx[0] as usize)
+                    .copied()
+                    .unwrap_or(-1),
+            )
+        } else {
+            (
+                neigh.mv[1],
+                neigh_ref_pocs[1]
+                    .get(neigh.ref_idx[1] as usize)
+                    .copied()
+                    .unwrap_or(-1),
+            )
+        };
+        if ref_a_poc == ref_b_poc {
+            if (a.x - b.x).abs() >= 4 || (a.y - b.y).abs() >= 4 {
+                1
+            } else {
+                0
+            }
+        } else {
+            1
+        }
+    } else {
+        // One bi-pred, one uni-pred
+        1
+    }
+}
+
+/// Compute deblocking boundary strengths for a TU or CU, mirroring
+/// FFmpeg `ff_hevc_deblocking_boundary_strengths`.
+///
+/// Called at TU leaf level (for CUs with residual) or at CU level (for skip/no-residual).
+fn compute_deblocking_boundary_strengths(
+    state: &mut PictureState,
+    slice_params: &SliceParams,
+    x0: u32,
+    y0: u32,
+    log2_size: u8,
+) {
     let size = 1u32 << log2_size;
     let pic_w = state.width as usize;
     let bs_w = pic_w >> 2;
+    let log2_min_pu = state.log2_min_pu_size as u32;
+    let min_pu_w = state.min_pu_width;
+    let log2_min_tb = state.log2_min_tb_size;
+    let min_tb_w = state.min_tb_width;
 
-    if y0 > 0 {
+    // Check if current block is intra
+    let x_pu = (x0 >> log2_min_pu) as usize;
+    let y_pu = (y0 >> log2_min_pu) as usize;
+    let is_intra = state.tab_mvf[y_pu * min_pu_w + x_pu].pred_flag == 0;
+
+    // Use the current slice's ref_pic_list_pocs as the "current" ref list
+    let curr_ref_pocs = &slice_params.ref_pic_list_pocs;
+
+    // Top boundary: y0 > 0 && 8-aligned
+    if y0 > 0 && (y0 & 7) == 0 {
+        let yp_pu = ((y0 - 1) >> log2_min_pu) as usize;
+        let yq_pu = (y0 >> log2_min_pu) as usize;
+        let yp_tu = ((y0 - 1) >> log2_min_tb) as usize;
+        let yq_tu = (y0 >> log2_min_tb) as usize;
+
         let yy = (y0 >> 2) as usize;
-        let xx_start = (x0 >> 2) as usize;
-        let xx_end = ((x0 + size) >> 2) as usize;
-        for xx in xx_start..xx_end {
-            if state.bs_horizontal[yy * bs_w + xx] == 0 {
-                state.bs_horizontal[yy * bs_w + xx] = 1;
-            }
+        for i in (0..size).step_by(4) {
+            let x_cur = x0 + i;
+            let xx = (x_cur >> 2) as usize;
+            let xpu = (x_cur >> log2_min_pu) as usize;
+            let xtu = (x_cur >> log2_min_tb) as usize;
+
+            let top_mvf = &state.tab_mvf[yp_pu * min_pu_w + xpu];
+            let curr_mvf = &state.tab_mvf[yq_pu * min_pu_w + xpu];
+
+            let bs = if curr_mvf.pred_flag == 0 || top_mvf.pred_flag == 0 {
+                // At least one side is intra (pred_flag == 0 means intra in our encoding)
+                2
+            } else {
+                let top_cbf = state.tab_cbf_luma[yp_tu * min_tb_w + xtu];
+                let curr_cbf = state.tab_cbf_luma[yq_tu * min_tb_w + xtu];
+                if top_cbf != 0 || curr_cbf != 0 {
+                    1
+                } else {
+                    // For the neighbor's ref_pocs, we use the same slice's pocs
+                    // (correct for non-cross-slice-boundary edges)
+                    inter_boundary_strength(curr_mvf, top_mvf, curr_ref_pocs, curr_ref_pocs)
+                }
+            };
+            state.bs_horizontal[yy * bs_w + xx] = bs;
         }
     }
-    if x0 > 0 {
+
+    // Left boundary: x0 > 0 && 8-aligned
+    if x0 > 0 && (x0 & 7) == 0 {
+        let xp_pu = ((x0 - 1) >> log2_min_pu) as usize;
+        let xq_pu = (x0 >> log2_min_pu) as usize;
+        let xp_tu = ((x0 - 1) >> log2_min_tb) as usize;
+        let xq_tu = (x0 >> log2_min_tb) as usize;
+
         let xx = (x0 >> 2) as usize;
-        let yy_start = (y0 >> 2) as usize;
-        let yy_end = ((y0 + size) >> 2) as usize;
-        for yy in yy_start..yy_end {
-            if state.bs_vertical[yy * bs_w + xx] == 0 {
-                state.bs_vertical[yy * bs_w + xx] = 1;
+        for i in (0..size).step_by(4) {
+            let y_cur = y0 + i;
+            let yy = (y_cur >> 2) as usize;
+            let ypu = (y_cur >> log2_min_pu) as usize;
+            let ytu = (y_cur >> log2_min_tb) as usize;
+
+            let left_mvf = &state.tab_mvf[ypu * min_pu_w + xp_pu];
+            let curr_mvf = &state.tab_mvf[ypu * min_pu_w + xq_pu];
+
+            let bs = if curr_mvf.pred_flag == 0 || left_mvf.pred_flag == 0 {
+                2
+            } else {
+                let left_cbf = state.tab_cbf_luma[ytu * min_tb_w + xp_tu];
+                let curr_cbf = state.tab_cbf_luma[ytu * min_tb_w + xq_tu];
+                if left_cbf != 0 || curr_cbf != 0 {
+                    1
+                } else {
+                    inter_boundary_strength(curr_mvf, left_mvf, curr_ref_pocs, curr_ref_pocs)
+                }
+            };
+            state.bs_vertical[yy * bs_w + xx] = bs;
+        }
+    }
+
+    // Internal PU boundaries within a large TU (for inter blocks only)
+    if (log2_size as u32) > log2_min_pu && !is_intra {
+        // Internal horizontal PU boundaries (every 8 pixels)
+        for j in (8..size).step_by(8) {
+            let yp_pu = ((y0 + j - 1) >> log2_min_pu) as usize;
+            let yq_pu = ((y0 + j) >> log2_min_pu) as usize;
+            let yy = ((y0 + j) >> 2) as usize;
+
+            for i in (0..size).step_by(4) {
+                let x_cur = x0 + i;
+                let xx = (x_cur >> 2) as usize;
+                let xpu = (x_cur >> log2_min_pu) as usize;
+
+                let top_mvf = &state.tab_mvf[yp_pu * min_pu_w + xpu];
+                let curr_mvf = &state.tab_mvf[yq_pu * min_pu_w + xpu];
+
+                let bs = inter_boundary_strength(curr_mvf, top_mvf, curr_ref_pocs, curr_ref_pocs);
+                state.bs_horizontal[yy * bs_w + xx] = bs;
+            }
+        }
+
+        // Internal vertical PU boundaries (every 8 pixels)
+        for j in (0..size).step_by(4) {
+            let ypu = ((y0 + j) >> log2_min_pu) as usize;
+            let yy = ((y0 + j) >> 2) as usize;
+
+            for i in (8..size).step_by(8) {
+                let xp_pu = ((x0 + i - 1) >> log2_min_pu) as usize;
+                let xq_pu = ((x0 + i) >> log2_min_pu) as usize;
+                let xx = ((x0 + i) >> 2) as usize;
+
+                let left_mvf = &state.tab_mvf[ypu * min_pu_w + xp_pu];
+                let curr_mvf = &state.tab_mvf[ypu * min_pu_w + xq_pu];
+
+                let bs = inter_boundary_strength(curr_mvf, left_mvf, curr_ref_pocs, curr_ref_pocs);
+                state.bs_vertical[yy * bs_w + xx] = bs;
             }
         }
     }
@@ -1955,8 +2188,12 @@ fn decode_coding_unit(
             slice_params.weighted_pred_flag,
             &slice_params.pred_weight_table,
         );
-        // Deblocking for inter skip: mark edges with bS=1.
-        mark_inter_cu_boundaries(state, x0, y0, log2_cb_size);
+        // Skip CUs have no residual and no cu_qp_delta. Write the current QP
+        // (slice QP + accumulated delta) into the QP table for deblocking.
+        let qp_y = slice_qp_y + state.last_cu_qp_delta;
+        write_qp_y_table(state, x0, y0, log2_cb_size, qp_y);
+        // Deblocking for inter skip/no-residual: compute bS per spec 8.7.2.
+        compute_deblocking_boundary_strengths(state, slice_params, x0, y0, log2_cb_size);
         state.cu_count += 1;
         return Ok(());
     }
@@ -2293,10 +2530,13 @@ fn decode_coding_unit(
                 inter_split,
                 0,
                 TransformTreeCbf::default(),
+                slice_params,
             )?;
         } else {
-            // No residual: for inter, mark deblocking edges.
-            mark_inter_cu_boundaries(state, x0, y0, log2_cb_size);
+            // No residual: write QP for deblocking and compute bS per spec 8.7.2.
+            let qp_y = slice_qp_y + state.last_cu_qp_delta;
+            write_qp_y_table(state, x0, y0, log2_cb_size, qp_y);
+            compute_deblocking_boundary_strengths(state, slice_params, x0, y0, log2_cb_size);
         }
     }
 
@@ -2464,6 +2704,7 @@ fn decode_transform_tree(
     inter_split: bool,
     blk_idx: u8,
     parent_cbf: TransformTreeCbf,
+    slice_params: &SliceParams,
 ) -> Result<TransformTreeCbf, DecodeError> {
     // 1) Decide split_transform_flag (FFmpeg `hls_transform_tree` lines 1566-1580).
     let split_transform_flag = if log2_trafo_size <= sps.max_tb_log2_size_y
@@ -2524,6 +2765,7 @@ fn decode_transform_tree(
             false, // inter_split only at depth 0
             0,
             child_cbf,
+            slice_params,
         )?;
         child_cbf = decode_transform_tree(
             cabac,
@@ -2545,6 +2787,7 @@ fn decode_transform_tree(
             false,
             1,
             child_cbf,
+            slice_params,
         )?;
         child_cbf = decode_transform_tree(
             cabac,
@@ -2566,6 +2809,7 @@ fn decode_transform_tree(
             false,
             2,
             child_cbf,
+            slice_params,
         )?;
         let final_cbf = decode_transform_tree(
             cabac,
@@ -2587,6 +2831,7 @@ fn decode_transform_tree(
             false,
             3,
             child_cbf,
+            slice_params,
         )?;
         Ok(final_cbf)
     } else {
@@ -2606,6 +2851,7 @@ fn decode_transform_tree(
             trafo_depth,
             blk_idx,
             inherited,
+            slice_params,
         )
     }
 }
@@ -2689,6 +2935,7 @@ fn decode_transform_unit(
     trafo_depth: u8,
     blk_idx: u8,
     inherited: TransformTreeCbf,
+    slice_params: &SliceParams,
 ) -> Result<TransformTreeCbf, DecodeError> {
     let is_intra = pred_mode == PredMode::Intra;
 
@@ -2712,6 +2959,23 @@ fn decode_transform_unit(
         true
     };
     state.last_cbf_luma = cbf_luma;
+
+    // Write cbf_luma to per-TU table for deblocking boundary strength.
+    {
+        let tu_size = 1u32 << log2_trafo_size;
+        let x_tu_start = (x0 >> state.log2_min_tb_size) as usize;
+        let y_tu_start = (y0 >> state.log2_min_tb_size) as usize;
+        let tu_count = (tu_size >> state.log2_min_tb_size).max(1) as usize;
+        let val = if cbf_luma { 1u8 } else { 0u8 };
+        for j in 0..tu_count {
+            for i in 0..tu_count {
+                let idx = (y_tu_start + j) * state.min_tb_width + (x_tu_start + i);
+                if idx < state.tab_cbf_luma.len() {
+                    state.tab_cbf_luma[idx] = val;
+                }
+            }
+        }
+    }
 
     let new_cbf = inherited;
     let do_chroma_inline = sps.chroma_format_idc == 1 && log2_trafo_size > 2;
@@ -2848,6 +3112,9 @@ fn decode_transform_unit(
     write_qp_y_table(state, x0, y0, log2_trafo_size, qp_y);
     if is_intra {
         mark_intra_tu_boundaries(state, x0, y0, log2_trafo_size);
+    } else {
+        // Inter TU leaf: compute boundary strengths using cbf_luma + MV comparison.
+        compute_deblocking_boundary_strengths(state, slice_params, x0, y0, log2_trafo_size);
     }
 
     Ok(new_cbf)

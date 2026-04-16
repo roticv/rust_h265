@@ -2755,13 +2755,169 @@ mod tests {
     #[test]
     fn test_decode_deblock_sao_320x240_hash() {
         let hash = decode_and_hash("deblock_sao_320x240.h265", 10);
-        // Known mismatch — deblock/SAO interaction. FFmpeg reference:
-        // "e672d49a06df7798d7c5c1610b5ccfe2e37772bbbf4eee3a2d3877838d12dc82"
-        let expected = "a4d3520c78a31f036ffa5a08c6e785f996abcf0caefce78f575c11a4cec69bc1";
+        let expected = "e672d49a06df7798d7c5c1610b5ccfe2e37772bbbf4eee3a2d3877838d12dc82";
         assert_eq!(
             hash, expected,
             "deblock_sao_320x240 hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
+    }
+
+    /// Same content as deblock_sao_320x240 but with `--no-deblock`.
+    /// Verifies that pre-deblock inter prediction is byte-exact.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=320x240:rate=30:duration=0.34" \
+    ///   -frames:v 10 -pix_fmt yuv420p -f rawvideo /tmp/input.yuv
+    /// x265 --input /tmp/input.yuv --input-res 320x240 --fps 30 --frames 10 \
+    ///   --preset ultrafast --ctu 16 --no-wpp --bframes 1 --ref 2 --qp 30 \
+    ///   --keyint 10 --no-open-gop --no-weightp --no-weightb --no-scenecut \
+    ///   --no-sao --no-deblock --no-psnr --no-ssim --no-info \
+    ///   -o deblock_sao_nodeblock.h265
+    /// ```
+    #[test]
+    fn test_decode_deblock_sao_nodeblock_hash() {
+        let hash = decode_and_hash("deblock_sao_nodeblock.h265", 10);
+        // FFmpeg reference: ffmpeg -i deblock_sao_nodeblock.h265 -f rawvideo -pix_fmt yuv420p pipe:1 | shasum -a 256
+        let expected = "609700078af4bf8de52d904a89ae75ced37b1e98e28cb0dc74ebc5bc980faff5";
+        assert_eq!(
+            hash, expected,
+            "deblock_sao_nodeblock hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// Diagnostic test: compare our decoded output of deblock_sao_320x240.h265
+    /// against FFmpeg's output, frame by frame, to find which frames mismatch
+    /// and where.
+    #[test]
+    #[ignore]
+    fn diag_deblock_sao() {
+        use std::process::Command;
+
+        let h265_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/deblock_sao_320x240.h265"
+        );
+        let h265 = std::fs::read(h265_path).expect("read fixture");
+
+        // Decode with our decoder
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+        let mut frames: Vec<Frame> = Vec::new();
+        for nal in &nals {
+            if let Ok(Some(frame)) = decoder.decode_nal(nal) {
+                frames.push(frame);
+            }
+        }
+        while let Some(frame) = decoder.flush() {
+            frames.push(frame);
+        }
+        frames.sort_by_key(|f| f.pic_order_cnt);
+
+        // Decode with FFmpeg
+        let ffmpeg_out = Command::new("ffmpeg")
+            .args([
+                "-i", h265_path, "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1",
+            ])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("ffmpeg");
+        let ref_yuv = ffmpeg_out.stdout;
+
+        let w = frames[0].width as usize;
+        let h = frames[0].height as usize;
+        let y_size = w * h;
+        let uv_size = (w / 2) * (h / 2);
+        let frame_size = y_size + 2 * uv_size;
+        assert_eq!(
+            ref_yuv.len(),
+            frame_size * frames.len(),
+            "ref yuv size mismatch"
+        );
+
+        let mut first_mismatch_frame = None;
+        for (fi, frame) in frames.iter().enumerate() {
+            let ref_off = fi * frame_size;
+            let ref_y = &ref_yuv[ref_off..ref_off + y_size];
+            let ref_u = &ref_yuv[ref_off + y_size..ref_off + y_size + uv_size];
+            let ref_v = &ref_yuv[ref_off + y_size + uv_size..ref_off + frame_size];
+
+            let mut mismatch = false;
+            let mut y_mismatches = 0;
+            // Check Y plane
+            for i in 0..y_size {
+                if frame.y[i] != ref_y[i] {
+                    let px = i % w;
+                    let py = i / w;
+                    if y_mismatches < 10 {
+                        let on_vedge = (px % 8) < 4 || (8 - (px % 8)) < 4;
+                        let on_hedge = (py % 8) < 4 || (8 - (py % 8)) < 4;
+                        let near_deblock_edge = on_vedge || on_hedge;
+                        eprintln!(
+                            "  Frame {} (POC {}): Y[{},{}] ours={} ref={} diff={} deblock_edge={}",
+                            fi,
+                            frame.pic_order_cnt,
+                            px,
+                            py,
+                            frame.y[i],
+                            ref_y[i],
+                            frame.y[i] as i32 - ref_y[i] as i32,
+                            near_deblock_edge
+                        );
+                    }
+                    if first_mismatch_frame.is_none() {
+                        first_mismatch_frame = Some(fi);
+                    }
+                    mismatch = true;
+                    y_mismatches += 1;
+                }
+            }
+            if y_mismatches > 0 {
+                eprintln!("  Frame {}: total Y mismatches: {}", fi, y_mismatches);
+            }
+            if !mismatch {
+                // Check U plane
+                for i in 0..uv_size {
+                    if frame.u[i] != ref_u[i] {
+                        let px = i % (w / 2);
+                        let py = i / (w / 2);
+                        eprintln!(
+                            "Frame {} (POC {}): U mismatch at ({},{}) ours={} ref={}",
+                            fi, frame.pic_order_cnt, px, py, frame.u[i], ref_u[i]
+                        );
+                        if first_mismatch_frame.is_none() {
+                            first_mismatch_frame = Some(fi);
+                        }
+                        mismatch = true;
+                        break;
+                    }
+                }
+            }
+            if !mismatch {
+                // Check V plane
+                for i in 0..uv_size {
+                    if frame.v[i] != ref_v[i] {
+                        let px = i % (w / 2);
+                        let py = i / (w / 2);
+                        eprintln!(
+                            "Frame {} (POC {}): V mismatch at ({},{}) ours={} ref={}",
+                            fi, frame.pic_order_cnt, px, py, frame.v[i], ref_v[i]
+                        );
+                        if first_mismatch_frame.is_none() {
+                            first_mismatch_frame = Some(fi);
+                        }
+                        mismatch = true;
+                        break;
+                    }
+                }
+            }
+            if !mismatch {
+                eprintln!("Frame {} (POC {}): MATCH", fi, frame.pic_order_cnt);
+            }
+        }
+        if let Some(f) = first_mismatch_frame {
+            panic!("First mismatch at frame {}", f);
+        }
     }
 
     /// 320x240, 10 frames with sign data hiding AND default scaling lists
