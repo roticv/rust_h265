@@ -2135,11 +2135,11 @@ fn decode_coding_unit(
     log2_cb_size: u8,
     cb_depth: u8,
 ) -> Result<(), DecodeError> {
-    if pps.transquant_bypass_enabled_flag {
-        return Err(DecodeError::Unsupported(
-            "cu_transquant_bypass not supported",
-        ));
-    }
+    let cu_transquant_bypass = if pps.transquant_bypass_enabled_flag {
+        cabac.decode_bin(&mut contexts.state[ctx::CU_TRANSQUANT_BYPASS_FLAG]) != 0
+    } else {
+        false
+    };
 
     let cb_size = 1u32 << log2_cb_size;
     let x_cb = (x0 >> state.log2_min_cb_size) as usize;
@@ -2553,6 +2553,7 @@ fn decode_coding_unit(
                 0,
                 TransformTreeCbf::default(),
                 slice_params,
+                cu_transquant_bypass,
             )?;
         } else {
             // No residual: the end-of-CU block below still runs the
@@ -2746,6 +2747,7 @@ fn decode_transform_tree(
     blk_idx: u8,
     parent_cbf: TransformTreeCbf,
     slice_params: &SliceParams,
+    cu_transquant_bypass: bool,
 ) -> Result<TransformTreeCbf, DecodeError> {
     // 1) Decide split_transform_flag (FFmpeg `hls_transform_tree` lines 1566-1580).
     let split_transform_flag = if log2_trafo_size <= sps.max_tb_log2_size_y
@@ -2812,6 +2814,7 @@ fn decode_transform_tree(
             0,
             inherited,
             slice_params,
+            cu_transquant_bypass,
         )?;
         let _ = decode_transform_tree(
             cabac,
@@ -2834,6 +2837,7 @@ fn decode_transform_tree(
             1,
             inherited,
             slice_params,
+            cu_transquant_bypass,
         )?;
         let _ = decode_transform_tree(
             cabac,
@@ -2856,6 +2860,7 @@ fn decode_transform_tree(
             2,
             inherited,
             slice_params,
+            cu_transquant_bypass,
         )?;
         let final_cbf = decode_transform_tree(
             cabac,
@@ -2878,6 +2883,7 @@ fn decode_transform_tree(
             3,
             inherited,
             slice_params,
+            cu_transquant_bypass,
         )?;
         Ok(final_cbf)
     } else {
@@ -2898,6 +2904,7 @@ fn decode_transform_tree(
             blk_idx,
             inherited,
             slice_params,
+            cu_transquant_bypass,
         )
     }
 }
@@ -2982,6 +2989,7 @@ fn decode_transform_unit(
     blk_idx: u8,
     inherited: TransformTreeCbf,
     slice_params: &SliceParams,
+    cu_transquant_bypass: bool,
 ) -> Result<TransformTreeCbf, DecodeError> {
     let is_intra = pred_mode == PredMode::Intra;
 
@@ -3072,6 +3080,7 @@ fn decode_transform_unit(
                 qp_y,
                 scan_idx,
                 is_intra,
+                cu_transquant_bypass,
             )?;
             apply_residual_to_luma(state, x0, y0, log2_trafo_size, &block, is_intra);
             state.last_luma_residual = Some(block);
@@ -3108,6 +3117,7 @@ fn decode_transform_unit(
                     inherited.cbf_cb,
                     inherited.cbf_cr,
                     true,
+                    cu_transquant_bypass,
                 )?;
             } else if do_chroma_deferred {
                 let chroma_mode = state.last_chroma_pred_mode;
@@ -3126,6 +3136,7 @@ fn decode_transform_unit(
                     inherited.cbf_cb,
                     inherited.cbf_cr,
                     true,
+                    cu_transquant_bypass,
                 )?;
             }
         } else {
@@ -3153,6 +3164,7 @@ fn decode_transform_unit(
                     inherited.cbf_cb,
                     inherited.cbf_cr,
                     false,
+                    cu_transquant_bypass,
                 )?;
             } else if do_chroma_deferred && (inherited.cbf_cb || inherited.cbf_cr) {
                 decode_chroma_residuals(
@@ -3169,6 +3181,7 @@ fn decode_transform_unit(
                     inherited.cbf_cb,
                     inherited.cbf_cr,
                     false,
+                    cu_transquant_bypass,
                 )?;
             }
         }
@@ -3326,6 +3339,7 @@ fn decode_chroma_residuals(
     cbf_cb: bool,
     cbf_cr: bool,
     is_intra: bool,
+    cu_transquant_bypass: bool,
 ) -> Result<(), DecodeError> {
     let x_c = (x0 >> 1) as usize;
     let y_c = (y0 >> 1) as usize;
@@ -3375,12 +3389,13 @@ fn decode_chroma_residuals(
             qp_c,
             scan_idx,
             is_intra,
+            cu_transquant_bypass,
         )?;
 
         // Apply inverse transform + add to chroma plane.
         let size_c = 1usize << log2_trafo_size_c;
         let mut residual = block.coeffs.clone();
-        if !block.transform_skip {
+        if !block.transform_skip && !block.cu_transquant_bypass {
             apply_inverse_transform(
                 &mut residual,
                 log2_trafo_size_c,
@@ -3725,7 +3740,7 @@ fn apply_residual_to_luma(
     // regular DCT. Previously this flag was `log2_size == 2`, which silently
     // miscompiled inter 4×4 luma TUs (only reachable with
     // `max_transform_hierarchy_depth_inter >= 2`, i.e. x265 --preset slow).
-    if !block.transform_skip {
+    if !block.transform_skip && !block.cu_transquant_bypass {
         let is_luma_intra_4x4 = log2_size == 2 && is_intra;
         apply_inverse_transform(
             &mut residual_pixels,

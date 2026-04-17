@@ -8,7 +8,7 @@
 //! line by line for the supported subset:
 //!   - 8-bit luma/chroma 4:2:0
 //!   - `transform_skip_flag` is supported for Main Profile (4×4 TUs only)
-//!   - No `cu_transquant_bypass_flag`
+//!   - `cu_transquant_bypass_flag` supported (skips dequant + transform)
 //!   - `scaling_list_enabled_flag` supported (default or explicit lists)
 //!   - No `persistent_rice_adaptation_enabled` (range extension)
 //!   - `sign_data_hiding_enabled_flag` supported (Phase 3a-6)
@@ -395,6 +395,10 @@ pub struct ResidualBlock {
     /// When true, the inverse transform is bypassed — the dequantized
     /// coefficients ARE the spatial-domain residual (HEVC spec 8.6.4).
     pub transform_skip: bool,
+    /// When true, both dequantization and inverse transform are bypassed —
+    /// the raw decoded coefficient levels are the spatial-domain residual.
+    /// Also disables deblocking on this CU's boundaries (HEVC spec 8.7.2).
+    pub cu_transquant_bypass: bool,
 }
 
 /// Compute the dequantization scale parameters for a TU.
@@ -441,11 +445,13 @@ pub fn decode_residual_coding(
     qp: i32,
     scan_idx: ScanOrder,
     is_intra: bool,
+    cu_transquant_bypass: bool,
 ) -> Result<ResidualBlock, DecodeError> {
     // Decode transform_skip_flag (HEVC spec 7.3.8.11 / 9.3.4.2.5).
     // In Main Profile, transform_skip is only allowed for 4×4 TUs
     // (log2_max_transform_skip_block_size defaults to 2 without range extensions).
-    let transform_skip = pps.transform_skip_enabled_flag && log2_trafo_size <= 2 && {
+    // When cu_transquant_bypass is set, transform_skip_flag is not decoded (spec 7.3.8.11).
+    let transform_skip = !cu_transquant_bypass && pps.transform_skip_enabled_flag && log2_trafo_size <= 2 && {
         let inc = if plane == ResidualPlane::Luma { 0 } else { 1 };
         cabac.decode_bin(&mut contexts.state[ctx::TRANSFORM_SKIP_FLAG + inc]) != 0
     };
@@ -718,10 +724,10 @@ pub fn decode_residual_coding(
         // In Main Profile (no Range Extensions), SDH depends only on the
         // scan-distance test. transform_skip_flag only disables SDH when
         // implicit_rdpcm_enabled is active (a Range Extension feature we
-        // don't support). cu_transquant_bypass_flag is always 0 (rejected
-        // at PPS level). See FFmpeg cabac.c:1348-1355 for the full gate.
+        // don't support). cu_transquant_bypass_flag disables SDH per spec.
+        // See FFmpeg cabac.c:1348-1355 for the full gate.
         let sign_hidden =
-            pps.sign_data_hiding_enabled_flag && (last_nz_pos_in_cg - first_nz_pos_in_cg >= 4);
+            pps.sign_data_hiding_enabled_flag && !cu_transquant_bypass && (last_nz_pos_in_cg - first_nz_pos_in_cg >= 4);
 
         // Sign flags (bypass). When SDH is active on this sub-block, the
         // encoder omitted the sign bit of the first non-zero coefficient in
@@ -785,27 +791,32 @@ pub fn decode_residual_coding(
             }
             sign_bits = (sign_bits << 1) & 0xffff;
 
-            // Dequantize with scaling matrix lookup (HEVC spec 8.6.3).
-            let scale_m: u32 = match &scale_matrix {
-                Some(sm) => {
-                    // For 16×16 and 32×32 TUs, the DC position uses dc_scale.
-                    if x_c != 0 || y_c != 0 || log2_trafo_size < 4 {
-                        let pos = match log2_trafo_size {
-                            3 => (y_c << 3) + x_c,
-                            4 => ((y_c >> 1) << 3) + (x_c >> 1),
-                            5 => ((y_c >> 2) << 3) + (x_c >> 2),
-                            _ => (y_c << 2) + x_c, // log2 == 2 (4×4)
-                        };
-                        sm[pos] as u32
-                    } else {
-                        dc_scale as u32
+            if cu_transquant_bypass {
+                // No dequantization: raw coefficient levels are the spatial residual.
+                coeffs[y_c * trafo_size + x_c] = trans_coeff_level as i16;
+            } else {
+                // Dequantize with scaling matrix lookup (HEVC spec 8.6.3).
+                let scale_m: u32 = match &scale_matrix {
+                    Some(sm) => {
+                        // For 16×16 and 32×32 TUs, the DC position uses dc_scale.
+                        if x_c != 0 || y_c != 0 || log2_trafo_size < 4 {
+                            let pos = match log2_trafo_size {
+                                3 => (y_c << 3) + x_c,
+                                4 => ((y_c >> 1) << 3) + (x_c >> 1),
+                                5 => ((y_c >> 2) << 3) + (x_c >> 2),
+                                _ => (y_c << 2) + x_c, // log2 == 2 (4×4)
+                            };
+                            sm[pos] as u32
+                        } else {
+                            dc_scale as u32
+                        }
                     }
-                }
-                None => 16,
-            };
-            let dq = (trans_coeff_level * scale as i64 * scale_m as i64 + add as i64) >> shift;
-            let dq = dq.clamp(-32768, 32767) as i16;
-            coeffs[y_c * trafo_size + x_c] = dq;
+                    None => 16,
+                };
+                let dq = (trans_coeff_level * scale as i64 * scale_m as i64 + add as i64) >> shift;
+                let dq = dq.clamp(-32768, 32767) as i16;
+                coeffs[y_c * trafo_size + x_c] = dq;
+            }
         }
     }
 
@@ -816,7 +827,7 @@ pub fn decode_residual_coding(
     // This is separate from the standard per-coefficient dequant already applied
     // above. Without this, the coefficients are ~32× too large for 8-bit 4×4
     // (shift=5), causing massive clipping artifacts.
-    if transform_skip {
+    if transform_skip && !cu_transquant_bypass {
         let bd = if plane == ResidualPlane::Luma {
             sps.bit_depth_luma
         } else {
@@ -837,6 +848,7 @@ pub fn decode_residual_coding(
         last_sig_x,
         last_sig_y,
         transform_skip,
+        cu_transquant_bypass,
     })
 }
 

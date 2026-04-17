@@ -3123,4 +3123,31 @@ mod tests {
             "ramp64 hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
     }
+
+    /// 64×64, 2 frames (I+P), lossless with `cu_transquant_bypass_flag`.
+    /// When `transquant_bypass_enabled_flag = 1` in PPS, each CU can set
+    /// `cu_transquant_bypass_flag` which skips both dequantization and
+    /// inverse transform — the raw decoded coefficient levels ARE the
+    /// spatial residual. Also disables sign data hiding and deblocking
+    /// on the bypassed CU's boundaries.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=64x64:rate=30:duration=0.1" \
+    ///   -frames:v 2 -pix_fmt yuv420p -f rawvideo /tmp/in.yuv
+    /// x265 --input /tmp/in.yuv --input-res 64x64 --fps 30 --frames 2 \
+    ///   --preset ultrafast --ctu 16 --keyint 30 --no-open-gop --bframes 0 \
+    ///   --lossless --no-cutree --no-aq --no-sao --no-deblock --no-wpp \
+    ///   --no-info --no-psnr --no-ssim \
+    ///   -o transquant_bypass_64x64.h265
+    /// ```
+    #[test]
+    fn test_decode_transquant_bypass_hash() {
+        let hash = decode_and_hash("transquant_bypass_64x64.h265", 2);
+        let expected = "6bf3ca6a6ce625fbde46994777239aae61d3b92b75729cece0945f89edec1435";
+        assert_eq!(
+            hash, expected,
+            "transquant_bypass hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
 }

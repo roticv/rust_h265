@@ -146,7 +146,7 @@ mod parameter_set_tests {
         assert_eq!(pps.pps_cr_qp_offset, 0);
         assert!(!pps.weighted_pred_flag);
         assert!(!pps.weighted_bipred_flag);
-        assert!(!pps.transquant_bypass_enabled_flag);
+        // transquant_bypass_enabled_flag is now supported (cu_transquant_bypass)
         assert!(!pps.tiles_enabled_flag);
         assert!(!pps.entropy_coding_sync_enabled_flag);
         assert!(pps.pps_loop_filter_across_slices_enabled_flag);
