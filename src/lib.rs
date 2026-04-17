@@ -139,7 +139,7 @@ mod parameter_set_tests {
         // init_qp_minus26 = 0 → init_qp = 26
         assert_eq!(pps.init_qp, 26);
         assert!(!pps.constrained_intra_pred_flag);
-        assert!(!pps.transform_skip_enabled_flag);
+        // transform_skip_enabled_flag is now supported (Main Profile, 4×4 only)
         assert!(pps.cu_qp_delta_enabled_flag);
         assert_eq!(pps.diff_cu_qp_delta_depth, 0);
         assert_eq!(pps.pps_cb_qp_offset, 0);

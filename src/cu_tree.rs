@@ -3380,14 +3380,16 @@ fn decode_chroma_residuals(
         // Apply inverse transform + add to chroma plane.
         let size_c = 1usize << log2_trafo_size_c;
         let mut residual = block.coeffs.clone();
-        apply_inverse_transform(
-            &mut residual,
-            log2_trafo_size_c,
-            block.last_sig_x,
-            block.last_sig_y,
-            sps.bit_depth_chroma as u32,
-            false, // chroma never uses DST
-        );
+        if !block.transform_skip {
+            apply_inverse_transform(
+                &mut residual,
+                log2_trafo_size_c,
+                block.last_sig_x,
+                block.last_sig_y,
+                sps.bit_depth_chroma as u32,
+                false, // chroma never uses DST
+            );
+        }
         let dst_stride = state.uv_stride;
         let dst_plane = if c_idx == 1 {
             &mut state.u_plane
@@ -3723,15 +3725,19 @@ fn apply_residual_to_luma(
     // regular DCT. Previously this flag was `log2_size == 2`, which silently
     // miscompiled inter 4×4 luma TUs (only reachable with
     // `max_transform_hierarchy_depth_inter >= 2`, i.e. x265 --preset slow).
-    let is_luma_intra_4x4 = log2_size == 2 && is_intra;
-    apply_inverse_transform(
-        &mut residual_pixels,
-        log2_size,
-        block.last_sig_x,
-        block.last_sig_y,
-        state.bit_depth as u32,
-        is_luma_intra_4x4,
-    );
+    if !block.transform_skip {
+        let is_luma_intra_4x4 = log2_size == 2 && is_intra;
+        apply_inverse_transform(
+            &mut residual_pixels,
+            log2_size,
+            block.last_sig_x,
+            block.last_sig_y,
+            state.bit_depth as u32,
+            is_luma_intra_4x4,
+        );
+    }
+    // When transform_skip, the dequantized coefficients ARE the spatial
+    // residual — skip IDCT, add directly (HEVC spec 8.6.4).
     let dst_stride = state.y_stride;
     let dst_offset = (y0 as usize) * dst_stride + (x0 as usize);
     let dst = &mut state.y_plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];

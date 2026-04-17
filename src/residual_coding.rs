@@ -7,7 +7,7 @@
 //! Mirrors FFmpeg `libavcodec/hevc/cabac.c` `ff_hevc_hls_residual_coding`
 //! line by line for the supported subset:
 //!   - 8-bit luma/chroma 4:2:0
-//!   - No `transform_skip_flag` (PPS rejects it)
+//!   - `transform_skip_flag` is supported for Main Profile (4×4 TUs only)
 //!   - No `cu_transquant_bypass_flag`
 //!   - `scaling_list_enabled_flag` supported (default or explicit lists)
 //!   - No `persistent_rice_adaptation_enabled` (range extension)
@@ -392,6 +392,9 @@ pub struct ResidualBlock {
     pub log2_size: u8,
     pub last_sig_x: u32,
     pub last_sig_y: u32,
+    /// When true, the inverse transform is bypassed — the dequantized
+    /// coefficients ARE the spatial-domain residual (HEVC spec 8.6.4).
+    pub transform_skip: bool,
 }
 
 /// Compute the dequantization scale parameters for a TU.
@@ -439,11 +442,14 @@ pub fn decode_residual_coding(
     scan_idx: ScanOrder,
     is_intra: bool,
 ) -> Result<ResidualBlock, DecodeError> {
-    if pps.transform_skip_enabled_flag {
-        return Err(DecodeError::Unsupported(
-            "transform_skip_flag in residual_coding not supported",
-        ));
-    }
+    // Decode transform_skip_flag (HEVC spec 7.3.8.11 / 9.3.4.2.5).
+    // In Main Profile, transform_skip is only allowed for 4×4 TUs
+    // (log2_max_transform_skip_block_size defaults to 2 without range extensions).
+    let transform_skip = pps.transform_skip_enabled_flag && log2_trafo_size <= 2 && {
+        let inc = if plane == ResidualPlane::Luma { 0 } else { 1 };
+        cabac.decode_bin(&mut contexts.state[ctx::TRANSFORM_SKIP_FLAG + inc]) != 0
+    };
+
     // Horizontal and vertical scan orders are used for angular intra modes
     // 6..14 (vert) and 22..30 (horiz) at log2_trafo_size <= 3.
 
@@ -708,10 +714,12 @@ pub fn decode_residual_coding(
             coeff_abs_level_greater1_flag[first_greater1_idx as usize] += greater2;
         }
 
-        // Sign data hiding gating (HEVC spec 7.4.9.11 / FFmpeg cabac.c).
-        // We don't support `cu_transquant_bypass_flag`, `transform_skip_flag`
-        // (which would gate implicit RDPCM), or `explicit_rdpcm_flag`, so the
-        // only condition that matters is the scan-distance test.
+        // Sign data hiding gating (HEVC spec 7.4.9.11 / FFmpeg cabac.c:1348-1355).
+        // In Main Profile (no Range Extensions), SDH depends only on the
+        // scan-distance test. transform_skip_flag only disables SDH when
+        // implicit_rdpcm_enabled is active (a Range Extension feature we
+        // don't support). cu_transquant_bypass_flag is always 0 (rejected
+        // at PPS level). See FFmpeg cabac.c:1348-1355 for the full gate.
         let sign_hidden =
             pps.sign_data_hiding_enabled_flag && (last_nz_pos_in_cg - first_nz_pos_in_cg >= 4);
 
@@ -801,11 +809,34 @@ pub fn decode_residual_coding(
         }
     }
 
+    // For transform_skip, apply the additional dequant shift that compensates
+    // for the IDCT scaling we're skipping. FFmpeg's hevcdsp.dequant() does:
+    //   shift = 15 - bit_depth - log2_trafo_size
+    //   coeff = (coeff + (1 << (shift-1))) >> shift
+    // This is separate from the standard per-coefficient dequant already applied
+    // above. Without this, the coefficients are ~32× too large for 8-bit 4×4
+    // (shift=5), causing massive clipping artifacts.
+    if transform_skip {
+        let bd = if plane == ResidualPlane::Luma {
+            sps.bit_depth_luma
+        } else {
+            sps.bit_depth_chroma
+        } as i32;
+        let ts_shift = 15 - bd - log2_trafo_size as i32;
+        if ts_shift > 0 {
+            let ts_offset = 1i32 << (ts_shift - 1);
+            for c in coeffs.iter_mut() {
+                *c = ((*c as i32 + ts_offset) >> ts_shift) as i16;
+            }
+        }
+    }
+
     Ok(ResidualBlock {
         coeffs,
         log2_size: log2_trafo_size,
         last_sig_x,
         last_sig_y,
+        transform_skip,
     })
 }
 

@@ -3205,6 +3205,36 @@ mod tests {
         );
     }
 
+    /// 128×128, 3 frames (I+P+P) with `--preset medium --tskip --signhide`.
+    /// Exercises `transform_skip_flag` decoding (HEVC spec 7.3.8.11 /
+    /// 9.3.4.2.5): when `transform_skip_enabled_flag = 1`, each 4×4 TU
+    /// decodes a CABAC bin that, if set, bypasses the inverse transform and
+    /// instead applies the additional dequant right-shift from FFmpeg's
+    /// `hevcdsp.dequant()` (shift = 15 - bitDepth - log2TrafoSize). Also
+    /// verifies the sign_data_hiding interaction: in Main Profile (no Range
+    /// Extensions), SDH is NOT disabled by transform_skip_flag — it's only
+    /// gated by `implicit_rdpcm_enabled` which is a Range Extension feature.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=128x128:rate=30:duration=0.2" \
+    ///   -frames:v 3 -pix_fmt yuv420p -f rawvideo /tmp/in.yuv
+    /// x265 --input /tmp/in.yuv --input-res 128x128 --fps 30 --frames 3 \
+    ///   --preset medium --ctu 16 --keyint 30 --no-open-gop --bframes 0 \
+    ///   --tskip --signhide --qp 26 --no-cutree --no-aq --no-sao \
+    ///   --no-deblock --no-wpp --no-info --no-psnr --no-ssim \
+    ///   -o tskip_128x128.h265
+    /// ```
+    #[test]
+    fn test_decode_transform_skip_hash() {
+        let hash = decode_and_hash("tskip_128x128.h265", 3);
+        let expected = "0b4ace7f469d9fcd377efb0a8b9512697e89a3f04a5e726ff9d7f06f4e14c6af";
+        assert_eq!(
+            hash, expected,
+            "tskip_128x128 hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
     #[test]
     #[ignore = "diagnostic — requires /tmp/grad64_ffmpeg.yuv from FFmpeg"]
     fn diag_grad64_pixel() {
