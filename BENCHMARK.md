@@ -231,46 +231,51 @@ the same pattern amplified: MC rises to **85.9%** inclusive (more refs,
 deeper hierarchical-B, denser inter blocks), IDCT drops to 4.3%, and SAO
 appears at 6.3% (slow-preset encodes with more SAO usage).
 
+### Optimization attempt: stack-allocated MC scratch buffers
+
+Replaced all 13 per-PU `vec![0i16; ...]` allocations in the MC path with
+fixed-size stack arrays (`[0i16; MAX_PB_LUMA]`, etc.). Result: malloc/free
+call sites in the profile dropped from 79 to 40, but **wall-clock time was
+unchanged** (1.039 s -> 1.058 s, within noise). The allocation overhead was
+only a few percent at most — the "~23% self-time" initially attributed to
+allocation was actually spent in the filter arithmetic inner loops and the
+weighted-pred combining loops. The stack arrays are still worth keeping
+(fewer heap allocations, better cache locality), but the gap is squarely in
+the per-pixel filter computation.
+
 ## Interpretation
 
-The 4.5–5.1x single-threaded gap at 1080p across both content types and
-presets points at two factors:
+The 4.5–5.1x single-threaded gap at 1080p is dominated by two factors:
 
-1. **SIMD.** FFmpeg's arm64 build uses NEON for the HEVC hot paths: MC
-   7/8-tap luma and 4-tap chroma sub-pel filters (our #1 bottleneck),
-   inverse transforms, deblocking, and SAO. `rust_h265` is pure scalar
-   safe Rust; none of these kernels are vectorized.
+1. **Scalar filter kernels.** The MC 7/8-tap luma and 4-tap chroma sub-pel
+   filters account for ~46% of decode time as pure per-pixel arithmetic.
+   FFmpeg's arm64 build uses NEON intrinsics for these — processing 4-8
+   pixels per instruction vs our 1. This alone explains roughly 3-4x of
+   the gap.
 
-2. **Allocation overhead.** ~29% of decode time is spent in `malloc`/`free`
-   /`memset` for per-PU scratch buffers and per-picture plane allocation.
-   FFmpeg uses pre-allocated frame buffers and stack/thread-local scratch.
-   This is a pure Rust-side optimization opportunity — no SIMD needed.
-
-3. **Threading.** FFmpeg's `-threads 0` enables frame-parallel decode across
+2. **Threading.** FFmpeg's `-threads 0` enables frame-parallel decode across
    all cores. `rust_h265` is single-threaded by design. The `ff-t1 -> ff-tN`
    delta is roughly 3-4x on workloads big enough to keep 10 cores busy.
+
+Allocation overhead (~6% for `PictureState::new`, now minimal for MC) and
+bounds-check overhead are second-order effects, not the primary bottleneck.
 
 ## Priorities
 
 All four real-world fixtures decode byte-exact. Remaining focus is
 performance, ordered by profile-informed impact:
 
-1. **Eliminate per-PU Vec allocation in MC** (~23% of decode). Pre-allocate
-   a reusable `[i16; 64*64]` scratch buffer (or a few for luma + chroma)
-   on `PictureState` or the decoder. This is the single highest-ROI change
-   — pure safe Rust, no SIMD, no algorithmic change.
-
-2. **Pool picture buffers** (~6%). Reuse `PictureState` Y/U/V planes and
-   bookkeeping arrays across frames instead of allocating fresh each time.
-
-3. **NEON SIMD for MC filters** (~38% self-time in filter kernels).
+1. **NEON SIMD for MC filters** (~46% self-time in filter kernels).
    `mc_luma` / `mc_luma_i16` 7/8-tap filter first (27%), then
    `mc_chroma` / `mc_chroma_i16` 4-tap (19%). These are textbook
    NEON workloads: small fixed-tap FIR on contiguous rows.
 
-4. **NEON SIMD for IDCT** (~8%). tr_32 first (4%), then tr_16 (2%).
+2. **NEON SIMD for IDCT** (~8%). tr_32 first (4%), then tr_16 (2%).
 
-5. **Deblocking optimization** (~9%). BS derivation could batch per-8x8
+3. **Pool picture buffers** (~6%). Reuse `PictureState` Y/U/V planes and
+   bookkeeping arrays across frames instead of allocating fresh each time.
+
+4. **Deblocking optimization** (~9%). BS derivation could batch per-8x8
    block instead of per-4x4 edge; filter_luma_edge is a SIMD candidate.
 
 ## Appendix: tool usage
