@@ -170,43 +170,108 @@ comparisons tractable. The 1080p fixture is 10 frames of testsrc2 content
 under ~10 ms should be read as "both finish well under a measurement
 quantum" rather than as meaningful ratios.
 
+## Profile: `bbb_1080p_5s_safe` (1920x1080, 120 frames, safe preset)
+
+Collected with macOS `sample` (1 ms sampling, `RUSTFLAGS="-C force-frame-pointers=yes"`).
+Best-of-5 wall-clock: **1.027 s** (116.8 fps, 242 Mpx/s).
+
+### Function-level breakdown (inclusive, safe preset)
+
+| Function | Inclusive % | Notes |
+|---|---:|---|
+| `motion_compensation_pu` | **68.7%** | The dominant bottleneck |
+| - `mc_luma_i16` | 27.2% | 7/8-tap luma filter (i16 precision for weighted pred) |
+| - `mc_chroma_i16` | 11.1% | 4-tap chroma filter (i16 for weighted pred) |
+| - `mc_chroma` | 7.6% | 4-tap chroma filter (direct u8 path) |
+| - self (alloc, weighted-pred loop, memset) | ~22.8% | Vec allocation per PU is a major contributor |
+| `decode_transform_tree` | 18.6% | Residual decode + IDCT + intra pred |
+| - `apply_inverse_transform` | 8.4% | IDCT (tr_32: 3.9%, tr_16: 1.8%) |
+| - `residual_coding` (CABAC) | 4.7% | sig_coeff_flag / coeff_abs_level bins |
+| - `compute_deblocking_boundary_strengths` | 5.5% | Per-4x4-edge BS derivation |
+| `PictureState::new` | 6.3% | Per-picture Y/U/V + bookkeeping allocation |
+| `deblock_picture` | 3.9% | filter_luma_edge: 2.8% |
+| `decode_prediction_unit` | 2.5% | Merge/AMVP syntax parsing |
+| `predict_intra_chroma` | 1.3% | Angular + build_reference_samples |
+| `decode_bin` (CABAC engine) | 0.3% | Arithmetic core is not the bottleneck |
+
+### Key findings
+
+1. **Motion compensation is 69% of decode time**, not inverse transforms.
+   The earlier BENCHMARK.md prediction ("IDCT first, then MC") was inverted.
+   On real 1080p content with dense inter blocks, MC runs on nearly every PU
+   while IDCT only runs on non-zero TUs (many inter blocks have cbf_luma=0).
+
+2. **Vec allocation inside MC is a major cost.** The weighted-prediction
+   path (`mc_luma_i16`, `mc_chroma_i16`) allocates a `Vec<i16>` scratch
+   buffer per PU, plus the `mc_luma`/`mc_chroma` non-weighted path does
+   similar. The ~22.8% "self" time in `motion_compensation_pu` is dominated
+   by `malloc`/`free`/`memset` calls visible in the profile. Pre-allocating
+   a reusable scratch buffer would eliminate this.
+
+3. **PictureState::new at 6.3%** is pure allocation — Y/U/V planes
+   (1920x1080x1.5 = 3.1 MB) plus deblocking/QP/MV bookkeeping arrays.
+   A picture-buffer pool would amortize this across frames.
+
+4. **IDCT is only 8.4%** — mostly 32x32 (3.9%) and 16x16 (1.8%). Still
+   worth SIMD-ing, but the payoff is ~5x smaller than MC filters.
+
+5. **Deblocking is 9.4% combined** — BS derivation (5.5%) plus the actual
+   filter (3.9%). The BS derivation calls `inter_boundary_strength` per
+   edge, which does MV comparison and ref-picture lookup; this is
+   arithmetic, not memory-bound.
+
+6. **CABAC is not a bottleneck** — `decode_bin` at 0.3% and
+   `residual_coding` at 4.7% (dominated by coefficient-level bin reads,
+   not the arithmetic engine). No need to optimize the CABAC core.
+
+### Slow preset comparison
+
+Profiling `bbb_1080p_5s_slow` (same content, x265 `--preset slow`) shows
+the same pattern amplified: MC rises to **85.9%** inclusive (more refs,
+deeper hierarchical-B, denser inter blocks), IDCT drops to 4.3%, and SAO
+appears at 6.3% (slow-preset encodes with more SAO usage).
+
 ## Interpretation
 
-The 4.5–4.8× single-threaded gap at 1080p across both content types points at
-two factors:
+The 4.5–5.1x single-threaded gap at 1080p across both content types and
+presets points at two factors:
 
-1. **SIMD.** FFmpeg's arm64 build uses NEON for the HEVC hot paths: inverse
-   transforms, motion-compensation 7/8-tap luma and 4-tap chroma sub-pel
-   filters, deblocking, and SAO. `rust_h265` is pure scalar safe Rust; none
-   of these kernels are vectorized. At 1080p those kernels are the bulk of
-   decode cost, which matches the observed gap.
+1. **SIMD.** FFmpeg's arm64 build uses NEON for the HEVC hot paths: MC
+   7/8-tap luma and 4-tap chroma sub-pel filters (our #1 bottleneck),
+   inverse transforms, deblocking, and SAO. `rust_h265` is pure scalar
+   safe Rust; none of these kernels are vectorized.
 
-2. **Threading.** FFmpeg's `-threads 0` enables frame-parallel decode across
-   all cores. `rust_h265` is single-threaded by design. The `ff-t1 → ff-tN`
-   delta is where threading contributes — roughly 3–4× on all workloads big
-   enough to keep 10 cores busy.
+2. **Allocation overhead.** ~29% of decode time is spent in `malloc`/`free`
+   /`memset` for per-PU scratch buffers and per-picture plane allocation.
+   FFmpeg uses pre-allocated frame buffers and stack/thread-local scratch.
+   This is a pure Rust-side optimization opportunity — no SIMD needed.
 
-The remainder — branch predictability, cache locality, bounds-check
-overhead — is second-order.
+3. **Threading.** FFmpeg's `-threads 0` enables frame-parallel decode across
+   all cores. `rust_h265` is single-threaded by design. The `ff-t1 -> ff-tN`
+   delta is roughly 3-4x on workloads big enough to keep 10 cores busy.
 
 ## Priorities
 
 All four real-world fixtures decode byte-exact. Remaining focus is
-performance:
+performance, ordered by profile-informed impact:
 
-1. **Profile the 1080p safe-preset fixture.** With a 1 s+ decode time
-   (`bbb_1080p_5s_safe` at 120 frames × ~8 ms each), `samply` or
-   `cargo flamegraph` should cleanly reveal the pixel-budget ordering —
-   likely IDCT → MC filters → deblock → intra angular. That confirms
-   which hot path is worth SIMD-ing first.
+1. **Eliminate per-PU Vec allocation in MC** (~23% of decode). Pre-allocate
+   a reusable `[i16; 64*64]` scratch buffer (or a few for luma + chroma)
+   on `PictureState` or the decoder. This is the single highest-ROI change
+   — pure safe Rust, no SIMD, no algorithmic change.
 
-2. **Cheap scalar wins before SIMD.** Bounds-check removal in proven hot
-   loops (`get_unchecked` with documented invariants) and stack-allocated
-   fixed-size buffers for IDCT coefficients (≤ 32×32) typically pay back
-   a lot before you reach for intrinsics.
+2. **Pool picture buffers** (~6%). Reuse `PictureState` Y/U/V planes and
+   bookkeeping arrays across frames instead of allocating fresh each time.
 
-3. **SIMD, in order of pixel budget.** IDCT first (2 M coefficients per
-   1080p frame), then MC luma filter, then MC chroma filter, then deblock.
+3. **NEON SIMD for MC filters** (~38% self-time in filter kernels).
+   `mc_luma` / `mc_luma_i16` 7/8-tap filter first (27%), then
+   `mc_chroma` / `mc_chroma_i16` 4-tap (19%). These are textbook
+   NEON workloads: small fixed-tap FIR on contiguous rows.
+
+4. **NEON SIMD for IDCT** (~8%). tr_32 first (4%), then tr_16 (2%).
+
+5. **Deblocking optimization** (~9%). BS derivation could batch per-8x8
+   block instead of per-4x4 edge; filter_luma_edge is a SIMD candidate.
 
 ## Appendix: tool usage
 
