@@ -3155,4 +3155,31 @@ mod tests {
             "transquant_bypass hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
     }
+
+    /// 128×128, 4 frames (I+P+P+P) with `--constrained-intra`.
+    /// When `constrained_intra_pred_flag = 1`, intra blocks must NOT use
+    /// inter-predicted neighbor samples as references. The availability
+    /// check must additionally verify that each neighbor min-PU has
+    /// `pred_flag == 0` (intra). Without enforcement, intra blocks in
+    /// P-frames would use inter-predicted pixels, producing wrong output.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=128x128:rate=30:duration=0.2" \
+    ///   -frames:v 4 -pix_fmt yuv420p -f rawvideo /tmp/in.yuv
+    /// x265 --input /tmp/in.yuv --input-res 128x128 --fps 30 --frames 4 \
+    ///   --preset ultrafast --ctu 16 --keyint 30 --no-open-gop --bframes 0 \
+    ///   --constrained-intra --qp 26 --no-cutree --no-aq --no-sao \
+    ///   --no-deblock --no-wpp --no-info --no-psnr --no-ssim \
+    ///   -o constrained_intra_128x128.h265
+    /// ```
+    #[test]
+    fn test_decode_constrained_intra_hash() {
+        let hash = decode_and_hash("constrained_intra_128x128.h265", 4);
+        let expected = "5306a3cb6d71fc1ead86e18e455c528bb01ea763087fc179726c4f80b54502e0";
+        assert_eq!(
+            hash, expected,
+            "constrained_intra hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
 }
