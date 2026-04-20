@@ -1,9 +1,39 @@
 //! Pure Rust H.265 / HEVC video decoder.
 //!
-//! See `CLAUDE.md` and `TODO.md` for the implementation plan. As of Phase 1
-//! the bitstream reader, NAL parser, and parameter set parsers (VPS / SPS /
-//! PPS) are implemented; slice decoding has not started.
+//! Decodes Main-profile 8-bit 4:2:0 HEVC bitstreams end-to-end, including
+//! I/P/B slices, hierarchical B-frames, WPP, tiles, dependent slice segments,
+//! SAO, deblocking, AQ, scaling lists, sign-data hiding, weighted prediction,
+//! PCM, transform skip, and transquant bypass. Byte-exact against FFmpeg on
+//! all in-tree fixtures plus real 1080p Big Buck Bunny at x265 presets
+//! ultrafast / medium / slow.
+//!
+//! # Quick start
+//!
+//! ```no_run
+//! use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, NalUnitType};
+//!
+//! let data = std::fs::read("input.h265").unwrap();
+//! let nals = parse_annex_b(&data);
+//! let mut decoder = Decoder::new();
+//! let mut frames = Vec::new();
+//!
+//! for nal in &nals {
+//!     match decoder.decode_nal(nal) {
+//!         Ok(Some(frame)) => frames.push(frame),
+//!         Ok(None) => {}
+//!         Err(e) => eprintln!("decode error: {e:?}"),
+//!     }
+//! }
+//! while let Some(frame) = decoder.flush() {
+//!     frames.push(frame);
+//! }
+//! // Sort by POC for display order.
+//! frames.sort_by_key(|f| f.pic_order_cnt);
+//! ```
 
+// --- Internal modules (not part of the public API) ---
+// allow(dead_code): internal modules contain utility functions, struct fields,
+// and table constants kept for spec completeness / future use.
 #[allow(dead_code)]
 mod bitstream;
 #[allow(dead_code)]
@@ -14,17 +44,12 @@ mod cabac_tables;
 mod cu_tree;
 #[allow(dead_code)]
 mod deblock;
-pub mod decoder;
-#[allow(dead_code)]
-pub mod dpb;
-pub mod error;
 #[allow(dead_code)]
 mod inter_pred;
 #[allow(dead_code)]
 mod intra_pred;
 #[allow(dead_code)]
 mod inverse_transform;
-pub mod nal;
 #[allow(dead_code)]
 mod pps;
 #[allow(dead_code)]
@@ -42,9 +67,22 @@ mod sps;
 #[allow(dead_code)]
 mod vps;
 
+// --- Internal but needs pub(crate) access from decoder ---
+#[allow(dead_code)]
+pub(crate) mod dpb;
+
+// --- Public modules ---
+pub mod decoder;
+pub mod error;
+pub mod nal;
+
+// --- Top-level re-exports for convenience ---
+pub use decoder::{Decoder, Frame};
+pub use error::DecodeError;
+pub use nal::{parse_annex_b, NalUnit, NalUnitType};
+
 #[cfg(test)]
 mod parameter_set_tests {
-    use super::*;
     use crate::nal::{NalUnitType, parse_annex_b};
 
     /// Decode VPS+SPS+PPS from a real x265-encoded fixture and assert the
@@ -80,7 +118,7 @@ mod parameter_set_tests {
             .expect("PPS NAL");
 
         // ---- VPS ----
-        let vps = vps::parse_vps(&vps_nal.rbsp).expect("parse VPS");
+        let vps = crate::vps::parse_vps(&vps_nal.rbsp).expect("parse VPS");
         assert_eq!(vps.vps_video_parameter_set_id, 0);
         assert_eq!(vps.vps_max_layers_minus1, 0);
         assert_eq!(vps.vps_max_sub_layers_minus1, 0);
@@ -91,7 +129,7 @@ mod parameter_set_tests {
         assert!(!vps.profile_tier_level.general_tier_flag);
 
         // ---- SPS ----
-        let sps = sps::parse_sps(&sps_nal.rbsp).expect("parse SPS");
+        let sps = crate::sps::parse_sps(&sps_nal.rbsp).expect("parse SPS");
         assert_eq!(sps.sps_video_parameter_set_id, 0);
         assert_eq!(sps.sps_seq_parameter_set_id, 0);
         assert_eq!(sps.chroma_format_idc, 1);
@@ -99,24 +137,23 @@ mod parameter_set_tests {
         assert_eq!(sps.pic_height_in_luma_samples, 16);
         assert_eq!(sps.bit_depth_luma, 8);
         assert_eq!(sps.bit_depth_chroma, 8);
-        // log2_max_pic_order_cnt_lsb_minus4 = 4 → MaxPicOrderCntLsb = 256
+        // log2_max_pic_order_cnt_lsb_minus4 = 4 -> MaxPicOrderCntLsb = 256
         assert_eq!(sps.log2_max_pic_order_cnt_lsb, 8);
 
         // CTU derivation: log2_min_cb_minus3=0, log2_diff=1
-        // → MinCbLog2SizeY=3, CtbLog2SizeY=4, CtbSizeY=16.
+        // -> MinCbLog2SizeY=3, CtbLog2SizeY=4, CtbSizeY=16.
         assert_eq!(sps.min_cb_log2_size_y, 3);
         assert_eq!(sps.ctb_log2_size_y, 4);
         assert_eq!(sps.ctb_size_y, 16);
         assert_eq!(sps.pic_width_in_ctbs_y(), 1);
         assert_eq!(sps.pic_height_in_ctbs_y(), 1);
 
-        // TU derivation: min_tb_minus2=0, diff=2 → 2..=4 (4×4..16×16)
+        // TU derivation: min_tb_minus2=0, diff=2 -> 2..=4 (4x4..16x16)
         assert_eq!(sps.min_tb_log2_size_y, 2);
         assert_eq!(sps.max_tb_log2_size_y, 4);
 
         assert!(!sps.scaling_list_enabled_flag);
         assert!(!sps.amp_enabled_flag);
-        // Fixture is encoded with --no-sao --no-strong-intra-smoothing.
         assert!(!sps.sample_adaptive_offset_enabled_flag);
         assert!(!sps.pcm_enabled_flag);
         assert_eq!(sps.num_short_term_ref_pic_sets, 0);
@@ -125,33 +162,26 @@ mod parameter_set_tests {
         assert!(!sps.strong_intra_smoothing_enabled_flag);
 
         // ---- PPS ----
-        let pps = pps::parse_pps(&pps_nal.rbsp).expect("parse PPS");
+        let pps = crate::pps::parse_pps(&pps_nal.rbsp).expect("parse PPS");
         assert_eq!(pps.pps_pic_parameter_set_id, 0);
         assert_eq!(pps.pps_seq_parameter_set_id, 0);
         assert!(!pps.dependent_slice_segments_enabled_flag);
         assert!(!pps.output_flag_present_flag);
         assert_eq!(pps.num_extra_slice_header_bits, 0);
-        // Fixture is encoded with --no-signhide.
         assert!(!pps.sign_data_hiding_enabled_flag);
         assert!(!pps.cabac_init_present_flag);
         assert_eq!(pps.num_ref_idx_l0_default_active_minus1, 0);
         assert_eq!(pps.num_ref_idx_l1_default_active_minus1, 0);
-        // init_qp_minus26 = 0 → init_qp = 26
         assert_eq!(pps.init_qp, 26);
-        // constrained_intra_pred_flag is now enforced in compute_luma_avail_inner
-        // transform_skip_enabled_flag is now supported (Main Profile, 4×4 only)
         assert!(pps.cu_qp_delta_enabled_flag);
         assert_eq!(pps.diff_cu_qp_delta_depth, 0);
         assert_eq!(pps.pps_cb_qp_offset, 0);
         assert_eq!(pps.pps_cr_qp_offset, 0);
         assert!(!pps.weighted_pred_flag);
         assert!(!pps.weighted_bipred_flag);
-        // transquant_bypass_enabled_flag is now supported (cu_transquant_bypass)
         assert!(!pps.tiles_enabled_flag);
         assert!(!pps.entropy_coding_sync_enabled_flag);
         assert!(pps.pps_loop_filter_across_slices_enabled_flag);
-        // x265 with --no-deblock sets deblocking_filter_control_present and
-        // pps_deblocking_filter_disabled.
         assert!(pps.deblocking_filter_control_present_flag);
         assert!(!pps.deblocking_filter_override_enabled_flag);
         assert!(pps.pps_deblocking_filter_disabled_flag);

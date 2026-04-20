@@ -27,8 +27,7 @@ A pure Rust H.264 decoder ([`rust_h264`](https://github.com/roticv/rust_h264)) a
 The public API mirrors `rust_h264`:
 
 ```rust
-use rust_h265::decoder::Decoder;
-use rust_h265::nal::parse_annex_b;
+use rust_h265::{Decoder, parse_annex_b};
 
 let h265_data = std::fs::read("input.h265").unwrap();
 let nals = parse_annex_b(&h265_data);
@@ -59,7 +58,7 @@ if let Some(frame) = decoder.flush() {
 To display frames correctly, sort by `pic_order_cnt` (POC). If the stream has multiple IDR boundaries (GOPs), also track IDR boundaries to avoid mixing frames from different GOPs:
 
 ```rust
-use rust_h265::nal::NalUnitType;
+use rust_h265::NalUnitType;
 
 let mut idr_count: u32 = 0;
 let mut frames = Vec::new();
