@@ -7,6 +7,7 @@ edition = "2024"
 
 [dev-dependencies]
 sha2 = "0.10"
+minifb = "0.28"
 
 [[example]]
 name = "bench_decode"
