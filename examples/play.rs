@@ -212,7 +212,7 @@ fn main() {
         .expect("failed to update window");
     frame_count += 1;
 
-    let mut current_argb;
+    let mut last_argb = first_frame_argb;
     let mut flushing = false;
     let mut flush_queue: Vec<Frame> = Vec::new();
 
@@ -286,15 +286,18 @@ fn main() {
                 eprintln!("Looping... ({} frames played)", frame_count);
                 continue;
             }
+            eprintln!("Finished ({} frames). Press Escape to quit.", frame_count);
             while window.is_open() && !window.is_key_down(Key::Escape) {
-                window.update();
+                window
+                    .update_with_buffer(&last_argb, width, height)
+                    .expect("failed to update window");
                 std::thread::sleep(Duration::from_millis(10));
             }
             break;
         }
 
         let f = display_frame.unwrap();
-        current_argb = yuv_to_argb(&f.y, &f.u, &f.v, width, height);
+        last_argb = yuv_to_argb(&f.y, &f.u, &f.v, width, height);
         frame_count += 1;
 
         // Wait for frame timing.
@@ -312,7 +315,7 @@ fn main() {
         }
 
         window
-            .update_with_buffer(&current_argb, width, height)
+            .update_with_buffer(&last_argb, width, height)
             .expect("failed to update window");
     }
 
