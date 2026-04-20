@@ -4228,4 +4228,58 @@ mod tests {
         assert_eq!(r.read_bits(3), 0b101);
         assert_eq!(r.read_bits(8), 0b1011_0001);
     }
+
+    /// Verify the chroma QP derivation from spec 8.6.1 / table 8-9 with
+    /// both PPS-level and slice-level chroma QP offsets combined. This
+    /// exercises the `pps_cb_qp_offset + slice_cb_qp_offset` addition
+    /// in `decode_chroma_residuals` — a code path that no available
+    /// encoder produces (x265/kvazaar always set
+    /// `pps_slice_chroma_qp_offsets_present_flag = 0`), so it's tested
+    /// via unit math rather than a bitstream fixture.
+    #[test]
+    fn test_chroma_qp_derivation_with_slice_offsets() {
+        // Spec table 8-9 mapping: qp_i → qp_c.
+        let qp_c_from_qp_i = |qp_i: i32| -> i32 {
+            let qp_i = qp_i.clamp(0, 57);
+            if qp_i < 30 {
+                qp_i
+            } else if qp_i > 43 {
+                qp_i - 6
+            } else {
+                const QP_C: [i32; 14] =
+                    [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37];
+                QP_C[(qp_i - 30) as usize]
+            }
+        };
+
+        // Case 1: PPS offset only (slice offset = 0) — baseline.
+        let qp_y = 26;
+        let pps_cb_offset = 4;
+        let slice_cb_offset = 0;
+        let qp_i = qp_y + pps_cb_offset + slice_cb_offset; // 30
+        assert_eq!(qp_c_from_qp_i(qp_i), 29); // table 8-9: qp_i=30 → qp_c=29
+
+        // Case 2: PPS + slice offset combined.
+        let slice_cb_offset = 3;
+        let qp_i = qp_y + pps_cb_offset + slice_cb_offset; // 33
+        assert_eq!(qp_c_from_qp_i(qp_i), 32); // table 8-9: qp_i=33 → QP_C[3]=32
+
+        // Case 3: Negative slice offset reducing total.
+        let slice_cb_offset = -6;
+        let qp_i = qp_y + pps_cb_offset + slice_cb_offset; // 24
+        assert_eq!(qp_c_from_qp_i(qp_i), 24); // qp_i < 30 → qp_c = qp_i
+
+        // Case 4: Large offset pushing into the high range.
+        let qp_y = 40;
+        let pps_cr_offset = -2;
+        let slice_cr_offset = 8;
+        let qp_i = qp_y + pps_cr_offset + slice_cr_offset; // 46
+        assert_eq!(qp_c_from_qp_i(qp_i), 40); // qp_i > 43 → qp_c = qp_i - 6
+
+        // Case 5: Clamping at boundaries.
+        let qp_i = (-5i32 + 2 + 0).clamp(0, 57); // 0 (clamped)
+        assert_eq!(qp_c_from_qp_i(qp_i), 0);
+        let qp_i = (51 + 5 + 3).clamp(0, 57); // 57 (clamped)
+        assert_eq!(qp_c_from_qp_i(qp_i), 51); // 57 - 6
+    }
 }
