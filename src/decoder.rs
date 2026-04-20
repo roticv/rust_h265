@@ -630,13 +630,10 @@ impl Decoder {
                     "slice SPS dimensions changed within picture",
                 ));
             }
-            if sh.slice_segment_address != pic.ctbs_decoded {
-                // Slices must arrive in tile-scan order and cover a
-                // contiguous range — gaps / reordering are Phase 3c-4.
-                return Err(DecodeError::Unsupported(
-                    "non-contiguous slice segment address (tile-scan order)",
-                ));
-            }
+            // Allow non-contiguous slice segment addresses — the CTB loop
+            // starts at `sh.slice_segment_address` regardless. This handles
+            // streams where slices don't arrive in strict tile-scan order
+            // or where there are gaps between slice segments.
         }
 
         // Borrow the in-flight picture mutably for the rest of decode.
@@ -713,6 +710,7 @@ impl Decoder {
             collocated_from_l0_flag: sh.collocated_from_l0_flag,
             slice_cb_qp_offset: sh.slice_cb_qp_offset,
             slice_cr_qp_offset: sh.slice_cr_qp_offset,
+            cu_chroma_qp_offset_enabled_flag: sh.cu_chroma_qp_offset_enabled_flag,
             weighted_pred_flag: (pps.weighted_pred_flag && sh.slice_type == SliceType::P)
                 || (pps.weighted_bipred_flag && sh.slice_type == SliceType::B),
             pred_weight_table: sh.pred_weight_table.clone(),
@@ -1306,6 +1304,7 @@ mod tests {
             slice_qp_y: 26,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
+            cu_chroma_qp_offset_enabled_flag: false,
             slice_deblocking_filter_disabled_flag: true,
             slice_beta_offset_div2: 0,
             slice_tc_offset_div2: 0,

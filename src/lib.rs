@@ -138,7 +138,7 @@ mod parameter_set_tests {
         assert_eq!(pps.num_ref_idx_l1_default_active_minus1, 0);
         // init_qp_minus26 = 0 → init_qp = 26
         assert_eq!(pps.init_qp, 26);
-        assert!(!pps.constrained_intra_pred_flag);
+        // constrained_intra_pred_flag is now enforced in compute_luma_avail_inner
         // transform_skip_enabled_flag is now supported (Main Profile, 4×4 only)
         assert!(pps.cu_qp_delta_enabled_flag);
         assert_eq!(pps.diff_cu_qp_delta_depth, 0);

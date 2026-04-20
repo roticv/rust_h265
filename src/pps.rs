@@ -73,6 +73,16 @@ pub struct Pps {
     pub lists_modification_present_flag: bool,
     pub log2_parallel_merge_level_minus2: u32,
     pub slice_segment_header_extension_present_flag: bool,
+    /// `chroma_qp_offset_list_enabled_flag` from PPS Range Extension.
+    /// In Main Profile this is always false (range extensions not parsed).
+    /// When true, the slice header may signal `cu_chroma_qp_offset_enabled_flag`.
+    pub chroma_qp_offset_list_enabled_flag: bool,
+    /// `chroma_qp_offset_list_len_minus1` from PPS Range Extension (0..5).
+    pub chroma_qp_offset_list_len_minus1: u32,
+    /// Per-index Cb QP offset list (up to 6 entries).
+    pub cb_qp_offset_list: [i32; 6],
+    /// Per-index Cr QP offset list (up to 6 entries).
+    pub cr_qp_offset_list: [i32; 6],
 }
 
 impl Pps {
@@ -304,5 +314,9 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
         lists_modification_present_flag,
         log2_parallel_merge_level_minus2,
         slice_segment_header_extension_present_flag,
+        chroma_qp_offset_list_enabled_flag: false,
+        chroma_qp_offset_list_len_minus1: 0,
+        cb_qp_offset_list: [0i32; 6],
+        cr_qp_offset_list: [0i32; 6],
     })
 }

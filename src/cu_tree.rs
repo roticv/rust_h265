@@ -145,6 +145,8 @@ pub struct SliceParams {
     /// QP derivation per spec 8.6.1).
     pub slice_cb_qp_offset: i32,
     pub slice_cr_qp_offset: i32,
+    /// Whether per-CU chroma QP offset signaling is enabled for this slice.
+    pub cu_chroma_qp_offset_enabled_flag: bool,
     /// Whether weighted prediction is active for this slice.
     pub weighted_pred_flag: bool,
     /// Prediction weight table (only meaningful when `weighted_pred_flag`).
@@ -194,6 +196,13 @@ pub struct PictureState {
     /// Reset at the top of each QP group in decode_coding_quadtree;
     /// set to true once the first TU with non-zero CBF decodes cu_qp_delta.
     pub is_cu_qp_delta_coded: bool,
+    /// Whether `cu_chroma_qp_offset_flag` has already been decoded for the
+    /// current CU. Reset at the start of each CU (spec 7.3.8.11).
+    pub is_cu_chroma_qp_offset_coded: bool,
+    /// Per-CU Cb chroma QP offset selected from PPS offset list (or 0).
+    pub cu_qp_offset_cb: i32,
+    /// Per-CU Cr chroma QP offset selected from PPS offset list (or 0).
+    pub cu_qp_offset_cr: i32,
     /// Effective QP after applying `last_cu_qp_delta` to the predicted QP
     /// (spec 8.6.1). Equals `slice_qp_y` while `cu_qp_delta_enabled_flag=0`.
     pub last_qp_y: i32,
@@ -307,6 +316,9 @@ impl PictureState {
             last_cbf_cr: false,
             last_cu_qp_delta: 0,
             is_cu_qp_delta_coded: false,
+            is_cu_chroma_qp_offset_coded: false,
+            cu_qp_offset_cb: 0,
+            cu_qp_offset_cr: 0,
             last_qp_y: 0,
             qpy_pred: 0,
             first_qp_group: false,
@@ -2145,6 +2157,13 @@ fn decode_coding_unit(
         false
     };
 
+    // Reset per-CU chroma QP offset state (FFmpeg hls_coding_unit:2633-2634).
+    if slice_params.cu_chroma_qp_offset_enabled_flag && !cu_transquant_bypass {
+        state.is_cu_chroma_qp_offset_coded = false;
+        state.cu_qp_offset_cb = 0;
+        state.cu_qp_offset_cr = 0;
+    }
+
     let cb_size = 1u32 << log2_cb_size;
     let x_cb = (x0 >> state.log2_min_cb_size) as usize;
     let y_cb = (y0 >> state.log2_min_cb_size) as usize;
@@ -3005,7 +3024,7 @@ fn decode_transform_unit(
         let x_pu = (x0 >> state.log2_min_pu_size) as usize;
         let y_pu = (y0 >> state.log2_min_pu_size) as usize;
         let luma_mode = state.tab_ipm[y_pu * state.min_pu_width + x_pu];
-        predict_intra_luma(state, sps, x0, y0, log2_trafo_size, luma_mode)?;
+        predict_intra_luma(state, sps, x0, y0, log2_trafo_size, luma_mode, pps.constrained_intra_pred_flag)?;
     }
 
     // ---- Step 2: cbf_luma decode.
@@ -3062,6 +3081,41 @@ fn decode_transform_unit(
             set_qpy(state, sps, pps, slice_qp_y, x_base, y_base);
         }
 
+        // cu_chroma_qp_offset (spec 7.3.8.11 / FFmpeg hevcdec.c:1349-1366).
+        // Decoded once per CU on the first TU with non-zero chroma cbf.
+        let cbf_chroma = inherited.cbf_cb || inherited.cbf_cr;
+        if slice_params.cu_chroma_qp_offset_enabled_flag
+            && cbf_chroma
+            && !cu_transquant_bypass
+            && !state.is_cu_chroma_qp_offset_coded
+        {
+            let cu_chroma_qp_offset_flag =
+                cabac.decode_bin(&mut contexts.state[ctx::CU_CHROMA_QP_OFFSET_FLAG]);
+            if cu_chroma_qp_offset_flag != 0 {
+                let mut cu_chroma_qp_offset_idx = 0u32;
+                if pps.chroma_qp_offset_list_len_minus1 > 0 {
+                    // Truncated unary binarization, max = chroma_qp_offset_list_len_minus1.
+                    cu_chroma_qp_offset_idx = 0;
+                    while cu_chroma_qp_offset_idx < pps.chroma_qp_offset_list_len_minus1 {
+                        let bin =
+                            cabac.decode_bin(&mut contexts.state[ctx::CU_CHROMA_QP_OFFSET_IDX]);
+                        if bin == 0 {
+                            break;
+                        }
+                        cu_chroma_qp_offset_idx += 1;
+                    }
+                }
+                state.cu_qp_offset_cb =
+                    pps.cb_qp_offset_list[cu_chroma_qp_offset_idx as usize];
+                state.cu_qp_offset_cr =
+                    pps.cr_qp_offset_list[cu_chroma_qp_offset_idx as usize];
+            } else {
+                state.cu_qp_offset_cb = 0;
+                state.cu_qp_offset_cr = 0;
+            }
+            state.is_cu_chroma_qp_offset_coded = true;
+        }
+
         let qp_y = state.last_qp_y;
 
         // ---- Step 3: luma residual_coding + IDCT + reconstruction.
@@ -3106,7 +3160,7 @@ fn decode_transform_unit(
         if is_intra {
             if do_chroma_inline {
                 let chroma_mode = state.last_chroma_pred_mode;
-                predict_intra_chroma(state, sps, x0, y0, log2_trafo_size - 1, chroma_mode)?;
+                predict_intra_chroma(state, sps, x0, y0, log2_trafo_size - 1, chroma_mode, pps.constrained_intra_pred_flag)?;
                 decode_chroma_residuals(
                     cabac,
                     contexts,
@@ -3127,7 +3181,7 @@ fn decode_transform_unit(
                 )?;
             } else if do_chroma_deferred {
                 let chroma_mode = state.last_chroma_pred_mode;
-                predict_intra_chroma(state, sps, x_base, y_base, log2_trafo_size, chroma_mode)?;
+                predict_intra_chroma(state, sps, x_base, y_base, log2_trafo_size, chroma_mode, pps.constrained_intra_pred_flag)?;
                 decode_chroma_residuals(
                     cabac,
                     contexts,
@@ -3200,10 +3254,10 @@ fn decode_transform_unit(
     } else if is_intra {
         if do_chroma_inline {
             let chroma_mode = state.last_chroma_pred_mode;
-            predict_intra_chroma(state, sps, x0, y0, log2_trafo_size - 1, chroma_mode)?;
+            predict_intra_chroma(state, sps, x0, y0, log2_trafo_size - 1, chroma_mode, pps.constrained_intra_pred_flag)?;
         } else if do_chroma_deferred {
             let chroma_mode = state.last_chroma_pred_mode;
-            predict_intra_chroma(state, sps, x_base, y_base, log2_trafo_size, chroma_mode)?;
+            predict_intra_chroma(state, sps, x_base, y_base, log2_trafo_size, chroma_mode, pps.constrained_intra_pred_flag)?;
         }
     }
 
@@ -3364,11 +3418,11 @@ fn decode_chroma_residuals(
             continue;
         }
         // Derive chroma QP per spec 8.6.1 / table 8-9.
-        // Sum PPS-level and slice-level chroma QP offsets.
+        // Sum PPS-level, slice-level, and CU-level chroma QP offsets.
         let qp_offset = if c_idx == 1 {
-            pps.pps_cb_qp_offset + slice_cb_qp_offset
+            pps.pps_cb_qp_offset + slice_cb_qp_offset + state.cu_qp_offset_cb
         } else {
-            pps.pps_cr_qp_offset + slice_cr_qp_offset
+            pps.pps_cr_qp_offset + slice_cr_qp_offset + state.cu_qp_offset_cr
         };
         let qp_i = (qp_y + qp_offset).clamp(0, 57);
         let qp_c = if qp_i < 30 {
@@ -3470,11 +3524,12 @@ fn predict_intra_luma(
     y0: u32,
     log2_size: u8,
     mode: u8,
+    constrained_intra_pred_flag: bool,
 ) -> Result<(), DecodeError> {
     let size = 1usize << log2_size;
     let pic_w = state.width as usize;
     let pic_h = state.height as usize;
-    let avail = compute_luma_avail(state, x0, y0, size as u32);
+    let avail = compute_luma_avail_inner(state, x0, y0, size as u32, constrained_intra_pred_flag);
     let (mut top, mut left) = build_reference_samples(
         &state.y_plane,
         state.y_stride,
@@ -3526,6 +3581,19 @@ fn predict_intra_luma(
 /// to a CTB in a different slice is treated as unavailable, matching the
 /// spec rule (`ctb_addr_in_slice > 0` / `>= ctb_width`).
 fn compute_luma_avail(state: &PictureState, x0: u32, y0: u32, size: u32) -> ReferenceAvailability {
+    compute_luma_avail_inner(state, x0, y0, size, false)
+}
+
+/// Core availability computation. When `constrained_intra_pred` is true,
+/// additionally requires that all neighbor min-PUs in each direction were
+/// intra-coded (pred_flag == 0 in tab_mvf).
+fn compute_luma_avail_inner(
+    state: &PictureState,
+    x0: u32,
+    y0: u32,
+    size: u32,
+    constrained_intra_pred: bool,
+) -> ReferenceAvailability {
     let pic_w = state.width;
     let pic_h = state.height;
     let log2_ctb = state.log2_ctb_size;
@@ -3640,13 +3708,82 @@ fn compute_luma_avail(state: &PictureState, x0: u32, y0: u32, size: u32) -> Refe
     let left = cand_left && x0 > 0;
     let up_left = cand_up_left && x0 > 0 && y0 > 0;
 
-    ReferenceAvailability {
+    let mut avail = ReferenceAvailability {
         up_left,
         up,
         up_right,
         left,
         bottom_left,
+    };
+
+    // --- constrained_intra_pred enforcement (spec 8.4.4.2.2) ---
+    // When enabled, neighbor samples from inter-coded PUs are treated as
+    // unavailable. We check per-direction that ALL min-PU samples in that
+    // direction have pred_flag == 0 (intra). If any sample is inter, the
+    // entire direction is marked unavailable and the substitution process
+    // in build_reference_samples will fill it.
+    if constrained_intra_pred {
+        let log2_min_pu = state.log2_min_pu_size;
+        let min_pu_w = state.min_pu_width;
+        let tab_mvf = &state.tab_mvf;
+
+        // Helper: check if sample at (sx, sy) is intra (pred_flag == 0).
+        let is_intra_at = |sx: u32, sy: u32| -> bool {
+            let idx = (sy >> log2_min_pu) as usize * min_pu_w + (sx >> log2_min_pu) as usize;
+            tab_mvf.get(idx).map_or(false, |m| m.pred_flag == 0)
+        };
+
+        // Up-left corner: single sample at (x0-1, y0-1).
+        if avail.up_left {
+            if !is_intra_at(x0 - 1, y0 - 1) {
+                avail.up_left = false;
+            }
+        }
+
+        // Up: samples at (x0..x0+size-1, y0-1).
+        if avail.up {
+            for i in 0..size {
+                if !is_intra_at(x0 + i, y0 - 1) {
+                    avail.up = false;
+                    break;
+                }
+            }
+        }
+
+        // Up-right: samples at (x0+size..x0+2*size-1, y0-1), clamped to pic.
+        if avail.up_right {
+            let count = (pic_w.saturating_sub(x0 + size)).min(size);
+            for i in 0..count {
+                if !is_intra_at(x0 + size + i, y0 - 1) {
+                    avail.up_right = false;
+                    break;
+                }
+            }
+        }
+
+        // Left: samples at (x0-1, y0..y0+size-1).
+        if avail.left {
+            for i in 0..size {
+                if !is_intra_at(x0 - 1, y0 + i) {
+                    avail.left = false;
+                    break;
+                }
+            }
+        }
+
+        // Bottom-left: samples at (x0-1, y0+size..y0+2*size-1), clamped to pic.
+        if avail.bottom_left {
+            let count = (pic_h.saturating_sub(y0 + size)).min(size);
+            for i in 0..count {
+                if !is_intra_at(x0 - 1, y0 + size + i) {
+                    avail.bottom_left = false;
+                    break;
+                }
+            }
+        }
     }
+
+    avail
 }
 
 /// Same as `predict_intra_luma` but for one chroma plane (Cb and Cr both
@@ -3660,13 +3797,14 @@ fn predict_intra_chroma(
     y0_luma: u32,
     log2_size: u8,
     mode: u8,
+    constrained_intra_pred_flag: bool,
 ) -> Result<(), DecodeError> {
     let size = 1usize << log2_size;
     let pic_w_c = (state.width / 2) as usize;
     let pic_h_c = (state.height / 2) as usize;
     let x_c = (x0_luma >> 1) as usize;
     let y_c = (y0_luma >> 1) as usize;
-    let avail = compute_chroma_avail(state, x0_luma, y0_luma, (size as u32) * 2);
+    let avail = compute_chroma_avail(state, x0_luma, y0_luma, (size as u32) * 2, constrained_intra_pred_flag);
     let dst_stride = state.uv_stride;
 
     for plane_idx in 0..2 {
@@ -3730,8 +3868,9 @@ fn compute_chroma_avail(
     x0_luma: u32,
     y0_luma: u32,
     luma_size: u32,
+    constrained_intra_pred: bool,
 ) -> ReferenceAvailability {
-    compute_luma_avail(state, x0_luma, y0_luma, luma_size)
+    compute_luma_avail_inner(state, x0_luma, y0_luma, luma_size, constrained_intra_pred)
 }
 
 /// Apply the inverse transform to a luma residual block and add it to the
@@ -4046,6 +4185,7 @@ mod tests {
             collocated_from_l0_flag: true,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
+            cu_chroma_qp_offset_enabled_flag: false,
             weighted_pred_flag: false,
             pred_weight_table: crate::slice::PredWeightTable::default(),
         };

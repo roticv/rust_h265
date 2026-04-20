@@ -123,6 +123,9 @@ pub struct SliceHeader {
     pub slice_cb_qp_offset: i32,
     /// Slice-level Cr QP offset.
     pub slice_cr_qp_offset: i32,
+    /// Per-slice flag enabling per-CU chroma QP offset signaling (spec 7.3.6.1).
+    /// Only present if `pps.chroma_qp_offset_list_enabled_flag = 1`.
+    pub cu_chroma_qp_offset_enabled_flag: bool,
     /// Slice-level deblocking disable flag. Inherits from PPS unless an
     /// override is signaled (Phase 3b-1 only supports the inherited path).
     pub slice_deblocking_filter_disabled_flag: bool,
@@ -283,6 +286,7 @@ pub fn parse_slice_segment_header(
     let mut slice_qp_y = 0i32;
     let mut slice_cb_qp_offset = 0i32;
     let mut slice_cr_qp_offset = 0i32;
+    let mut cu_chroma_qp_offset_enabled_flag = false;
     let mut slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
     let mut slice_beta_offset_div2 = 0i32;
     let mut slice_tc_offset_div2 = 0i32;
@@ -532,6 +536,10 @@ pub fn parse_slice_segment_header(
             slice_cr_qp_offset = r.read_se()?;
         }
 
+        if pps.chroma_qp_offset_list_enabled_flag {
+            cu_chroma_qp_offset_enabled_flag = r.read_bit()? == 1;
+        }
+
         if pps.deblocking_filter_override_enabled_flag {
             let deblocking_filter_override_flag = r.read_bit()? == 1;
             if deblocking_filter_override_flag {
@@ -623,6 +631,7 @@ pub fn parse_slice_segment_header(
         slice_qp_y,
         slice_cb_qp_offset,
         slice_cr_qp_offset,
+        cu_chroma_qp_offset_enabled_flag,
         slice_deblocking_filter_disabled_flag,
         slice_beta_offset_div2,
         slice_tc_offset_div2,
@@ -888,6 +897,10 @@ mod tests {
             lists_modification_present_flag: false,
             log2_parallel_merge_level_minus2: 0,
             slice_segment_header_extension_present_flag: false,
+            chroma_qp_offset_list_enabled_flag: false,
+            chroma_qp_offset_list_len_minus1: 0,
+            cb_qp_offset_list: [0i32; 6],
+            cr_qp_offset_list: [0i32; 6],
         }
     }
 
