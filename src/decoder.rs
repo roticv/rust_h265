@@ -426,6 +426,8 @@ impl Decoder {
             sh.slice_sao_chroma_flag = parent.slice_sao_chroma_flag;
             sh.slice_qp_delta = parent.slice_qp_delta;
             sh.slice_qp_y = parent.slice_qp_y;
+            sh.slice_cb_qp_offset = parent.slice_cb_qp_offset;
+            sh.slice_cr_qp_offset = parent.slice_cr_qp_offset;
             sh.slice_deblocking_filter_disabled_flag = parent.slice_deblocking_filter_disabled_flag;
             sh.slice_beta_offset_div2 = parent.slice_beta_offset_div2;
             sh.slice_tc_offset_div2 = parent.slice_tc_offset_div2;
@@ -709,6 +711,8 @@ impl Decoder {
             collocated_ref,
             slice_temporal_mvp_enabled_flag: sh.slice_temporal_mvp_enabled_flag,
             collocated_from_l0_flag: sh.collocated_from_l0_flag,
+            slice_cb_qp_offset: sh.slice_cb_qp_offset,
+            slice_cr_qp_offset: sh.slice_cr_qp_offset,
             weighted_pred_flag: (pps.weighted_pred_flag && sh.slice_type == SliceType::P)
                 || (pps.weighted_bipred_flag && sh.slice_type == SliceType::B),
             pred_weight_table: sh.pred_weight_table.clone(),
@@ -1300,6 +1304,8 @@ mod tests {
             slice_sao_chroma_flag: false,
             slice_qp_delta: 0,
             slice_qp_y: 26,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
             slice_deblocking_filter_disabled_flag: true,
             slice_beta_offset_div2: 0,
             slice_tc_offset_div2: 0,

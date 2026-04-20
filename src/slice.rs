@@ -118,6 +118,11 @@ pub struct SliceHeader {
     pub slice_qp_delta: i32,
     /// Effective slice QP: `pps.init_qp + slice_qp_delta`. Spec eq. 7-54.
     pub slice_qp_y: i32,
+    /// Slice-level Cb QP offset (spec 7.4.7.1). Summed with
+    /// `pps.pps_cb_qp_offset` when deriving chroma QP.
+    pub slice_cb_qp_offset: i32,
+    /// Slice-level Cr QP offset.
+    pub slice_cr_qp_offset: i32,
     /// Slice-level deblocking disable flag. Inherits from PPS unless an
     /// override is signaled (Phase 3b-1 only supports the inherited path).
     pub slice_deblocking_filter_disabled_flag: bool,
@@ -276,6 +281,8 @@ pub fn parse_slice_segment_header(
     let mut slice_sao_chroma_flag = false;
     let mut slice_qp_delta = 0i32;
     let mut slice_qp_y = 0i32;
+    let mut slice_cb_qp_offset = 0i32;
+    let mut slice_cr_qp_offset = 0i32;
     let mut slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
     let mut slice_beta_offset_div2 = 0i32;
     let mut slice_tc_offset_div2 = 0i32;
@@ -521,8 +528,8 @@ pub fn parse_slice_segment_header(
         }
 
         if pps.pps_slice_chroma_qp_offsets_present_flag {
-            let _slice_cb_qp_offset = r.read_se()?;
-            let _slice_cr_qp_offset = r.read_se()?;
+            slice_cb_qp_offset = r.read_se()?;
+            slice_cr_qp_offset = r.read_se()?;
         }
 
         if pps.deblocking_filter_override_enabled_flag {
@@ -614,6 +621,8 @@ pub fn parse_slice_segment_header(
         slice_sao_chroma_flag,
         slice_qp_delta,
         slice_qp_y,
+        slice_cb_qp_offset,
+        slice_cr_qp_offset,
         slice_deblocking_filter_disabled_flag,
         slice_beta_offset_div2,
         slice_tc_offset_div2,

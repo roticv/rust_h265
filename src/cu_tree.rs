@@ -141,6 +141,10 @@ pub struct SliceParams {
     /// true = collocated picture is from L0 (collocated_list = 0),
     /// false = from L1 (collocated_list = 1).
     pub collocated_from_l0_flag: bool,
+    /// Slice-level chroma QP offsets (summed with PPS offsets in chroma
+    /// QP derivation per spec 8.6.1).
+    pub slice_cb_qp_offset: i32,
+    pub slice_cr_qp_offset: i32,
     /// Whether weighted prediction is active for this slice.
     pub weighted_pred_flag: bool,
     /// Prediction weight table (only meaningful when `weighted_pred_flag`).
@@ -3118,6 +3122,8 @@ fn decode_transform_unit(
                     inherited.cbf_cr,
                     true,
                     cu_transquant_bypass,
+                    slice_params.slice_cb_qp_offset,
+                    slice_params.slice_cr_qp_offset,
                 )?;
             } else if do_chroma_deferred {
                 let chroma_mode = state.last_chroma_pred_mode;
@@ -3137,6 +3143,8 @@ fn decode_transform_unit(
                     inherited.cbf_cr,
                     true,
                     cu_transquant_bypass,
+                    slice_params.slice_cb_qp_offset,
+                    slice_params.slice_cr_qp_offset,
                 )?;
             }
         } else {
@@ -3165,6 +3173,8 @@ fn decode_transform_unit(
                     inherited.cbf_cr,
                     false,
                     cu_transquant_bypass,
+                    slice_params.slice_cb_qp_offset,
+                    slice_params.slice_cr_qp_offset,
                 )?;
             } else if do_chroma_deferred && (inherited.cbf_cb || inherited.cbf_cr) {
                 decode_chroma_residuals(
@@ -3182,6 +3192,8 @@ fn decode_transform_unit(
                     inherited.cbf_cr,
                     false,
                     cu_transquant_bypass,
+                    slice_params.slice_cb_qp_offset,
+                    slice_params.slice_cr_qp_offset,
                 )?;
             }
         }
@@ -3340,6 +3352,8 @@ fn decode_chroma_residuals(
     cbf_cr: bool,
     is_intra: bool,
     cu_transquant_bypass: bool,
+    slice_cb_qp_offset: i32,
+    slice_cr_qp_offset: i32,
 ) -> Result<(), DecodeError> {
     let x_c = (x0 >> 1) as usize;
     let y_c = (y0 >> 1) as usize;
@@ -3350,10 +3364,11 @@ fn decode_chroma_residuals(
             continue;
         }
         // Derive chroma QP per spec 8.6.1 / table 8-9.
+        // Sum PPS-level and slice-level chroma QP offsets.
         let qp_offset = if c_idx == 1 {
-            pps.pps_cb_qp_offset
+            pps.pps_cb_qp_offset + slice_cb_qp_offset
         } else {
-            pps.pps_cr_qp_offset
+            pps.pps_cr_qp_offset + slice_cr_qp_offset
         };
         let qp_i = (qp_y + qp_offset).clamp(0, 57);
         let qp_c = if qp_i < 30 {
@@ -4029,6 +4044,8 @@ mod tests {
             collocated_ref: None,
             slice_temporal_mvp_enabled_flag: false,
             collocated_from_l0_flag: true,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
             weighted_pred_flag: false,
             pred_weight_table: crate::slice::PredWeightTable::default(),
         };
