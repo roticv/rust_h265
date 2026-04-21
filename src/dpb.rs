@@ -272,11 +272,19 @@ pub struct ReferencePictureSets {
     /// which must still be kept around (they're referenced by later
     /// pictures according to the RPS).
     pub st_foll: Vec<i32>,
-    /// Long-term references that the current picture uses.
+    /// Long-term references that the current picture uses. Each entry is
+    /// a full POC (when `lt_poc_msb_present` is true for that index) or a
+    /// POC LSB (when false).
     pub lt_curr: Vec<i32>,
     /// Long-term references that the current picture does not use but
     /// which later pictures will.
     pub lt_foll: Vec<i32>,
+    /// Per-entry flag for `lt_curr` ++ `lt_foll` (in that order) indicating
+    /// whether `delta_poc_msb_present_flag` was set. When true, the
+    /// corresponding entry in `lt_curr`/`lt_foll` is a full POC and DPB
+    /// matching uses exact POC. When false, it's a POC LSB and DPB matching
+    /// uses `poc % MaxPicOrderCntLsb`.
+    pub lt_poc_msb_present: Vec<bool>,
 }
 
 impl ReferencePictureSets {
@@ -485,6 +493,7 @@ mod tests {
             st_foll: vec![-4],
             lt_curr: vec![100],
             lt_foll: vec![],
+            lt_poc_msb_present: vec![],
         };
         assert_eq!(rps.num_poc_total_curr(), 4);
     }
@@ -499,6 +508,7 @@ mod tests {
             st_foll: vec![],
             lt_curr: vec![100],
             lt_foll: vec![],
+            lt_poc_msb_present: vec![],
         };
         // NumPocTotalCurr = 5, so with num_rps_curr_temp_list = 5 we expect
         // exactly the concatenation, no wrap.
@@ -516,6 +526,7 @@ mod tests {
             st_foll: vec![],
             lt_curr: vec![100],
             lt_foll: vec![],
+            lt_poc_msb_present: vec![],
         };
         let temp = build_ref_pic_list_temp1(&rps, 5);
         assert_eq!(temp, vec![5, 6, 3, 2, 100]);
@@ -531,6 +542,7 @@ mod tests {
             st_foll: vec![],
             lt_curr: vec![],
             lt_foll: vec![],
+            lt_poc_msb_present: vec![],
         };
         let temp = build_ref_pic_list_temp0(&rps, 5);
         assert_eq!(temp, vec![3, 2, 3, 2, 3]);
@@ -641,6 +653,7 @@ mod tests {
             st_foll: vec![],
             lt_curr: vec![],
             lt_foll: vec![],
+            lt_poc_msb_present: vec![],
         };
         Decoder::apply_rps_marking(&rps, &dpb, 8);
 
@@ -670,6 +683,7 @@ mod tests {
             st_foll: vec![],
             lt_curr: vec![3], // LSB=3, matches both POC 3 and POC 19 (19%16=3)
             lt_foll: vec![],
+            lt_poc_msb_present: vec![false, false], // LSB-based matching for both
         };
         // log2_max_poc_lsb=4 → max_poc_lsb=16
         Decoder::apply_rps_marking(&rps, &dpb, 4);
@@ -677,6 +691,62 @@ mod tests {
         // POC 3 should be ST (ST takes priority over LT).
         assert_eq!(p3.reference_status(), PictureReferenceStatus::ShortTerm);
         // POC 19 (LSB=3) should be LT (not overridden by ST since POC 19 != 3).
+        assert_eq!(p19.reference_status(), PictureReferenceStatus::LongTerm);
+    }
+
+    /// LT marking with poc_msb_present=true uses full POC matching (not LSB).
+    #[test]
+    fn apply_rps_marking_lt_full_poc_matching() {
+        use crate::decoder::Decoder;
+
+        let mut dpb = DecodedPictureBuffer::new();
+        // Two pictures with the SAME POC LSB (3) but different full POCs.
+        // log2_max_poc_lsb=4 → max_poc_lsb=16
+        let p3 = Rc::new(DecodedPicture::new(vec![], vec![], vec![], 0, 0, 3));
+        let p19 = Rc::new(DecodedPicture::new(vec![], vec![], vec![], 0, 0, 19));
+        dpb.insert(p3.clone());
+        dpb.insert(p19.clone());
+
+        // LT ref with poc_msb_present=true and full POC=19 → should match
+        // only POC 19, not POC 3 (even though both have LSB=3).
+        let rps = ReferencePictureSets {
+            st_curr_before: vec![],
+            st_curr_after: vec![],
+            st_foll: vec![],
+            lt_curr: vec![19], // full POC (msb_present=true)
+            lt_foll: vec![],
+            lt_poc_msb_present: vec![true],
+        };
+        Decoder::apply_rps_marking(&rps, &dpb, 4);
+
+        assert_eq!(
+            p3.reference_status(),
+            PictureReferenceStatus::UnusedForReference
+        );
+        assert_eq!(p19.reference_status(), PictureReferenceStatus::LongTerm);
+    }
+
+    /// LT marking with poc_msb_present=false uses LSB matching.
+    #[test]
+    fn apply_rps_marking_lt_lsb_matching() {
+        use crate::decoder::Decoder;
+
+        let mut dpb = DecodedPictureBuffer::new();
+        // POC 19 has LSB=3 (19%16=3)
+        let p19 = Rc::new(DecodedPicture::new(vec![], vec![], vec![], 0, 0, 19));
+        dpb.insert(p19.clone());
+
+        // LT ref with poc_msb_present=false and LSB=3 → matches POC 19
+        let rps = ReferencePictureSets {
+            st_curr_before: vec![],
+            st_curr_after: vec![],
+            st_foll: vec![],
+            lt_curr: vec![3], // POC LSB (msb_present=false)
+            lt_foll: vec![],
+            lt_poc_msb_present: vec![false],
+        };
+        Decoder::apply_rps_marking(&rps, &dpb, 4);
+
         assert_eq!(p19.reference_status(), PictureReferenceStatus::LongTerm);
     }
 }

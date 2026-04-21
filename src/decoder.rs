@@ -588,7 +588,7 @@ impl Decoder {
                 let sps_st_rps = sps_for_rps.st_ref_pic_sets.clone();
                 let log2_max_poc_lsb = sps_for_rps.log2_max_pic_order_cnt_lsb;
                 self.dpb.configure_from_sps(sps_for_rps);
-                let rps = Self::derive_rps_from_slice_header_parts(&sh, &sps_st_rps);
+                let rps = Self::derive_rps_from_slice_header_parts(&sh, &sps_st_rps, log2_max_poc_lsb);
                 Self::apply_rps_marking(&rps, &self.dpb, log2_max_poc_lsb);
                 self.current_rps = rps;
                 let (l0, l1) = Self::build_ref_pic_lists(&self.current_rps, &self.dpb, &sh)?;
@@ -965,8 +965,11 @@ impl Decoder {
             self.dpb.configure_from_sps(sps_for_dpb);
         }
 
-        self.current_rps =
-            Self::derive_rps_from_slice_header_parts(&last_sh_cloned, &sps_st_ref_pic_sets);
+        self.current_rps = Self::derive_rps_from_slice_header_parts(
+            &last_sh_cloned,
+            &sps_st_ref_pic_sets,
+            log2_max_poc_lsb,
+        );
         // Mark DPB pictures based on the newly derived RPS.
         Self::apply_rps_marking(&self.current_rps, &self.dpb, log2_max_poc_lsb);
 
@@ -1088,6 +1091,7 @@ impl Decoder {
     fn derive_rps_from_slice_header_parts(
         sh: &SliceHeader,
         sps_st_ref_pic_sets: &[ShortTermRps],
+        log2_max_pic_order_cnt_lsb: u8,
     ) -> ReferencePictureSets {
         let mut rps = ReferencePictureSets::default();
 
@@ -1126,25 +1130,67 @@ impl Decoder {
             }
         }
 
-        // Long-term references: lookup by POC LSB. Each entry either goes
-        // into `lt_curr` (used by current picture) or `lt_foll` (not
-        // used).
+        // Long-term references per spec 8.3.2 / FFmpeg decode_lt_rps.
+        // When delta_poc_msb_present_flag is true, compute full POC:
+        //   PocLt = poc_lsb + cur_poc - delta * MaxPicOrderCntLsb - cur_poc_lsb
+        // When false, store just the POC LSB for LSB-based DPB matching.
+        let max_poc_lsb = 1i32 << log2_max_pic_order_cnt_lsb;
+        let cur_poc = sh.poc;
+        let cur_poc_lsb = sh.slice_pic_order_cnt_lsb as i32;
+        let num_lt_sps = sh.long_term_rps.poc_lsb_lt.len()
+            - sh.long_term_rps.poc_lsb_lt.len().min(
+                sh.long_term_rps
+                    .delta_poc_msb_cycle_lt
+                    .len(),
+            );
+        let _ = num_lt_sps; // suppress unused warning
+        let mut prev_delta_msb: i64 = 0;
+
         for (i, poc_lsb) in sh.long_term_rps.poc_lsb_lt.iter().enumerate() {
-            // For Phase 3d-1 we just record the LSB as the full POC
-            // (good enough for set membership; real decoding will redo
-            // the MSB computation).
-            let ref_poc = *poc_lsb as i32;
-            if sh
+            let msb_present = sh
+                .long_term_rps
+                .delta_poc_msb_present_flag
+                .get(i)
+                .copied()
+                .unwrap_or(false);
+
+            let ref_poc = if msb_present {
+                // Accumulate delta_poc_msb_cycle_lt per spec 7.4.7.1.
+                // FFmpeg: `if (i && i != nb_sps) delta += prev_delta_msb;`
+                // We don't track nb_sps separately — just accumulate when
+                // the entry isn't the first overall or first inline entry.
+                let raw_delta = sh
+                    .long_term_rps
+                    .delta_poc_msb_cycle_lt
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0) as i64;
+                let delta = if i > 0 {
+                    raw_delta + prev_delta_msb
+                } else {
+                    raw_delta
+                };
+                prev_delta_msb = delta;
+                // FFmpeg: poc = rps->poc[i] + cur_poc - delta * max_poc_lsb - poc_lsb
+                (*poc_lsb as i64 + cur_poc as i64
+                    - delta * max_poc_lsb as i64
+                    - cur_poc_lsb as i64) as i32
+            } else {
+                *poc_lsb as i32
+            };
+
+            let used = sh
                 .long_term_rps
                 .used_by_curr_pic_lt_flag
                 .get(i)
                 .copied()
-                .unwrap_or(false)
-            {
+                .unwrap_or(false);
+            if used {
                 rps.lt_curr.push(ref_poc);
             } else {
                 rps.lt_foll.push(ref_poc);
             }
+            rps.lt_poc_msb_present.push(msb_present);
         }
 
         rps
@@ -1228,17 +1274,23 @@ impl Decoder {
             // resolve_ref_pics when building the actual ref lists.
         }
 
-        // Step 3: mark long-term references by POC LSB.
-        let lt_lsbs = rps.lt_curr.iter().chain(&rps.lt_foll);
-        for &lsb in lt_lsbs {
-            // Find a DPB picture whose POC LSB matches and hasn't already
-            // been marked ShortTerm (ST takes priority over LT per spec
-            // because ST and LT POC spaces don't overlap in well-formed
-            // streams).
+        // Step 3: mark long-term references. When `poc_msb_present` is true
+        // for an entry, match by full POC (the entry already contains the
+        // resolved absolute POC). When false, match by POC LSB (spec 8.3.2 /
+        // FFmpeg find_ref_idx: `mask = use_msb ? ~0 : (1 << log2) - 1`).
+        let lt_all: Vec<i32> = rps.lt_curr.iter().chain(&rps.lt_foll).copied().collect();
+        for (idx, &poc_or_lsb) in lt_all.iter().enumerate() {
+            let use_msb = rps.lt_poc_msb_present.get(idx).copied().unwrap_or(false);
             for pic in dpb.pictures() {
-                if pic.poc.rem_euclid(max_poc_lsb) == lsb
-                    && pic.reference_status() != PictureReferenceStatus::ShortTerm
-                {
+                if pic.reference_status() == PictureReferenceStatus::ShortTerm {
+                    continue; // ST takes priority
+                }
+                let matches = if use_msb {
+                    pic.poc == poc_or_lsb
+                } else {
+                    pic.poc.rem_euclid(max_poc_lsb) == poc_or_lsb
+                };
+                if matches {
                     pic.mark(PictureReferenceStatus::LongTerm);
                     break;
                 }
@@ -1375,6 +1427,7 @@ mod tests {
             st_foll: vec![],
             lt_curr: vec![],
             lt_foll: vec![],
+            lt_poc_msb_present: vec![],
         };
         let mut dpb = DecodedPictureBuffer::new();
         dpb.insert(test_decoded_picture(8));
@@ -1404,6 +1457,7 @@ mod tests {
             st_foll: vec![],
             lt_curr: vec![],
             lt_foll: vec![],
+            lt_poc_msb_present: vec![],
         };
         let mut dpb = DecodedPictureBuffer::new();
         dpb.insert(test_decoded_picture(8));
@@ -1433,6 +1487,7 @@ mod tests {
             st_foll: vec![],
             lt_curr: vec![],
             lt_foll: vec![],
+            lt_poc_msb_present: vec![],
         };
         let mut dpb = DecodedPictureBuffer::new();
         dpb.insert(test_decoded_picture(8));
@@ -1462,6 +1517,7 @@ mod tests {
             st_foll: vec![],
             lt_curr: vec![],
             lt_foll: vec![],
+            lt_poc_msb_present: vec![],
         };
         let mut dpb = DecodedPictureBuffer::new();
         dpb.insert(test_decoded_picture(8));
@@ -1487,6 +1543,7 @@ mod tests {
             st_foll: vec![],
             lt_curr: vec![],
             lt_foll: vec![],
+            lt_poc_msb_present: vec![],
         };
         // DPB is empty → the POC=8 lookup fails.
         let dpb = DecodedPictureBuffer::new();
