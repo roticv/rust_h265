@@ -501,8 +501,8 @@ pub fn mc_chroma<P: Pixel>(
 /// For uni-prediction (L0 or L1 only), the prediction is written directly.
 /// For bi-prediction (both L0 and L1), the two predictions are averaged:
 /// `dst = (predL0 + predL1 + 1) >> 1`.
-pub fn motion_compensation_pu(
-    state: &mut PictureState,
+pub fn motion_compensation_pu<P: Pixel>(
+    state: &mut PictureState<P>,
     ref_frames_l0: &[Rc<DecodedPicture>],
     ref_frames_l1: &[Rc<DecodedPicture>],
     x0: u32,
@@ -537,7 +537,6 @@ pub fn motion_compensation_pu(
     let bit_depth = state.bit_depth;
     let bi_shift = crate::pixel::bipred_shift(bit_depth) as i32;
     let bi_offset = crate::pixel::bipred_offset(bit_depth);
-    let max_val = crate::pixel::max_pixel_val(bit_depth);
 
     if is_bi {
         // Bi-prediction: compute L0 and L1 intermediates at i32 precision
@@ -669,10 +668,10 @@ pub fn motion_compensation_pu(
             for i in 0..w {
                 let idx = j * w + i;
                 let avg =
-                    ((pred_l0_y[idx] + pred_l1_y[idx] + bi_offset) >> bi_shift).clamp(0, max_val) as u8;
+                    (pred_l0_y[idx] + pred_l1_y[idx] + bi_offset) >> bi_shift;
                 let dst_idx = y_off + j * y_stride + i;
                 if dst_idx < state.y_plane.len() {
-                    state.y_plane[dst_idx] = avg;
+                    state.y_plane[dst_idx] = P::from_i32_clamped(avg, bit_depth);
                 }
             }
         }
@@ -682,12 +681,14 @@ pub fn motion_compensation_pu(
                 let idx = j * w_c + i;
                 let dst_idx = c_off + j * uv_stride + i;
                 if dst_idx < state.u_plane.len() {
-                    state.u_plane[dst_idx] = ((pred_l0_u[idx] + pred_l1_u[idx] + bi_offset)
-                        >> bi_shift)
-                        .clamp(0, max_val) as u8;
-                    state.v_plane[dst_idx] = ((pred_l0_v[idx] + pred_l1_v[idx] + bi_offset)
-                        >> bi_shift)
-                        .clamp(0, max_val) as u8;
+                    state.u_plane[dst_idx] = P::from_i32_clamped(
+                        (pred_l0_u[idx] + pred_l1_u[idx] + bi_offset) >> bi_shift,
+                        bit_depth,
+                    );
+                    state.v_plane[dst_idx] = P::from_i32_clamped(
+                        (pred_l0_v[idx] + pred_l1_v[idx] + bi_offset) >> bi_shift,
+                        bit_depth,
+                    );
                 }
             }
         }
@@ -710,11 +711,12 @@ pub fn motion_compensation_pu(
         };
 
         if !weighted_pred_flag {
-            // Non-weighted: write prediction samples directly.
-            let y_off = (y0 as usize) * y_stride + (x0 as usize);
+            // Non-weighted: MC into u8 intermediate, then convert to P.
+            // (DecodedPicture stores Vec<u8>; state planes store Vec<P>.)
+            let mut tmp_y = [0u8; MAX_PB_LUMA];
             mc_luma::<u8>(
-                &mut state.y_plane[y_off..],
-                y_stride,
+                &mut tmp_y,
+                w,
                 &ref_list.y,
                 ref_list.width as usize,
                 pic_w,
@@ -727,6 +729,15 @@ pub fn motion_compensation_pu(
                 mv.y,
                 bit_depth,
             );
+            let y_off = (y0 as usize) * y_stride + (x0 as usize);
+            for j in 0..h {
+                for i in 0..w {
+                    let dst_idx = y_off + j * y_stride + i;
+                    if dst_idx < state.y_plane.len() {
+                        state.y_plane[dst_idx] = P::from_i32_clamped(tmp_y[j * w + i] as i32, bit_depth);
+                    }
+                }
+            }
 
             let w_c = w / 2;
             let h_c = h / 2;
@@ -738,10 +749,11 @@ pub fn motion_compensation_pu(
             let mv_x_c = mv.x as i32;
             let mv_y_c = mv.y as i32;
 
-            let c_off = (y0 as usize / 2) * uv_stride + (x0 as usize / 2);
+            let mut tmp_u = [0u8; MAX_PB_CHROMA];
+            let mut tmp_v = [0u8; MAX_PB_CHROMA];
             mc_chroma::<u8>(
-                &mut state.u_plane[c_off..],
-                uv_stride,
+                &mut tmp_u,
+                w_c,
                 &ref_list.u,
                 ref_uv_stride,
                 ref_w_c,
@@ -755,8 +767,8 @@ pub fn motion_compensation_pu(
                 bit_depth,
             );
             mc_chroma::<u8>(
-                &mut state.v_plane[c_off..],
-                uv_stride,
+                &mut tmp_v,
+                w_c,
                 &ref_list.v,
                 ref_uv_stride,
                 ref_w_c,
@@ -769,6 +781,16 @@ pub fn motion_compensation_pu(
                 mv_y_c as i16,
                 bit_depth,
             );
+            let c_off = (y0 as usize / 2) * uv_stride + (x0 as usize / 2);
+            for j in 0..h_c {
+                for i in 0..w_c {
+                    let dst_idx = c_off + j * uv_stride + i;
+                    if dst_idx < state.u_plane.len() {
+                        state.u_plane[dst_idx] = P::from_i32_clamped(tmp_u[j * w_c + i] as i32, bit_depth);
+                        state.v_plane[dst_idx] = P::from_i32_clamped(tmp_v[j * w_c + i] as i32, bit_depth);
+                    }
+                }
+            }
         } else {
             // Weighted uni-prediction: compute MC at i16 precision, then apply
             // weight/offset per HEVC spec 8.5.3.3.4.1 / FFmpeg put_hevc_qpel_uni_w.
@@ -827,7 +849,7 @@ pub fn motion_compensation_pu(
                     let weighted = ((val * luma_w + round) >> shift) + luma_o;
                     let dst_idx = y_off + j * y_stride + i;
                     if dst_idx < state.y_plane.len() {
-                        state.y_plane[dst_idx] = weighted.clamp(0, max_val) as u8;
+                        state.y_plane[dst_idx] = P::from_i32_clamped(weighted, bit_depth);
                     }
                 }
             }
@@ -884,14 +906,16 @@ pub fn motion_compensation_pu(
                     if dst_idx < state.u_plane.len() {
                         let wu = chroma_w[0] as i32;
                         let ou = chroma_o[0] as i32;
-                        state.u_plane[dst_idx] = (((pred_u[idx] * wu + c_round) >> c_shift)
-                            + ou)
-                            .clamp(0, max_val) as u8;
+                        state.u_plane[dst_idx] = P::from_i32_clamped(
+                            ((pred_u[idx] * wu + c_round) >> c_shift) + ou,
+                            bit_depth,
+                        );
                         let wv = chroma_w[1] as i32;
                         let ov = chroma_o[1] as i32;
-                        state.v_plane[dst_idx] = (((pred_v[idx] * wv + c_round) >> c_shift)
-                            + ov)
-                            .clamp(0, max_val) as u8;
+                        state.v_plane[dst_idx] = P::from_i32_clamped(
+                            ((pred_v[idx] * wv + c_round) >> c_shift) + ov,
+                            bit_depth,
+                        );
                     }
                 }
             }
@@ -988,8 +1012,8 @@ fn mc_chroma_from_ref_uv(
 
 /// Perform motion compensation for an entire inter CU, dispatching to each PU
 /// based on the partition mode. This replaces `write_placeholder_prediction`.
-pub fn motion_compensation_cu(
-    state: &mut PictureState,
+pub fn motion_compensation_cu<P: Pixel>(
+    state: &mut PictureState<P>,
     ref_frames_l0: &[Rc<DecodedPicture>],
     ref_frames_l1: &[Rc<DecodedPicture>],
     x0: u32,

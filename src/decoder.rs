@@ -65,7 +65,7 @@ pub struct Frame {
 /// In-flight picture state: the reconstruction buffers plus the bookkeeping
 /// needed to stitch multi-slice decode back together.
 struct PictureInProgress {
-    state: PictureState,
+    state: PictureState<u8>,
     /// Header of the most recently decoded slice segment. Phase 3c-1 uses
     /// it for deblock/SAO finalization — in the common case all slices in a
     /// picture share the same filter flags, which this approximation
@@ -247,7 +247,7 @@ pub struct Decoder {
 /// always use `state.y_stride` / `state.uv_stride` for row addressing.
 #[allow(clippy::too_many_arguments)]
 fn crop_frame(
-    state: &crate::cu_tree::PictureState,
+    state: &crate::cu_tree::PictureState<u8>,
     _coded_w: u32,
     _coded_h: u32,
     cropped_w: u32,
@@ -598,7 +598,7 @@ impl Decoder {
 
             // Populate `tab_tile_id` on the fresh picture state so intra
             // availability checks can see it.
-            let mut ps = PictureState::new(sps);
+            let mut ps = PictureState::<u8>::new(sps);
             let n = ps.tab_tile_id.len();
             ps.tab_tile_id.copy_from_slice(&tile_tables.tile_id[..n]);
             // QP-prediction state (spec 8.6.1 / FFmpeg hevcdec.c:3066-3069):

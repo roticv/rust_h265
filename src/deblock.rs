@@ -324,7 +324,7 @@ fn filter_chroma_edge<P: Pixel>(
 // ---- Top-level dispatch ----
 
 /// Get the per-min-CB QP at luma sample position `(x, y)`.
-fn get_qp_y(state: &PictureState, x: i32, y: i32) -> i32 {
+fn get_qp_y<P: Pixel>(state: &PictureState<P>, x: i32, y: i32) -> i32 {
     let xc = (x.max(0) >> state.log2_min_cb_size) as usize;
     let yc = (y.max(0) >> state.log2_min_cb_size) as usize;
     state.tab_qp_y[yc * state.min_cb_width + xc] as i32
@@ -340,7 +340,7 @@ fn read_bs(bs: &[u8], pic_w: usize, x: usize, y: usize) -> i32 {
 /// should be skipped because `slice_loop_filter_across_slices_enabled_flag`
 /// is false on either side.
 #[inline]
-fn skip_vertical_slice_boundary(state: &PictureState, x: usize, y: usize) -> bool {
+fn skip_vertical_slice_boundary<P: Pixel>(state: &PictureState<P>, x: usize, y: usize) -> bool {
     let log2_ctb = state.log2_ctb_size as usize;
     let left_ctb_col = (x - 1) >> log2_ctb;
     let right_ctb_col = x >> log2_ctb;
@@ -360,7 +360,7 @@ fn skip_vertical_slice_boundary(state: &PictureState, x: usize, y: usize) -> boo
 /// Check whether a horizontal edge at luma y crosses a slice boundary and
 /// should be skipped.
 #[inline]
-fn skip_horizontal_slice_boundary(state: &PictureState, x: usize, y: usize) -> bool {
+fn skip_horizontal_slice_boundary<P: Pixel>(state: &PictureState<P>, x: usize, y: usize) -> bool {
     let log2_ctb = state.log2_ctb_size as usize;
     let top_ctb_row = (y - 1) >> log2_ctb;
     let bot_ctb_row = y >> log2_ctb;
@@ -382,7 +382,7 @@ fn skip_horizontal_slice_boundary(state: &PictureState, x: usize, y: usize) -> b
 /// Phase 3b-1 limitation: only the intra-slice path. The boundary strength
 /// arrays must already be populated by the CU/TU decode (every internal
 /// 8-aligned TU/CU edge inside the picture gets `bS = 2`).
-pub fn deblock_picture(state: &mut PictureState, sps: &Sps, pps: &Pps, sh: &SliceHeader) {
+pub fn deblock_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, pps: &Pps, sh: &SliceHeader) {
     let pic_w = state.width as usize;
     let pic_h = state.height as usize;
     let stride_y = state.y_stride;
@@ -409,7 +409,7 @@ pub fn deblock_picture(state: &mut PictureState, sps: &Sps, pps: &Pps, sh: &Slic
                     + 1)
                     >> 1;
                 let pix_base = y * stride_y + x;
-                filter_luma_edge::<u8>(
+                filter_luma_edge::<P>(
                     &mut state.y_plane,
                     pix_base,
                     1,
@@ -444,7 +444,7 @@ pub fn deblock_picture(state: &mut PictureState, sps: &Sps, pps: &Pps, sh: &Slic
                     + 1)
                     >> 1;
                 let pix_base = y * stride_y + x;
-                filter_luma_edge::<u8>(
+                filter_luma_edge::<P>(
                     &mut state.y_plane,
                     pix_base,
                     stride_y as isize,
@@ -564,7 +564,7 @@ pub fn deblock_picture(state: &mut PictureState, sps: &Sps, pps: &Pps, sh: &Slic
                 &mut state.v_plane
             };
             for e in &edges {
-                filter_chroma_edge::<u8>(
+                filter_chroma_edge::<P>(
                     plane, e.pix_base, e.xstride, e.ystride, e.qp0_avg, e.qp1_avg, qp_offset,
                     tc_offset, e.bs0, e.bs1, bit_depth_chroma,
                 );

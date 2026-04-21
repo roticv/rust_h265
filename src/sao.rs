@@ -100,10 +100,10 @@ fn decode_sao_eo_class(cabac: &mut CabacReader) -> u32 {
 /// FFmpeg `hls_sao_param`. Resolves merge flags by copying from the left
 /// or upper neighbor.
 #[allow(clippy::too_many_arguments)]
-pub fn decode_sao_param(
+pub fn decode_sao_param<P: Pixel>(
     cabac: &mut CabacReader,
     contexts: &mut CabacContexts,
-    state: &mut PictureState,
+    state: &mut PictureState<P>,
     sps: &Sps,
     sh: &SliceHeader,
     rx: usize,
@@ -339,7 +339,7 @@ fn sao_edge_filter<P: Pixel>(
 /// and if not, whether loop filtering across that boundary is allowed.
 /// Returns true if the boundary should be treated as "no filtering across".
 #[inline]
-fn sao_skip_slice_boundary(state: &PictureState, rs_a: usize, rs_b: usize) -> bool {
+fn sao_skip_slice_boundary<P: Pixel>(state: &PictureState<P>, rs_a: usize, rs_b: usize) -> bool {
     if state.tab_slice_addr_rs[rs_a] == state.tab_slice_addr_rs[rs_b] {
         return false;
     }
@@ -348,7 +348,7 @@ fn sao_skip_slice_boundary(state: &PictureState, rs_a: usize, rs_b: usize) -> bo
 
 /// Apply SAO to the entire reconstructed picture, after deblocking.
 /// Per-CTB SAO parameters must already be in `state.sao_params`.
-pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) {
+pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &SliceHeader) {
     if !sh.slice_sao_luma_flag && !sh.slice_sao_chroma_flag {
         return;
     }
@@ -388,7 +388,7 @@ pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) 
                 let h = (y0 + ctb_size).min(pic_h) - y0;
                 let bit_depth_y = sps.bit_depth_luma;
                 match sao.type_idx[0] {
-                    SaoType::Band => sao_band_filter::<u8>(
+                    SaoType::Band => sao_band_filter::<P>(
                         &mut state.y_plane,
                         &y_src,
                         state.y_stride,
@@ -401,7 +401,7 @@ pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) 
                         y0,
                         bit_depth_y,
                     ),
-                    SaoType::Edge => sao_edge_filter::<u8>(
+                    SaoType::Edge => sao_edge_filter::<P>(
                         &mut state.y_plane,
                         &y_src,
                         state.y_stride,
@@ -441,7 +441,7 @@ pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) 
                     };
                     let bit_depth_c = sps.bit_depth_chroma;
                     match sao.type_idx[c_idx] {
-                        SaoType::Band => sao_band_filter::<u8>(
+                        SaoType::Band => sao_band_filter::<P>(
                             dst_plane,
                             src_plane,
                             state.uv_stride,
@@ -454,7 +454,7 @@ pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) 
                             y0_c,
                             bit_depth_c,
                         ),
-                        SaoType::Edge => sao_edge_filter::<u8>(
+                        SaoType::Edge => sao_edge_filter::<P>(
                             dst_plane,
                             src_plane,
                             state.uv_stride,

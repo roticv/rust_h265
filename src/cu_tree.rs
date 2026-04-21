@@ -26,6 +26,7 @@ use crate::inverse_transform::apply_inverse_transform;
 use crate::pps::Pps;
 use crate::residual_coding::{ResidualBlock, ResidualPlane, ScanOrder, decode_residual_coding};
 use crate::slice::SliceType;
+use crate::pixel::Pixel;
 use crate::sps::Sps;
 
 /// HEVC luma intra prediction mode constants (spec table 8-1).
@@ -160,7 +161,7 @@ pub struct SliceParams {
 /// and stores the decoded luma intra prediction mode for downstream use.
 /// `y_plane`/`u_plane`/`v_plane` are the reconstructed picture planes that
 /// `decode_transform_unit` writes prediction + residual into.
-pub struct PictureState {
+pub struct PictureState<P: Pixel> {
     pub width: u32,
     pub height: u32,
     pub bit_depth: u8,
@@ -171,9 +172,9 @@ pub struct PictureState {
     pub min_pu_width: usize,
     pub tab_ct_depth: Vec<u8>,
     pub tab_ipm: Vec<u8>,
-    pub y_plane: Vec<u8>,
-    pub u_plane: Vec<u8>,
-    pub v_plane: Vec<u8>,
+    pub y_plane: Vec<P>,
+    pub u_plane: Vec<P>,
+    pub v_plane: Vec<P>,
     pub y_stride: usize,
     pub uv_stride: usize,
 
@@ -268,7 +269,7 @@ pub struct PictureState {
     pub min_tb_width: usize,
 }
 
-impl PictureState {
+impl<P: Pixel> PictureState<P> {
     pub fn new(sps: &Sps) -> Self {
         let log2_min_cb_size = sps.min_cb_log2_size_y;
         // HEVC base profile pins min PU size to 4×4 (spec 7.4.3.2.1).
@@ -306,9 +307,9 @@ impl PictureState {
             // Default IPM is INTRA_DC (matches FFmpeg
             // `intra_prediction_unit_default_value`).
             tab_ipm: vec![INTRA_DC; min_pu_width * min_pu_height],
-            y_plane: vec![0u8; (w_aligned * h_aligned) as usize],
-            u_plane: vec![0u8; ((w_aligned / 2) * (h_aligned / 2)) as usize],
-            v_plane: vec![0u8; ((w_aligned / 2) * (h_aligned / 2)) as usize],
+            y_plane: vec![P::zero(); (w_aligned * h_aligned) as usize],
+            u_plane: vec![P::zero(); ((w_aligned / 2) * (h_aligned / 2)) as usize],
+            v_plane: vec![P::zero(); ((w_aligned / 2) * (h_aligned / 2)) as usize],
             y_stride,
             uv_stride,
             last_luma_pred_mode: 0,
@@ -444,10 +445,10 @@ impl PictureState {
 /// was 0 at the CTB boundary, OR we haven't reached one yet), or `Ok(false)`
 /// if we've consumed the slice's terminate bin and the slice is done.
 #[allow(clippy::too_many_arguments)]
-pub fn decode_coding_quadtree(
+pub fn decode_coding_quadtree<P: Pixel>(
     cabac: &mut CabacReader,
     contexts: &mut CabacContexts,
-    state: &mut PictureState,
+    state: &mut PictureState<P>,
     sps: &Sps,
     pps: &Pps,
     slice_qp_y: i32,
@@ -606,10 +607,10 @@ pub fn decode_coding_quadtree(
 /// `inc = (depth_left > cb_depth) + (depth_top > cb_depth)`. Neighbor depths
 /// come from `tab_ct_depth`. A neighbor is unavailable (depth 0) if it's
 /// outside the picture or in a different slice/tile (spec 6.4.1).
-fn decode_split_cu_flag(
+fn decode_split_cu_flag<P: Pixel>(
     cabac: &mut CabacReader,
     contexts: &mut CabacContexts,
-    state: &PictureState,
+    state: &PictureState<P>,
     x0: u32,
     y0: u32,
     cb_depth: u8,
@@ -656,7 +657,7 @@ fn decode_split_cu_flag(
     Ok(cabac.decode_bin(&mut contexts.state[ctx::SPLIT_CODING_UNIT_FLAG + inc]))
 }
 
-fn set_ct_depth(state: &mut PictureState, x0: u32, y0: u32, log2_cb_size: u8, cb_depth: u8) {
+fn set_ct_depth<P: Pixel>(state: &mut PictureState<P>, x0: u32, y0: u32, log2_cb_size: u8, cb_depth: u8) {
     let length = ((1u32 << log2_cb_size) >> state.log2_min_cb_size) as usize;
     let x_cb = (x0 >> state.log2_min_cb_size) as usize;
     let y_cb = (y0 >> state.log2_min_cb_size) as usize;
@@ -674,10 +675,10 @@ fn set_ct_depth(state: &mut PictureState, x0: u32, y0: u32, log2_cb_size: u8, cb
 
 /// `cu_skip_flag` decode (FFmpeg `ff_hevc_skip_flag_decode`).
 /// Context: SKIP_FLAG offset + (skip_left + skip_above).
-fn decode_skip_flag(
+fn decode_skip_flag<P: Pixel>(
     cabac: &mut CabacReader,
     contexts: &mut CabacContexts,
-    state: &PictureState,
+    state: &PictureState<P>,
     x0: u32,
     y0: u32,
 ) -> u32 {
@@ -763,7 +764,7 @@ fn is_diff_mer(log2_parallel_merge_level: u8, x_n: i32, y_n: i32, x_p: i32, y_p:
 }
 
 /// Read the MvField from `tab_mvf` at luma sample position `(x, y)`.
-fn tab_mvf_at(state: &PictureState, x: i32, y: i32) -> MvField {
+fn tab_mvf_at<P: Pixel>(state: &PictureState<P>, x: i32, y: i32) -> MvField {
     let x_pu = (x as u32 >> state.log2_min_pu_size) as usize;
     let y_pu = (y as u32 >> state.log2_min_pu_size) as usize;
     state.tab_mvf[y_pu * state.min_pu_width + x_pu]
@@ -773,7 +774,7 @@ fn tab_mvf_at(state: &PictureState, x: i32, y: i32) -> MvField {
 /// merge candidate for a PU at `(x0, y0)`.  The position must be inside
 /// the picture, belong to an inter-coded PU (`pred_flag != 0`), be in the
 /// same slice and same tile, and already decoded (z-scan order).
-fn spatial_cand_available(state: &PictureState, x0: i32, y0: i32, x_n: i32, y_n: i32) -> bool {
+fn spatial_cand_available<P: Pixel>(state: &PictureState<P>, x0: i32, y0: i32, x_n: i32, y_n: i32) -> bool {
     // Out of picture bounds?
     if x_n < 0 || y_n < 0 || x_n >= state.width as i32 || y_n >= state.height as i32 {
         return false;
@@ -804,8 +805,8 @@ fn spatial_cand_available(state: &PictureState, x0: i32, y0: i32, x_n: i32, y_n:
 /// `cb_size == 8`; in that case the candidate list is derived once for the
 /// whole CU (part_idx forced to 0, PU size = CU size).
 #[allow(clippy::too_many_arguments)]
-fn build_merge_candidates(
-    state: &PictureState,
+fn build_merge_candidates<P: Pixel>(
+    state: &PictureState<P>,
     slice_params: &SliceParams,
     x0: u32,
     y0: u32,
@@ -1237,8 +1238,8 @@ fn derive_temporal_colocated_mvs(
 /// Attempts to derive a temporal MV candidate from the collocated picture.
 /// Returns `Some(mv)` if a valid temporal candidate was found.
 #[allow(clippy::too_many_arguments)]
-fn temporal_luma_motion_vector(
-    state: &PictureState,
+fn temporal_luma_motion_vector<P: Pixel>(
+    state: &PictureState<P>,
     slice_params: &SliceParams,
     x0: i32,
     y0: i32,
@@ -1312,8 +1313,8 @@ fn temporal_luma_motion_vector(
 /// that references the same picture as `ref_idx` on list `ref_idx_curr` (i.e.
 /// same POC). If so, returns `Some(neighbor_mv)`. This corresponds to FFmpeg's
 /// `mv_mp_mode_mx`.
-fn amvp_same_ref_mv(
-    state: &PictureState,
+fn amvp_same_ref_mv<P: Pixel>(
+    state: &PictureState<P>,
     slice_params: &SliceParams,
     x_n: i32,
     y_n: i32,
@@ -1342,8 +1343,8 @@ fn amvp_same_ref_mv(
 /// Check if a spatial neighbor at `(x_n, y_n)` has a MV on list `pred_flag_idx`,
 /// and if so return that MV scaled by POC distance. This is the "long-term
 /// compatible" fallback (FFmpeg `mv_mp_mode_mx_lt`). For short-term refs only.
-fn amvp_scaled_ref_mv(
-    state: &PictureState,
+fn amvp_scaled_ref_mv<P: Pixel>(
+    state: &PictureState<P>,
     slice_params: &SliceParams,
     x_n: i32,
     y_n: i32,
@@ -1380,8 +1381,8 @@ fn amvp_scaled_ref_mv(
 ///
 /// `positions` is the list of (x, y) neighbor positions to check (e.g.
 /// [A0, A1] for the left group, [B0, B1, B2] for the above group).
-fn amvp_spatial_candidate(
-    state: &PictureState,
+fn amvp_spatial_candidate<P: Pixel>(
+    state: &PictureState<P>,
     slice_params: &SliceParams,
     x0: i32,
     y0: i32,
@@ -1469,8 +1470,8 @@ fn amvp_spatial_candidate(
 /// `ref_idx` is the decoded `ref_idx_lX` for the current list.
 /// `list_idx` is 0 for L0, 1 for L1.
 #[allow(clippy::too_many_arguments)]
-fn build_amvp_candidates(
-    state: &PictureState,
+fn build_amvp_candidates<P: Pixel>(
+    state: &PictureState<P>,
     slice_params: &SliceParams,
     x0: u32,
     y0: u32,
@@ -1629,10 +1630,10 @@ fn build_amvp_candidates(
 /// FFmpeg `hls_prediction_unit`). Returns the `merge_flag` value (needed
 /// for `rqt_root_cbf` gating).
 #[allow(clippy::too_many_arguments)]
-fn decode_prediction_unit(
+fn decode_prediction_unit<P: Pixel>(
     cabac: &mut CabacReader,
     contexts: &mut CabacContexts,
-    state: &mut PictureState,
+    state: &mut PictureState<P>,
     slice_params: &SliceParams,
     x0: u32,
     y0: u32,
@@ -2029,8 +2030,8 @@ fn inter_boundary_strength(
 /// FFmpeg `ff_hevc_deblocking_boundary_strengths`.
 ///
 /// Called at TU leaf level (for CUs with residual) or at CU level (for skip/no-residual).
-fn compute_deblocking_boundary_strengths(
-    state: &mut PictureState,
+fn compute_deblocking_boundary_strengths<P: Pixel>(
+    state: &mut PictureState<P>,
     slice_params: &SliceParams,
     x0: u32,
     y0: u32,
@@ -2164,10 +2165,10 @@ fn compute_deblocking_boundary_strengths(
 ///
 /// Handles both intra (I/P/B slices) and inter (P/B slices) CUs.
 #[allow(clippy::too_many_arguments)]
-fn decode_coding_unit(
+fn decode_coding_unit<P: Pixel>(
     cabac: &mut CabacReader,
     contexts: &mut CabacContexts,
-    state: &mut PictureState,
+    state: &mut PictureState<P>,
     sps: &Sps,
     pps: &Pps,
     slice_qp_y: i32,
@@ -2651,9 +2652,9 @@ fn decode_coding_unit(
 /// reconstructed picture's bit depth may be larger than the PCM sample bit
 /// depth, in which case PCM samples get left-shifted to match. We only
 /// support 8-bit reconstruction today so the shift is in [0, 7].
-fn decode_pcm_block(
+fn decode_pcm_block<P: Pixel>(
     cabac: &mut CabacReader,
-    state: &mut PictureState,
+    state: &mut PictureState<P>,
     sps: &Sps,
     x0: u32,
     y0: u32,
@@ -2691,8 +2692,8 @@ fn decode_pcm_block(
         let dst_off = (y0 as usize) * stride + (x0 as usize);
         for j in 0..cb_size {
             for i in 0..cb_size {
-                let sample = reader.read_bits(pcm_bd_luma) as u8;
-                state.y_plane[dst_off + j * stride + i] = sample << luma_shift;
+                let sample = reader.read_bits(pcm_bd_luma);
+                state.y_plane[dst_off + j * stride + i] = P::from_i32_clamped((sample << luma_shift) as i32, state.bit_depth);
             }
         }
     }
@@ -2712,8 +2713,8 @@ fn decode_pcm_block(
             };
             for j in 0..cb_chroma {
                 for i in 0..cb_chroma {
-                    let sample = reader.read_bits(pcm_bd_chroma) as u8;
-                    plane[dst_off + j * stride + i] = sample << chroma_shift;
+                    let sample = reader.read_bits(pcm_bd_chroma);
+                    plane[dst_off + j * stride + i] = P::from_i32_clamped((sample << chroma_shift) as i32, state.bit_depth);
                 }
             }
         }
@@ -2775,10 +2776,10 @@ struct TransformTreeCbf {
 /// Recursive transform tree decode (HEVC spec 7.3.8.10).
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::only_used_in_recursion)]
-fn decode_transform_tree(
+fn decode_transform_tree<P: Pixel>(
     cabac: &mut CabacReader,
     contexts: &mut CabacContexts,
-    state: &mut PictureState,
+    state: &mut PictureState<P>,
     sps: &Sps,
     pps: &Pps,
     slice_qp_y: i32,
@@ -3021,10 +3022,10 @@ fn decode_cu_qp_delta_sign_flag(cabac: &mut CabacReader) -> u32 {
 /// For inter CUs: prediction was already written as placeholder (128)
 /// and residual is added on top.
 #[allow(clippy::too_many_arguments)]
-fn decode_transform_unit(
+fn decode_transform_unit<P: Pixel>(
     cabac: &mut CabacReader,
     contexts: &mut CabacContexts,
-    state: &mut PictureState,
+    state: &mut PictureState<P>,
     sps: &Sps,
     pps: &Pps,
     slice_qp_y: i32,
@@ -3315,8 +3316,8 @@ fn decode_transform_unit(
 /// when the function falls into the first-group / picture-origin branch,
 /// matching FFmpeg's behavior so that multi-CU QP groups that never decode
 /// a delta keep the flag set for the next group.
-fn get_qpy_pred(
-    state: &mut PictureState,
+fn get_qpy_pred<P: Pixel>(
+    state: &mut PictureState<P>,
     sps: &Sps,
     pps: &Pps,
     slice_qp: i32,
@@ -3359,8 +3360,8 @@ fn get_qpy_pred(
 /// then stashes the result in `state.last_qp_y`. Mirrors FFmpeg
 /// `filter.c:ff_hevc_set_qPy`. We only support 8-bit (`qp_bd_offset = 0`),
 /// so the modular wrap reduces to mod-52.
-fn set_qpy(
-    state: &mut PictureState,
+fn set_qpy<P: Pixel>(
+    state: &mut PictureState<P>,
     sps: &Sps,
     pps: &Pps,
     slice_qp: i32,
@@ -3381,8 +3382,8 @@ fn set_qpy(
 /// End of a QP-group-aligned CU or split node: save `last_qp_y` as the
 /// `qpy_pred` fallback for the next group (spec 8.6.1 / FFmpeg
 /// hevcdec.c:2597-2600 and 2671-2673).
-fn maybe_save_qpy_pred(
-    state: &mut PictureState,
+fn maybe_save_qpy_pred<P: Pixel>(
+    state: &mut PictureState<P>,
     sps: &Sps,
     pps: &Pps,
     x0: u32,
@@ -3400,7 +3401,7 @@ fn maybe_save_qpy_pred(
 /// Write `qp_y` into the per-min-CB QP table for all min-CB positions
 /// covered by the TU at `(x0, y0)` of size `1 << log2_size`. Used by
 /// the deblock pass to look up tc/β.
-fn write_qp_y_table(state: &mut PictureState, x0: u32, y0: u32, log2_size: u8, qp_y: i32) {
+fn write_qp_y_table<P: Pixel>(state: &mut PictureState<P>, x0: u32, y0: u32, log2_size: u8, qp_y: i32) {
     let length = ((1u32 << log2_size) >> state.log2_min_cb_size).max(1) as usize;
     let x_cb = (x0 >> state.log2_min_cb_size) as usize;
     let y_cb = (y0 >> state.log2_min_cb_size) as usize;
@@ -3417,10 +3418,10 @@ fn write_qp_y_table(state: &mut PictureState, x0: u32, y0: u32, log2_size: u8, q
 /// QP is derived from the luma QP via the HEVC spec table 8-9 mapping.
 /// `x0`/`y0` are in luma sample coordinates; chroma is at half that for 4:2:0.
 #[allow(clippy::too_many_arguments)]
-fn decode_chroma_residuals(
+fn decode_chroma_residuals<P: Pixel>(
     cabac: &mut CabacReader,
     contexts: &mut CabacContexts,
-    state: &mut PictureState,
+    state: &mut PictureState<P>,
     sps: &Sps,
     pps: &Pps,
     x0: u32,
@@ -3516,7 +3517,7 @@ fn decode_chroma_residuals(
 /// Mark the top and left edges of an intra TU at `(x0, y0)` of size
 /// `1 << log2_size` with boundary strength 2 in the per-4×4 BS grid.
 /// Skips picture borders.
-fn mark_intra_tu_boundaries(state: &mut PictureState, x0: u32, y0: u32, log2_size: u8) {
+fn mark_intra_tu_boundaries<P: Pixel>(state: &mut PictureState<P>, x0: u32, y0: u32, log2_size: u8) {
     let size = 1u32 << log2_size;
     let pic_w = state.width as usize;
     let bs_w = pic_w >> 2; // entries per row in the BS grid
@@ -3543,8 +3544,8 @@ fn mark_intra_tu_boundaries(state: &mut PictureState, x0: u32, y0: u32, log2_siz
 
 /// Build the reference samples and call PLANAR/DC/angular for a luma TU.
 /// Writes the prediction into `state.y_plane` at `(x0, y0)`.
-fn predict_intra_luma(
-    state: &mut PictureState,
+fn predict_intra_luma<P: Pixel>(
+    state: &mut PictureState<P>,
     sps: &Sps,
     x0: u32,
     y0: u32,
@@ -3607,15 +3608,15 @@ fn predict_intra_luma(
 /// picture. Phase 3c-1 adds a cross-slice check: a neighbor pixel belonging
 /// to a CTB in a different slice is treated as unavailable, matching the
 /// spec rule (`ctb_addr_in_slice > 0` / `>= ctb_width`).
-fn compute_luma_avail(state: &PictureState, x0: u32, y0: u32, size: u32) -> ReferenceAvailability {
+fn compute_luma_avail<P: Pixel>(state: &PictureState<P>, x0: u32, y0: u32, size: u32) -> ReferenceAvailability {
     compute_luma_avail_inner(state, x0, y0, size, false)
 }
 
 /// Core availability computation. When `constrained_intra_pred` is true,
 /// additionally requires that all neighbor min-PUs in each direction were
 /// intra-coded (pred_flag == 0 in tab_mvf).
-fn compute_luma_avail_inner(
-    state: &PictureState,
+fn compute_luma_avail_inner<P: Pixel>(
+    state: &PictureState<P>,
     x0: u32,
     y0: u32,
     size: u32,
@@ -3817,8 +3818,8 @@ fn compute_luma_avail_inner(
 /// use the same logic — different planes, same prediction). The chroma
 /// position `(x0, y0)` here is in **luma sample coordinates**; we right-shift
 /// by `hshift = vshift = 1` for 4:2:0.
-fn predict_intra_chroma(
-    state: &mut PictureState,
+fn predict_intra_chroma<P: Pixel>(
+    state: &mut PictureState<P>,
     sps: &Sps,
     x0_luma: u32,
     y0_luma: u32,
@@ -3891,8 +3892,8 @@ fn predict_intra_chroma(
 /// Chroma availability mirrors luma availability — derived from the
 /// luma-coordinate position. For 4:2:0 the chroma TU's neighbors are
 /// available iff the corresponding luma neighbors were decoded.
-fn compute_chroma_avail(
-    state: &PictureState,
+fn compute_chroma_avail<P: Pixel>(
+    state: &PictureState<P>,
     x0_luma: u32,
     y0_luma: u32,
     luma_size: u32,
@@ -3908,8 +3909,8 @@ fn compute_chroma_avail(
 /// every other size and chroma uses the regular DCT. Since this function is
 /// only called from the I-slice intra path, `pred_mode == INTRA` is always
 /// true here.
-fn apply_residual_to_luma(
-    state: &mut PictureState,
+fn apply_residual_to_luma<P: Pixel>(
+    state: &mut PictureState<P>,
     x0: u32,
     y0: u32,
     log2_size: u8,
@@ -3960,10 +3961,10 @@ fn pick_scan_order(log2_trafo_size: u8, intra_pred_mode: u8) -> ScanOrder {
 
 /// Decode all intra prediction modes for a CU's PUs and write them into
 /// `tab_ipm`. Mirrors FFmpeg `intra_prediction_unit` for chroma_format_idc=1.
-fn decode_intra_mode_signaling(
+fn decode_intra_mode_signaling<P: Pixel>(
     cabac: &mut CabacReader,
     contexts: &mut CabacContexts,
-    state: &mut PictureState,
+    state: &mut PictureState<P>,
     x0: u32,
     y0: u32,
     log2_cb_size: u8,
@@ -4034,7 +4035,7 @@ fn decode_intra_mode_signaling(
     Ok(())
 }
 
-fn write_intra_pred_mode(state: &mut PictureState, x0: u32, y0: u32, pu_size: u32, mode: u8) {
+fn write_intra_pred_mode<P: Pixel>(state: &mut PictureState<P>, x0: u32, y0: u32, pu_size: u32, mode: u8) {
     let size_in_pus = (pu_size >> state.log2_min_pu_size).max(1) as usize;
     let x_pu = (x0 >> state.log2_min_pu_size) as usize;
     let y_pu = (y0 >> state.log2_min_pu_size) as usize;
@@ -4060,8 +4061,8 @@ fn decode_intra_chroma_pred_mode(cabac: &mut CabacReader, contexts: &mut CabacCo
 
 /// Luma intra mode derivation with the 3-entry MPM list (HEVC spec 8.4.2).
 /// Mirrors FFmpeg `luma_intra_pred_mode`.
-fn compute_luma_intra_pred_mode(
-    state: &PictureState,
+fn compute_luma_intra_pred_mode<P: Pixel>(
+    state: &PictureState<P>,
     x0: u32,
     y0: u32,
     prev_intra_luma_pred_flag: bool,
@@ -4196,7 +4197,7 @@ mod tests {
         );
         let mut cabac = CabacReader::new(&slice_nal.rbsp, cabac_byte_offset);
 
-        let mut state = PictureState::new(&sps);
+        let mut state = PictureState::<u8>::new(&sps);
         let slice_params = SliceParams {
             slice_type: sh.slice_type,
             max_num_merge_cand: sh.max_num_merge_cand,
