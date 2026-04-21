@@ -5,11 +5,15 @@
 //! - Chroma uses a 4-tap filter at eighth-pel resolution (8 positions).
 //! - Boundary samples are handled by clamping reference coordinates.
 //! - Bi-prediction averages L0 and L1 predictions: `(L0 + L1 + 1) >> 1`.
+//!
+//! Low-level MC functions (`mc_luma`, `mc_chroma`, `mc_luma_i32`, `mc_chroma_i32`,
+//! `ref_sample`) are generic over `P: Pixel` for multi-bit-depth support.
 
 use std::rc::Rc;
 
 use crate::cu_tree::PictureState;
 use crate::dpb::DecodedPicture;
+use crate::pixel::Pixel;
 
 /// HEVC 8-tap luma interpolation filter coefficients (spec table 8-12).
 /// Index 0 = integer position (identity / copy), 1..3 = quarter-pel.
@@ -59,24 +63,27 @@ const MAX_PB_LUMA: usize = MAX_PB_SIZE * MAX_PB_SIZE;
 /// Max chroma PU area for 4:2:0 (32×32).
 const MAX_PB_CHROMA: usize = (MAX_PB_SIZE / 2) * (MAX_PB_SIZE / 2);
 
-/// Fetch a reference luma sample with boundary clamping (spec 8.5.3.2.1).
+/// Fetch a reference sample with boundary clamping (spec 8.5.3.2.1).
+/// Generic over `P: Pixel` for multi-bit-depth support.
 #[inline]
-fn ref_sample(plane: &[u8], stride: usize, x: i32, y: i32, w: i32, h: i32) -> i32 {
+fn ref_sample<P: Pixel>(plane: &[P], stride: usize, x: i32, y: i32, w: i32, h: i32) -> i32 {
     let cx = x.clamp(0, w - 1) as usize;
     let cy = y.clamp(0, h - 1) as usize;
-    plane[cy * stride + cx] as i32
+    plane[cy * stride + cx].to_i32()
 }
 
 /// Uni-directional luma motion compensation (8-tap filter).
 ///
 /// Writes `nPbW * nPbH` prediction samples into `dst` at stride `dst_stride`.
 /// `x0, y0` are the PU's top-left luma coordinates in the current picture.
-/// `mv` is the quarter-pel motion vector.
+/// `mv` is the quarter-pel motion vector. `bit_depth` is the luma bit depth.
+///
+/// Generic over `P: Pixel` for multi-bit-depth support.
 #[allow(clippy::too_many_arguments)]
-pub fn mc_luma(
-    dst: &mut [u8],
+pub fn mc_luma<P: Pixel>(
+    dst: &mut [P],
     dst_stride: usize,
-    ref_plane: &[u8],
+    ref_plane: &[P],
     ref_stride: usize,
     ref_w: i32,
     ref_h: i32,
@@ -86,6 +93,7 @@ pub fn mc_luma(
     n_pb_h: usize,
     mv_x: i16,
     mv_y: i16,
+    bit_depth: u8,
 ) {
     let x_frac = (mv_x & 3) as usize;
     let y_frac = (mv_y & 3) as usize;
@@ -93,18 +101,17 @@ pub fn mc_luma(
     let x_int = x0 + (mv_x >> 2) as i32;
     let y_int = y0 + (mv_y >> 2) as i32;
 
+    let shift = crate::pixel::mc_shift(bit_depth);
+    let offset = crate::pixel::mc_offset(bit_depth);
+
     if x_frac == 0 && y_frac == 0 {
         // Integer-pel: direct copy.
         for j in 0..n_pb_h {
             for i in 0..n_pb_w {
-                dst[j * dst_stride + i] = ref_sample(
-                    ref_plane,
-                    ref_stride,
-                    x_int + i as i32,
-                    y_int + j as i32,
-                    ref_w,
-                    ref_h,
-                ) as u8;
+                dst[j * dst_stride + i] = P::from_i32_clamped(
+                    ref_sample(ref_plane, ref_stride, x_int + i as i32, y_int + j as i32, ref_w, ref_h),
+                    bit_depth,
+                );
             }
         }
     } else if y_frac == 0 {
@@ -119,8 +126,7 @@ pub fn mc_luma(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx + k as i32 - 3, ry, ref_w, ref_h);
                 }
-                // shift = 14 - 8 = 6, offset = 32
-                dst[j * dst_stride + i] = ((val + 32) >> 6).clamp(0, 255) as u8;
+                dst[j * dst_stride + i] = P::from_i32_clamped((val + offset) >> shift, bit_depth);
             }
         }
     } else if x_frac == 0 {
@@ -135,11 +141,11 @@ pub fn mc_luma(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx, ry + k as i32 - 3, ref_w, ref_h);
                 }
-                dst[j * dst_stride + i] = ((val + 32) >> 6).clamp(0, 255) as u8;
+                dst[j * dst_stride + i] = P::from_i32_clamped((val + offset) >> shift, bit_depth);
             }
         }
     } else {
-        // 2D separable interpolation: horizontal first into i16 intermediate,
+        // 2D separable interpolation: horizontal first into i32 intermediate,
         // then vertical on the intermediate.
         let h_filter = &QPEL_FILTER[x_frac];
         let v_filter = &QPEL_FILTER[y_frac];
@@ -147,10 +153,11 @@ pub fn mc_luma(
         // Intermediate buffer needs QPEL_EXTRA_BEFORE extra rows above and
         // QPEL_EXTRA_AFTER extra rows below. Stack-allocated to avoid per-PU
         // malloc/free overhead (this was ~23% of decode time on 1080p).
+        // Using i32 for 10-bit safety (8-tap on 1023-max samples can exceed i16 range).
         let tmp_h = n_pb_h + (QPEL_EXTRA_BEFORE + QPEL_EXTRA_AFTER) as usize;
-        let mut tmp = [0i16; QPEL_TMP_ROWS * MAX_PB_SIZE];
+        let mut tmp = [0i32; QPEL_TMP_ROWS * MAX_PB_SIZE];
 
-        // Horizontal pass: produce (n_pb_h + 7) rows of i16 values.
+        // Horizontal pass: produce (n_pb_h + 7) rows of i32 values.
         let y_start = y_int - QPEL_EXTRA_BEFORE;
         for j in 0..tmp_h {
             let ry = y_start + j as i32;
@@ -161,38 +168,45 @@ pub fn mc_luma(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx + k as i32 - 3, ry, ref_w, ref_h);
                 }
-                tmp[j * MAX_PB_SIZE + i] = val as i16;
+                tmp[j * MAX_PB_SIZE + i] = val;
             }
         }
 
         // Vertical pass on the intermediate buffer.
+        // Horizontal pass output is at 6 bits of extra precision (coefficients sum to 64).
+        // Vertical pass: undo horizontal precision (>> 6), then apply mc_shift/mc_offset.
+        // For 8-bit: (val >> 6 + 32) >> 6. For 10-bit: (val >> 6 + 8) >> 4.
         let tmp_off = QPEL_EXTRA_BEFORE as usize;
         for j in 0..n_pb_h {
             for i in 0..n_pb_w {
                 let mut val: i32 = 0;
                 for (k, &coeff) in v_filter.iter().enumerate() {
-                    val += coeff as i32 * tmp[(tmp_off + j + k - 3) * MAX_PB_SIZE + i] as i32;
+                    val += coeff as i32 * tmp[(tmp_off + j + k - 3) * MAX_PB_SIZE + i];
                 }
-                // Two-stage shift: horizontal produced values at <<0 (for 8-bit),
-                // vertical divides by 64 (>>6), then final rounding shift >>6.
-                // Net: (val >> 6 + 32) >> 6.
-                dst[j * dst_stride + i] = (((val >> 6) + 32) >> 6).clamp(0, 255) as u8;
+                dst[j * dst_stride + i] =
+                    P::from_i32_clamped(((val >> 6) + offset) >> shift, bit_depth);
             }
         }
     }
 }
 
-/// Luma MC producing i16 intermediates for bi-prediction (no final clip).
+/// Luma MC producing i32 intermediates for bi-prediction / weighted prediction
+/// (no final clip).
 ///
 /// The output is at "shift-6" precision: for sub-pixel, this is the raw
 /// filter output (H/V-only) or `vert_pass >> 6` (2D). For integer-pel,
 /// the pixel value is left-shifted by 6 to match. Bi-prediction combines
-/// two intermediates as `clip((L0 + L1 + 64) >> 7)`.
+/// two intermediates as `clip((L0 + L1 + bipred_offset) >> bipred_shift)`.
+///
+/// Uses i32 output (instead of i16) for 10-bit safety: 8-tap on 1023-max
+/// samples left-shifted by 6 can exceed i16 range.
+///
+/// Generic over `P: Pixel` for multi-bit-depth support.
 #[allow(clippy::too_many_arguments)]
-pub fn mc_luma_i16(
-    dst: &mut [i16],
+pub fn mc_luma_i32<P: Pixel>(
+    dst: &mut [i32],
     dst_stride: usize,
-    ref_plane: &[u8],
+    ref_plane: &[P],
     ref_stride: usize,
     ref_w: i32,
     ref_h: i32,
@@ -211,14 +225,14 @@ pub fn mc_luma_i16(
     if x_frac == 0 && y_frac == 0 {
         for j in 0..n_pb_h {
             for i in 0..n_pb_w {
-                dst[j * dst_stride + i] = (ref_sample(
+                dst[j * dst_stride + i] = ref_sample(
                     ref_plane,
                     ref_stride,
                     x_int + i as i32,
                     y_int + j as i32,
                     ref_w,
                     ref_h,
-                ) << 6) as i16;
+                ) << 6;
             }
         }
     } else if y_frac == 0 {
@@ -232,7 +246,7 @@ pub fn mc_luma_i16(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx + k as i32 - 3, ry, ref_w, ref_h);
                 }
-                dst[j * dst_stride + i] = val as i16;
+                dst[j * dst_stride + i] = val;
             }
         }
     } else if x_frac == 0 {
@@ -246,14 +260,14 @@ pub fn mc_luma_i16(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx, ry + k as i32 - 3, ref_w, ref_h);
                 }
-                dst[j * dst_stride + i] = val as i16;
+                dst[j * dst_stride + i] = val;
             }
         }
     } else {
         let h_filter = &QPEL_FILTER[x_frac];
         let v_filter = &QPEL_FILTER[y_frac];
         let tmp_h = n_pb_h + (QPEL_EXTRA_BEFORE + QPEL_EXTRA_AFTER) as usize;
-        let mut tmp = [0i16; QPEL_TMP_ROWS * MAX_PB_SIZE];
+        let mut tmp = [0i32; QPEL_TMP_ROWS * MAX_PB_SIZE];
         let y_start = y_int - QPEL_EXTRA_BEFORE;
         for j in 0..tmp_h {
             let ry = y_start + j as i32;
@@ -264,7 +278,7 @@ pub fn mc_luma_i16(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx + k as i32 - 3, ry, ref_w, ref_h);
                 }
-                tmp[j * MAX_PB_SIZE + i] = val as i16;
+                tmp[j * MAX_PB_SIZE + i] = val;
             }
         }
         let tmp_off = QPEL_EXTRA_BEFORE as usize;
@@ -272,20 +286,22 @@ pub fn mc_luma_i16(
             for i in 0..n_pb_w {
                 let mut val: i32 = 0;
                 for (k, &coeff) in v_filter.iter().enumerate() {
-                    val += coeff as i32 * tmp[(tmp_off + j + k - 3) * MAX_PB_SIZE + i] as i32;
+                    val += coeff as i32 * tmp[(tmp_off + j + k - 3) * MAX_PB_SIZE + i];
                 }
-                dst[j * dst_stride + i] = (val >> 6) as i16;
+                dst[j * dst_stride + i] = val >> 6;
             }
         }
     }
 }
 
-/// Chroma MC producing i16 intermediates for bi-prediction.
+/// Chroma MC producing i32 intermediates for bi-prediction / weighted prediction.
+///
+/// Uses i32 output for 10-bit safety. Generic over `P: Pixel`.
 #[allow(clippy::too_many_arguments)]
-pub fn mc_chroma_i16(
-    dst: &mut [i16],
+pub fn mc_chroma_i32<P: Pixel>(
+    dst: &mut [i32],
     dst_stride: usize,
-    ref_plane: &[u8],
+    ref_plane: &[P],
     ref_stride: usize,
     ref_w: i32,
     ref_h: i32,
@@ -304,14 +320,14 @@ pub fn mc_chroma_i16(
     if x_frac == 0 && y_frac == 0 {
         for j in 0..n_pb_h {
             for i in 0..n_pb_w {
-                dst[j * dst_stride + i] = (ref_sample(
+                dst[j * dst_stride + i] = ref_sample(
                     ref_plane,
                     ref_stride,
                     x_int + i as i32,
                     y_int + j as i32,
                     ref_w,
                     ref_h,
-                ) << 6) as i16;
+                ) << 6;
             }
         }
     } else if y_frac == 0 {
@@ -325,7 +341,7 @@ pub fn mc_chroma_i16(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx + k as i32 - 1, ry, ref_w, ref_h);
                 }
-                dst[j * dst_stride + i] = val as i16;
+                dst[j * dst_stride + i] = val;
             }
         }
     } else if x_frac == 0 {
@@ -339,14 +355,14 @@ pub fn mc_chroma_i16(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx, ry + k as i32 - 1, ref_w, ref_h);
                 }
-                dst[j * dst_stride + i] = val as i16;
+                dst[j * dst_stride + i] = val;
             }
         }
     } else {
         let h_filter = &EPEL_FILTER[x_frac];
         let v_filter = &EPEL_FILTER[y_frac];
         let tmp_h = n_pb_h + (EPEL_EXTRA_BEFORE + EPEL_EXTRA_AFTER) as usize;
-        let mut tmp = [0i16; EPEL_TMP_ROWS * MAX_PB_SIZE];
+        let mut tmp = [0i32; EPEL_TMP_ROWS * MAX_PB_SIZE];
         let y_start = y_int - EPEL_EXTRA_BEFORE;
         for j in 0..tmp_h {
             let ry = y_start + j as i32;
@@ -357,7 +373,7 @@ pub fn mc_chroma_i16(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx + k as i32 - 1, ry, ref_w, ref_h);
                 }
-                tmp[j * MAX_PB_SIZE + i] = val as i16;
+                tmp[j * MAX_PB_SIZE + i] = val;
             }
         }
         let tmp_off = EPEL_EXTRA_BEFORE as usize;
@@ -365,9 +381,9 @@ pub fn mc_chroma_i16(
             for i in 0..n_pb_w {
                 let mut val: i32 = 0;
                 for (k, &coeff) in v_filter.iter().enumerate() {
-                    val += coeff as i32 * tmp[(tmp_off + j + k - 1) * MAX_PB_SIZE + i] as i32;
+                    val += coeff as i32 * tmp[(tmp_off + j + k - 1) * MAX_PB_SIZE + i];
                 }
-                dst[j * dst_stride + i] = (val >> 6) as i16;
+                dst[j * dst_stride + i] = val >> 6;
             }
         }
     }
@@ -377,11 +393,14 @@ pub fn mc_chroma_i16(
 ///
 /// `x0_c, y0_c` are chroma-plane coordinates (i.e. already halved for 4:2:0).
 /// `mv_x_c, mv_y_c` are the halved MV components (still in eighth-pel units).
+/// `bit_depth` is the chroma bit depth.
+///
+/// Generic over `P: Pixel` for multi-bit-depth support.
 #[allow(clippy::too_many_arguments)]
-pub fn mc_chroma(
-    dst: &mut [u8],
+pub fn mc_chroma<P: Pixel>(
+    dst: &mut [P],
     dst_stride: usize,
-    ref_plane: &[u8],
+    ref_plane: &[P],
     ref_stride: usize,
     ref_w: i32,
     ref_h: i32,
@@ -391,6 +410,7 @@ pub fn mc_chroma(
     n_pb_h_c: usize,
     mv_x_c: i16,
     mv_y_c: i16,
+    bit_depth: u8,
 ) {
     // For 4:2:0, chroma MV has 3 fractional bits (eighth-pel).
     let x_frac = (mv_x_c & 7) as usize;
@@ -398,17 +418,16 @@ pub fn mc_chroma(
     let x_int = x0_c + (mv_x_c >> 3) as i32;
     let y_int = y0_c + (mv_y_c >> 3) as i32;
 
+    let shift = crate::pixel::mc_shift(bit_depth);
+    let offset = crate::pixel::mc_offset(bit_depth);
+
     if x_frac == 0 && y_frac == 0 {
         for j in 0..n_pb_h_c {
             for i in 0..n_pb_w_c {
-                dst[j * dst_stride + i] = ref_sample(
-                    ref_plane,
-                    ref_stride,
-                    x_int + i as i32,
-                    y_int + j as i32,
-                    ref_w,
-                    ref_h,
-                ) as u8;
+                dst[j * dst_stride + i] = P::from_i32_clamped(
+                    ref_sample(ref_plane, ref_stride, x_int + i as i32, y_int + j as i32, ref_w, ref_h),
+                    bit_depth,
+                );
             }
         }
     } else if y_frac == 0 {
@@ -422,7 +441,7 @@ pub fn mc_chroma(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx + k as i32 - 1, ry, ref_w, ref_h);
                 }
-                dst[j * dst_stride + i] = ((val + 32) >> 6).clamp(0, 255) as u8;
+                dst[j * dst_stride + i] = P::from_i32_clamped((val + offset) >> shift, bit_depth);
             }
         }
     } else if x_frac == 0 {
@@ -436,7 +455,7 @@ pub fn mc_chroma(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx, ry + k as i32 - 1, ref_w, ref_h);
                 }
-                dst[j * dst_stride + i] = ((val + 32) >> 6).clamp(0, 255) as u8;
+                dst[j * dst_stride + i] = P::from_i32_clamped((val + offset) >> shift, bit_depth);
             }
         }
     } else {
@@ -444,7 +463,7 @@ pub fn mc_chroma(
         let v_filter = &EPEL_FILTER[y_frac];
 
         let tmp_h = n_pb_h_c + (EPEL_EXTRA_BEFORE + EPEL_EXTRA_AFTER) as usize;
-        let mut tmp = [0i16; EPEL_TMP_ROWS * MAX_PB_SIZE];
+        let mut tmp = [0i32; EPEL_TMP_ROWS * MAX_PB_SIZE];
 
         let y_start = y_int - EPEL_EXTRA_BEFORE;
         for j in 0..tmp_h {
@@ -456,7 +475,7 @@ pub fn mc_chroma(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx + k as i32 - 1, ry, ref_w, ref_h);
                 }
-                tmp[j * MAX_PB_SIZE + i] = val as i16;
+                tmp[j * MAX_PB_SIZE + i] = val;
             }
         }
 
@@ -465,9 +484,10 @@ pub fn mc_chroma(
             for i in 0..n_pb_w_c {
                 let mut val: i32 = 0;
                 for (k, &coeff) in v_filter.iter().enumerate() {
-                    val += coeff as i32 * tmp[(tmp_off + j + k - 1) * MAX_PB_SIZE + i] as i32;
+                    val += coeff as i32 * tmp[(tmp_off + j + k - 1) * MAX_PB_SIZE + i];
                 }
-                dst[j * dst_stride + i] = (((val >> 6) + 32) >> 6).clamp(0, 255) as u8;
+                dst[j * dst_stride + i] =
+                    P::from_i32_clamped(((val >> 6) + offset) >> shift, bit_depth);
             }
         }
     }
@@ -514,19 +534,24 @@ pub fn motion_compensation_pu(
     let is_l1 = mvf.pred_flag & 2 != 0;
     let is_bi = is_l0 && is_l1;
 
+    let bit_depth = state.bit_depth;
+    let bi_shift = crate::pixel::bipred_shift(bit_depth) as i32;
+    let bi_offset = crate::pixel::bipred_offset(bit_depth);
+    let max_val = crate::pixel::max_pixel_val(bit_depth);
+
     if is_bi {
-        // Bi-prediction: compute L0 and L1 intermediates at i16 precision
+        // Bi-prediction: compute L0 and L1 intermediates at i32 precision
         // (before the final clip), then combine as specified by the HEVC spec:
-        //   output = clip((L0 + L1 + offset) >> shift)
-        // For 8-bit: shift = 7, offset = 64 (= 1 << 6).
-        let mut pred_l0_y = [0i16; MAX_PB_LUMA];
-        let mut pred_l1_y = [0i16; MAX_PB_LUMA];
+        //   output = clip((L0 + L1 + bipred_offset) >> bipred_shift)
+        // For 8-bit: shift = 7, offset = 64. For 10-bit: shift = 5, offset = 16.
+        let mut pred_l0_y = [0i32; MAX_PB_LUMA];
+        let mut pred_l1_y = [0i32; MAX_PB_LUMA];
         let w_c = w / 2;
         let h_c = h / 2;
-        let mut pred_l0_u = [0i16; MAX_PB_CHROMA];
-        let mut pred_l0_v = [0i16; MAX_PB_CHROMA];
-        let mut pred_l1_u = [0i16; MAX_PB_CHROMA];
-        let mut pred_l1_v = [0i16; MAX_PB_CHROMA];
+        let mut pred_l0_u = [0i32; MAX_PB_CHROMA];
+        let mut pred_l0_v = [0i32; MAX_PB_CHROMA];
+        let mut pred_l1_u = [0i32; MAX_PB_CHROMA];
+        let mut pred_l1_v = [0i32; MAX_PB_CHROMA];
 
         // L0
         let ref_pic_l0 = &ref_frames_l0[mvf.ref_idx[0] as usize];
@@ -534,7 +559,7 @@ pub fn motion_compensation_pu(
             let rw = ref_pic_l0.width as i32;
             let rh = ref_pic_l0.height as i32;
             let rs = ref_pic_l0.width as usize;
-            mc_luma_i16(
+            mc_luma_i32::<u8>(
                 &mut pred_l0_y,
                 w,
                 &ref_pic_l0.y,
@@ -553,7 +578,7 @@ pub fn motion_compensation_pu(
             let rs_c = (ref_pic_l0.width / 2) as usize;
             let mv_x_c = mvf.mv[0].x;
             let mv_y_c = mvf.mv[0].y;
-            mc_chroma_i16(
+            mc_chroma_i32::<u8>(
                 &mut pred_l0_u,
                 w_c,
                 &ref_pic_l0.u,
@@ -567,7 +592,7 @@ pub fn motion_compensation_pu(
                 mv_x_c,
                 mv_y_c,
             );
-            mc_chroma_i16(
+            mc_chroma_i32::<u8>(
                 &mut pred_l0_v,
                 w_c,
                 &ref_pic_l0.v,
@@ -589,7 +614,7 @@ pub fn motion_compensation_pu(
             let rw = ref_pic_l1.width as i32;
             let rh = ref_pic_l1.height as i32;
             let rs = ref_pic_l1.width as usize;
-            mc_luma_i16(
+            mc_luma_i32::<u8>(
                 &mut pred_l1_y,
                 w,
                 &ref_pic_l1.y,
@@ -608,7 +633,7 @@ pub fn motion_compensation_pu(
             let rs_c = (ref_pic_l1.width / 2) as usize;
             let mv_x_c = mvf.mv[1].x;
             let mv_y_c = mvf.mv[1].y;
-            mc_chroma_i16(
+            mc_chroma_i32::<u8>(
                 &mut pred_l1_u,
                 w_c,
                 &ref_pic_l1.u,
@@ -622,7 +647,7 @@ pub fn motion_compensation_pu(
                 mv_x_c,
                 mv_y_c,
             );
-            mc_chroma_i16(
+            mc_chroma_i32::<u8>(
                 &mut pred_l1_v,
                 w_c,
                 &ref_pic_l1.v,
@@ -638,13 +663,13 @@ pub fn motion_compensation_pu(
             );
         }
 
-        // Combine at i16 precision: (L0 + L1 + 64) >> 7, then clip.
+        // Combine at i32 precision: (L0 + L1 + bipred_offset) >> bipred_shift, then clip.
         let y_off = (y0 as usize) * y_stride + (x0 as usize);
         for j in 0..h {
             for i in 0..w {
                 let idx = j * w + i;
                 let avg =
-                    ((pred_l0_y[idx] as i32 + pred_l1_y[idx] as i32 + 64) >> 7).clamp(0, 255) as u8;
+                    ((pred_l0_y[idx] + pred_l1_y[idx] + bi_offset) >> bi_shift).clamp(0, max_val) as u8;
                 let dst_idx = y_off + j * y_stride + i;
                 if dst_idx < state.y_plane.len() {
                     state.y_plane[dst_idx] = avg;
@@ -657,12 +682,12 @@ pub fn motion_compensation_pu(
                 let idx = j * w_c + i;
                 let dst_idx = c_off + j * uv_stride + i;
                 if dst_idx < state.u_plane.len() {
-                    state.u_plane[dst_idx] = ((pred_l0_u[idx] as i32 + pred_l1_u[idx] as i32 + 64)
-                        >> 7)
-                        .clamp(0, 255) as u8;
-                    state.v_plane[dst_idx] = ((pred_l0_v[idx] as i32 + pred_l1_v[idx] as i32 + 64)
-                        >> 7)
-                        .clamp(0, 255) as u8;
+                    state.u_plane[dst_idx] = ((pred_l0_u[idx] + pred_l1_u[idx] + bi_offset)
+                        >> bi_shift)
+                        .clamp(0, max_val) as u8;
+                    state.v_plane[dst_idx] = ((pred_l0_v[idx] + pred_l1_v[idx] + bi_offset)
+                        >> bi_shift)
+                        .clamp(0, max_val) as u8;
                 }
             }
         }
@@ -687,7 +712,7 @@ pub fn motion_compensation_pu(
         if !weighted_pred_flag {
             // Non-weighted: write prediction samples directly.
             let y_off = (y0 as usize) * y_stride + (x0 as usize);
-            mc_luma(
+            mc_luma::<u8>(
                 &mut state.y_plane[y_off..],
                 y_stride,
                 &ref_list.y,
@@ -700,6 +725,7 @@ pub fn motion_compensation_pu(
                 h,
                 mv.x,
                 mv.y,
+                bit_depth,
             );
 
             let w_c = w / 2;
@@ -713,7 +739,7 @@ pub fn motion_compensation_pu(
             let mv_y_c = mv.y as i32;
 
             let c_off = (y0 as usize / 2) * uv_stride + (x0 as usize / 2);
-            mc_chroma(
+            mc_chroma::<u8>(
                 &mut state.u_plane[c_off..],
                 uv_stride,
                 &ref_list.u,
@@ -726,8 +752,9 @@ pub fn motion_compensation_pu(
                 h_c,
                 mv_x_c as i16,
                 mv_y_c as i16,
+                bit_depth,
             );
-            mc_chroma(
+            mc_chroma::<u8>(
                 &mut state.v_plane[c_off..],
                 uv_stride,
                 &ref_list.v,
@@ -740,6 +767,7 @@ pub fn motion_compensation_pu(
                 h_c,
                 mv_x_c as i16,
                 mv_y_c as i16,
+                bit_depth,
             );
         } else {
             // Weighted uni-prediction: compute MC at i16 precision, then apply
@@ -765,9 +793,9 @@ pub fn motion_compensation_pu(
                 )
             };
 
-            // Luma: MC into i16 intermediate, then apply weight.
-            let mut pred_y = [0i16; MAX_PB_LUMA];
-            mc_luma_i16(
+            // Luma: MC into i32 intermediate, then apply weight.
+            let mut pred_y = [0i32; MAX_PB_LUMA];
+            mc_luma_i32::<u8>(
                 &mut pred_y,
                 w,
                 &ref_list.y,
@@ -786,20 +814,20 @@ pub fn motion_compensation_pu(
             // For 8-bit: log2WD = luma_log2_weight_denom
             // FFmpeg's put_hevc_qpel_uni_w uses:
             //   (((val >> (14 - 8)) * weight + (1 << (log2WD + 14 - 8 - 1))) >> (log2WD + 14 - 8)) + offset
-            // The i16 intermediate from mc_luma_i16 is at "shift-6" precision:
+            // The i32 intermediate from mc_luma_i32 is at "shift-6" precision:
             //   integer-pel: pixel << 6
             //   sub-pel: raw filter output (also effectively << 6 for single-pass)
-            // So we need: clip((pred_i16 * weight + round) >> (6 + denom)) + offset
+            // So we need: clip((pred_i32 * weight + round) >> (6 + denom)) + offset
             let shift = 6 + luma_denom as i32;
             let round = if shift > 0 { 1i32 << (shift - 1) } else { 0 };
             let y_off = (y0 as usize) * y_stride + (x0 as usize);
             for j in 0..h {
                 for i in 0..w {
-                    let val = pred_y[j * w + i] as i32;
+                    let val = pred_y[j * w + i];
                     let weighted = ((val * luma_w + round) >> shift) + luma_o;
                     let dst_idx = y_off + j * y_stride + i;
                     if dst_idx < state.y_plane.len() {
-                        state.y_plane[dst_idx] = weighted.clamp(0, 255) as u8;
+                        state.y_plane[dst_idx] = weighted.clamp(0, max_val) as u8;
                     }
                 }
             }
@@ -817,9 +845,9 @@ pub fn motion_compensation_pu(
                 0
             };
 
-            let mut pred_u = [0i16; MAX_PB_CHROMA];
-            let mut pred_v = [0i16; MAX_PB_CHROMA];
-            mc_chroma_i16(
+            let mut pred_u = [0i32; MAX_PB_CHROMA];
+            let mut pred_v = [0i32; MAX_PB_CHROMA];
+            mc_chroma_i32::<u8>(
                 &mut pred_u,
                 w_c,
                 &ref_list.u,
@@ -833,7 +861,7 @@ pub fn motion_compensation_pu(
                 mv.x,
                 mv.y,
             );
-            mc_chroma_i16(
+            mc_chroma_i32::<u8>(
                 &mut pred_v,
                 w_c,
                 &ref_list.v,
@@ -856,14 +884,14 @@ pub fn motion_compensation_pu(
                     if dst_idx < state.u_plane.len() {
                         let wu = chroma_w[0] as i32;
                         let ou = chroma_o[0] as i32;
-                        state.u_plane[dst_idx] = (((pred_u[idx] as i32 * wu + c_round) >> c_shift)
+                        state.u_plane[dst_idx] = (((pred_u[idx] * wu + c_round) >> c_shift)
                             + ou)
-                            .clamp(0, 255) as u8;
+                            .clamp(0, max_val) as u8;
                         let wv = chroma_w[1] as i32;
                         let ov = chroma_o[1] as i32;
-                        state.v_plane[dst_idx] = (((pred_v[idx] as i32 * wv + c_round) >> c_shift)
+                        state.v_plane[dst_idx] = (((pred_v[idx] * wv + c_round) >> c_shift)
                             + ov)
-                            .clamp(0, 255) as u8;
+                            .clamp(0, max_val) as u8;
                     }
                 }
             }
@@ -882,8 +910,9 @@ fn mc_luma_from_ref(
     w: usize,
     h: usize,
     mv: crate::cu_tree::Mv,
+    bit_depth: u8,
 ) {
-    mc_luma(
+    mc_luma::<u8>(
         dst,
         dst_stride,
         &ref_pic.y,
@@ -896,6 +925,7 @@ fn mc_luma_from_ref(
         h,
         mv.x,
         mv.y,
+        bit_depth,
     );
 }
 
@@ -911,6 +941,7 @@ fn mc_chroma_from_ref_uv(
     w: usize,
     h: usize,
     mv: crate::cu_tree::Mv,
+    bit_depth: u8,
 ) {
     let w_c = w / 2;
     let h_c = h / 2;
@@ -923,7 +954,7 @@ fn mc_chroma_from_ref_uv(
     let mv_x_c = mv.x;
     let mv_y_c = mv.y;
 
-    mc_chroma(
+    mc_chroma::<u8>(
         dst_u,
         dst_stride_c,
         &ref_pic.u,
@@ -936,8 +967,9 @@ fn mc_chroma_from_ref_uv(
         h_c,
         mv_x_c,
         mv_y_c,
+        bit_depth,
     );
-    mc_chroma(
+    mc_chroma::<u8>(
         dst_v,
         dst_stride_c,
         &ref_pic.v,
@@ -950,6 +982,7 @@ fn mc_chroma_from_ref_uv(
         h_c,
         mv_x_c,
         mv_y_c,
+        bit_depth,
     );
 }
 
@@ -1065,6 +1098,7 @@ mod tests {
             h,
             0,
             0,
+            8,
         );
 
         for j in 0..h {
@@ -1096,6 +1130,7 @@ mod tests {
             4,
             2,
             0,
+            8,
         );
 
         // With uniform reference, all outputs should be 128.
@@ -1125,6 +1160,7 @@ mod tests {
             4,
             1,
             3,
+            8,
         );
 
         for &v in &dst {
@@ -1161,6 +1197,7 @@ mod tests {
             h,
             0,
             0,
+            8,
         );
 
         for j in 0..h {
@@ -1191,6 +1228,7 @@ mod tests {
             4,
             3,
             5,
+            8,
         );
 
         for &v in &dst {
