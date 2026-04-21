@@ -337,6 +337,47 @@ fn read_bs(bs: &[u8], pic_w: usize, x: usize, y: usize) -> i32 {
     bs[(y >> 2) * (pic_w >> 2) + (x >> 2)] as i32
 }
 
+/// Check whether a vertical edge at luma x crosses a slice boundary and
+/// should be skipped because `slice_loop_filter_across_slices_enabled_flag`
+/// is false on either side.
+#[inline]
+fn skip_vertical_slice_boundary(state: &PictureState, x: usize, y: usize) -> bool {
+    let log2_ctb = state.log2_ctb_size as usize;
+    let left_ctb_col = (x - 1) >> log2_ctb;
+    let right_ctb_col = x >> log2_ctb;
+    if left_ctb_col == right_ctb_col {
+        return false; // not at a CTB column boundary
+    }
+    let ctb_width = (state.width as usize).div_ceil(1 << log2_ctb);
+    let ctb_row = y >> log2_ctb;
+    let left_rs = ctb_row * ctb_width + left_ctb_col;
+    let right_rs = ctb_row * ctb_width + right_ctb_col;
+    if state.tab_slice_addr_rs[left_rs] == state.tab_slice_addr_rs[right_rs] {
+        return false; // same slice
+    }
+    !state.filter_slice_edges[left_rs] || !state.filter_slice_edges[right_rs]
+}
+
+/// Check whether a horizontal edge at luma y crosses a slice boundary and
+/// should be skipped.
+#[inline]
+fn skip_horizontal_slice_boundary(state: &PictureState, x: usize, y: usize) -> bool {
+    let log2_ctb = state.log2_ctb_size as usize;
+    let top_ctb_row = (y - 1) >> log2_ctb;
+    let bot_ctb_row = y >> log2_ctb;
+    if top_ctb_row == bot_ctb_row {
+        return false; // not at a CTB row boundary
+    }
+    let ctb_width = (state.width as usize).div_ceil(1 << log2_ctb);
+    let ctb_col = x >> log2_ctb;
+    let top_rs = top_ctb_row * ctb_width + ctb_col;
+    let bot_rs = bot_ctb_row * ctb_width + ctb_col;
+    if state.tab_slice_addr_rs[top_rs] == state.tab_slice_addr_rs[bot_rs] {
+        return false; // same slice
+    }
+    !state.filter_slice_edges[top_rs] || !state.filter_slice_edges[bot_rs]
+}
+
 /// Apply the deblocking filter to the entire reconstructed picture.
 ///
 /// Phase 3b-1 limitation: only the intra-slice path. The boundary strength
@@ -355,6 +396,10 @@ pub fn deblock_picture(state: &mut PictureState, sps: &Sps, pps: &Pps, sh: &Slic
     while y < pic_h {
         let mut x = 8usize;
         while x < pic_w {
+            if skip_vertical_slice_boundary(state, x, y) {
+                x += 8;
+                continue;
+            }
             let bs0 = read_bs(&state.bs_vertical, pic_w, x, y);
             let bs1 = read_bs(&state.bs_vertical, pic_w, x, y + 4);
             if bs0 != 0 || bs1 != 0 {
@@ -385,6 +430,10 @@ pub fn deblock_picture(state: &mut PictureState, sps: &Sps, pps: &Pps, sh: &Slic
     while y < pic_h {
         let mut x = 0usize;
         while x < pic_w {
+            if skip_horizontal_slice_boundary(state, x, y) {
+                x += 8;
+                continue;
+            }
             let bs0 = read_bs(&state.bs_horizontal, pic_w, x, y);
             let bs1 = read_bs(&state.bs_horizontal, pic_w, x + 4, y);
             if bs0 != 0 || bs1 != 0 {
@@ -431,6 +480,10 @@ pub fn deblock_picture(state: &mut PictureState, sps: &Sps, pps: &Pps, sh: &Slic
         while y_l < pic_h {
             let mut x_l = 16usize;
             while x_l < pic_w {
+                if skip_vertical_slice_boundary(state, x_l, y_l) {
+                    x_l += 16;
+                    continue;
+                }
                 let bs0 = read_bs(&state.bs_vertical, pic_w, x_l, y_l);
                 let bs1 = read_bs(&state.bs_vertical, pic_w, x_l, y_l + 8);
                 if bs0 == 2 || bs1 == 2 {
@@ -463,6 +516,10 @@ pub fn deblock_picture(state: &mut PictureState, sps: &Sps, pps: &Pps, sh: &Slic
         while y_l < pic_h {
             let mut x_l = 0usize;
             while x_l < pic_w {
+                if skip_horizontal_slice_boundary(state, x_l, y_l) {
+                    x_l += 16;
+                    continue;
+                }
                 let bs0 = read_bs(&state.bs_horizontal, pic_w, x_l, y_l);
                 let bs1 = read_bs(&state.bs_horizontal, pic_w, x_l + 8, y_l);
                 if bs0 == 2 || bs1 == 2 {

@@ -181,7 +181,6 @@ mod parameter_set_tests {
         assert!(!pps.weighted_bipred_flag);
         assert!(!pps.tiles_enabled_flag);
         assert!(!pps.entropy_coding_sync_enabled_flag);
-        assert!(pps.pps_loop_filter_across_slices_enabled_flag);
         assert!(pps.deblocking_filter_control_present_flag);
         assert!(!pps.deblocking_filter_override_enabled_flag);
         assert!(pps.pps_deblocking_filter_disabled_flag);

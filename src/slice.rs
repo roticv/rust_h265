@@ -195,6 +195,10 @@ pub struct SliceHeader {
     pub pred_weight_table: PredWeightTable,
     /// NAL unit type copy — needed for POC derivation downstream.
     pub nal_unit_type: NalUnitType,
+    /// `slice_loop_filter_across_slices_enabled_flag`. When false, deblocking
+    /// and SAO are suppressed at slice boundaries. Inferred equal to
+    /// `pps.pps_loop_filter_across_slices_enabled_flag` when not present.
+    pub slice_loop_filter_across_slices_enabled_flag: bool,
     /// NAL temporal id — used by the DPB's "prev_tid0" tracking. Always 0
     /// for fixtures we have today; populated by `Decoder::decode_slice` on
     /// behalf of the slice since the parser doesn't see the NAL header.
@@ -290,6 +294,8 @@ pub fn parse_slice_segment_header(
     let mut slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
     let mut slice_beta_offset_div2 = 0i32;
     let mut slice_tc_offset_div2 = 0i32;
+    let mut slice_loop_filter_across_slices_enabled_flag =
+        pps.pps_loop_filter_across_slices_enabled_flag;
 
     // Phase 3d-1 inter bitstream fields. Defaults match what an I-slice
     // picture expects: no RPS entries, no temporal MVP, zero ref indices.
@@ -556,7 +562,7 @@ pub fn parse_slice_segment_header(
                 || slice_sao_chroma_flag
                 || !slice_deblocking_filter_disabled_flag)
         {
-            let _slice_loop_filter_across_slices_enabled_flag = r.read_bit()?;
+            slice_loop_filter_across_slices_enabled_flag = r.read_bit()? == 1;
         }
     }
 
@@ -651,6 +657,7 @@ pub fn parse_slice_segment_header(
         max_num_merge_cand,
         ref_pic_list_modification,
         pred_weight_table,
+        slice_loop_filter_across_slices_enabled_flag,
         nal_unit_type,
         temporal_id: 0,
         // IDR pictures have POC = 0 regardless of slice_pic_order_cnt_lsb

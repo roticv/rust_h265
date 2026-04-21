@@ -236,7 +236,9 @@ fn cmp(a: i32, b: i32) -> i32 {
 }
 
 /// Edge offset filter: per-pixel category (1..4) drives the offset.
-/// Pixels at the picture borders along the EO direction are skipped.
+/// Pixels at the picture borders (or slice/tile boundaries when
+/// `no_cross_left/right/top/bottom` restrict the accessible area) along
+/// the EO direction are skipped.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::needless_range_loop)]
 fn sao_edge_filter(
@@ -252,6 +254,10 @@ fn sao_edge_filter(
     y0: usize,
     pic_w: usize,
     pic_h: usize,
+    no_cross_left: bool,
+    no_cross_right: bool,
+    no_cross_top: bool,
+    no_cross_bottom: bool,
 ) {
     // edge_idx maps (1 + cmp(a) + cmp(b)) → category.
     // FFmpeg uses { 1, 2, 0, 3, 4 } indexed by [2 + diff0 + diff1].
@@ -266,14 +272,15 @@ fn sao_edge_filter(
     };
 
     // Determine which rows/cols of the CTB to actually process — skip
-    // pixels whose neighbors would lie outside the picture.
+    // pixels whose neighbors would lie outside the picture or across a
+    // restricted slice/tile boundary.
     let init_x = if a_dx == -1 || b_dx == -1 {
-        if x0 == 0 { 1 } else { 0 }
+        if x0 == 0 || no_cross_left { 1 } else { 0 }
     } else {
         0
     };
     let end_x = if a_dx == 1 || b_dx == 1 {
-        if x0 + width >= pic_w {
+        if x0 + width >= pic_w || no_cross_right {
             width - 1
         } else {
             width
@@ -282,12 +289,12 @@ fn sao_edge_filter(
         width
     };
     let init_y = if a_dy == -1 || b_dy == -1 {
-        if y0 == 0 { 1 } else { 0 }
+        if y0 == 0 || no_cross_top { 1 } else { 0 }
     } else {
         0
     };
     let end_y = if a_dy == 1 || b_dy == 1 {
-        if y0 + height >= pic_h {
+        if y0 + height >= pic_h || no_cross_bottom {
             height - 1
         } else {
             height
@@ -316,6 +323,17 @@ fn sao_edge_filter(
     }
 }
 
+/// Check if two adjacent CTBs (by raster address) are in the same slice,
+/// and if not, whether loop filtering across that boundary is allowed.
+/// Returns true if the boundary should be treated as "no filtering across".
+#[inline]
+fn sao_skip_slice_boundary(state: &PictureState, rs_a: usize, rs_b: usize) -> bool {
+    if state.tab_slice_addr_rs[rs_a] == state.tab_slice_addr_rs[rs_b] {
+        return false;
+    }
+    !state.filter_slice_edges[rs_a] || !state.filter_slice_edges[rs_b]
+}
+
 /// Apply SAO to the entire reconstructed picture, after deblocking.
 /// Per-CTB SAO parameters must already be in `state.sao_params`.
 pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) {
@@ -337,7 +355,19 @@ pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) 
 
     for ry in 0..pic_h_in_ctbs {
         for rx in 0..pic_w_in_ctbs {
-            let sao = state.sao_params[ry * pic_w_in_ctbs + rx].clone();
+            let ctb_rs = ry * pic_w_in_ctbs + rx;
+            let sao = state.sao_params[ctb_rs].clone();
+
+            // Compute slice-boundary "no cross" flags for this CTB.
+            let no_cross_left = rx > 0
+                && sao_skip_slice_boundary(state, ctb_rs, ctb_rs - 1);
+            let no_cross_right = rx + 1 < pic_w_in_ctbs
+                && sao_skip_slice_boundary(state, ctb_rs, ctb_rs + 1);
+            let no_cross_top = ry > 0
+                && sao_skip_slice_boundary(state, ctb_rs, ctb_rs - pic_w_in_ctbs);
+            let no_cross_bottom = ry + 1 < pic_h_in_ctbs
+                && sao_skip_slice_boundary(state, ctb_rs, ctb_rs + pic_w_in_ctbs);
+
             // Luma
             if sh.slice_sao_luma_flag && sao.type_idx[0] != SaoType::NotApplied {
                 let x0 = rx * ctb_size;
@@ -370,6 +400,10 @@ pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) 
                         y0,
                         pic_w,
                         pic_h,
+                        no_cross_left,
+                        no_cross_right,
+                        no_cross_top,
+                        no_cross_bottom,
                     ),
                     SaoType::NotApplied => {}
                 }
@@ -416,6 +450,10 @@ pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) 
                             y0_c,
                             pic_w_c,
                             pic_h_c,
+                            no_cross_left,
+                            no_cross_right,
+                            no_cross_top,
+                            no_cross_bottom,
                         ),
                         SaoType::NotApplied => {}
                     }

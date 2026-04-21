@@ -237,6 +237,10 @@ pub struct PictureState {
     /// of the slice the CTB belongs to), indexed by CTB raster address.
     /// `-1` means the CTB has not been decoded yet (not part of any slice).
     pub tab_slice_addr_rs: Vec<i32>,
+    /// Per-CTB `slice_loop_filter_across_slices_enabled_flag`. When false for
+    /// either side of a CTB boundary, deblocking/SAO across that slice boundary
+    /// is suppressed. Indexed by CTB raster address.
+    pub filter_slice_edges: Vec<bool>,
     /// Phase 3c-2 tiles: per-CTB tile id (0-based), indexed by CTB raster
     /// address. For `tiles_enabled_flag = 0` pictures this is all zeros.
     /// Consulted by `compute_luma_avail` to treat cross-tile neighbor
@@ -339,6 +343,12 @@ impl PictureState {
                 let pw = w.div_ceil(ctb_size) as usize;
                 let ph = h.div_ceil(ctb_size) as usize;
                 vec![-1i32; pw * ph]
+            },
+            filter_slice_edges: {
+                let ctb_size = 1u32 << log2_ctb_size;
+                let pw = w.div_ceil(ctb_size) as usize;
+                let ph = h.div_ceil(ctb_size) as usize;
+                vec![true; pw * ph]
             },
             tab_tile_id: {
                 let ctb_size = 1u32 << log2_ctb_size;

@@ -447,6 +447,8 @@ impl Decoder {
             sh.max_num_merge_cand = parent.max_num_merge_cand;
             sh.ref_pic_list_modification = parent.ref_pic_list_modification.clone();
             sh.pred_weight_table = parent.pred_weight_table.clone();
+            sh.slice_loop_filter_across_slices_enabled_flag =
+                parent.slice_loop_filter_across_slices_enabled_flag;
             sh.poc = parent.poc;
         }
 
@@ -828,6 +830,8 @@ impl Decoder {
                 sh.slice_segment_address as i32
             };
             state.tab_slice_addr_rs[ctb_addr_rs as usize] = recorded_slice_addr;
+            state.filter_slice_edges[ctb_addr_rs as usize] =
+                sh.slice_loop_filter_across_slices_enabled_flag;
             crate::sao::decode_sao_param(&mut cabac, &mut contexts, state, sps, &sh, rx, ry);
             more_data = decode_coding_quadtree(
                 &mut cabac,
@@ -1324,6 +1328,7 @@ mod tests {
             max_num_merge_cand: 5,
             ref_pic_list_modification,
             pred_weight_table: crate::slice::PredWeightTable::default(),
+            slice_loop_filter_across_slices_enabled_flag: true,
             nal_unit_type: NalUnitType::TrailR,
             temporal_id: 0,
             poc: 10,
@@ -3180,6 +3185,31 @@ mod tests {
         assert_eq!(
             hash, expected,
             "constrained_intra hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// 256×256, 3 frames with `pps_loop_filter_across_slices_enabled_flag = 0`,
+    /// WPP dependent slices, deblocking + SAO enabled. Exercises the
+    /// slice-boundary deblocking/SAO suppression: edges at slice boundaries
+    /// must NOT be filtered when the flag is 0. Encoded with kvazaar (which
+    /// sets the PPS flag to 0 when using `--slices wpp`).
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=256x256:rate=30:duration=0.2" \
+    ///   -frames:v 3 -pix_fmt yuv420p -f rawvideo /tmp/in.yuv
+    /// kvazaar -i /tmp/in.yuv --input-res 256x256 --input-fps 30 -p 3 \
+    ///   --wpp --slices wpp --qp 26 --deblock 0:0 --sao \
+    ///   --no-open-gop --period 16 --no-bipred \
+    ///   -o no_filter_across_slices_256x256.h265
+    /// ```
+    #[test]
+    fn test_decode_no_filter_across_slices_hash() {
+        let hash = decode_and_hash("no_filter_across_slices_256x256.h265", 3);
+        let expected = "43920743b688ce7532c8e07fc6dd28d14169db351fd26ede858fa9a755aaf902";
+        assert_eq!(
+            hash, expected,
+            "no_filter_across_slices hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
     }
 }
