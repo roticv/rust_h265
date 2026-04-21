@@ -18,6 +18,7 @@
 //! `libavcodec/hevc/dsp_template.c::hevc_loop_filter_*`.
 
 use crate::cu_tree::PictureState;
+use crate::pixel::Pixel;
 use crate::pps::Pps;
 use crate::slice::SliceHeader;
 use crate::sps::Sps;
@@ -43,17 +44,17 @@ static TC_TABLE: [u8; 54] = [
 
 const MAX_QP: i32 = 51;
 
-/// Compute β for the given QP and offset.
-fn beta_lookup(qp: i32, beta_offset: i32) -> i32 {
+/// Compute β for the given QP and offset, scaled for bit depth.
+fn beta_lookup(qp: i32, beta_offset: i32, bit_depth: u8) -> i32 {
     let idx = (qp + beta_offset).clamp(0, MAX_QP) as usize;
-    BETA_TABLE[idx] as i32
+    (BETA_TABLE[idx] as i32) << (bit_depth - 8)
 }
 
-/// Compute tc for the given QP, boundary strength, and offset.
-fn tc_lookup(qp: i32, bs: i32, tc_offset: i32) -> i32 {
+/// Compute tc for the given QP, boundary strength, and offset, scaled for bit depth.
+fn tc_lookup(qp: i32, bs: i32, tc_offset: i32, bit_depth: u8) -> i32 {
     // For intra deblocking the offset is 2*(bS - 1) per spec 8.7.2.5.
     let idx = (qp + 2 * (bs - 1) + tc_offset).clamp(0, 53) as usize;
-    TC_TABLE[idx] as i32
+    (TC_TABLE[idx] as i32) << (bit_depth - 8)
 }
 
 /// Map a luma QP to the chroma QP via spec table 8-9 (chroma_format_idc=1).
@@ -68,13 +69,13 @@ fn chroma_qp_table(qp_i: i32) -> i32 {
     }
 }
 
-/// Compute chroma tc for an intra edge (bS == 2).
-fn chroma_tc(qp_y: i32, qp_offset: i32, tc_offset: i32) -> i32 {
+/// Compute chroma tc for an intra edge (bS == 2), scaled for bit depth.
+fn chroma_tc(qp_y: i32, qp_offset: i32, tc_offset: i32, bit_depth: u8) -> i32 {
     let qp_i = (qp_y + qp_offset).clamp(0, 57);
     let qp = chroma_qp_table(qp_i);
     // Intra deblocking: bS - 1 = 1, so tc table index gets +2.
     let idx = (qp + 2 + tc_offset).clamp(0, 53) as usize;
-    TC_TABLE[idx] as i32
+    (TC_TABLE[idx] as i32) << (bit_depth - 8)
 }
 
 // ---- Inner luma kernels (per "filter unit" of 4 pixels along the edge) ----
@@ -84,25 +85,26 @@ fn chroma_tc(qp_y: i32, qp_offset: i32, tc_offset: i32) -> i32 {
 /// (1 for horizontal edge, plane stride for vertical edge). `ystride` is
 /// the along-edge stride. `tc`, `tc2`, `tc3` are bounded by `tc << 0/1/?`.
 #[allow(clippy::too_many_arguments)]
-fn loop_filter_luma_strong(
-    plane: &mut [u8],
+fn loop_filter_luma_strong<P: Pixel>(
+    plane: &mut [P],
     base: usize,
     xstride: isize,
     ystride: isize,
     tc: i32,
     tc2: i32,
     tc3: i32,
+    bit_depth: u8,
 ) {
     for d in 0..4 {
         let line_off = d * ystride;
-        let p3 = plane[(base as isize + line_off + (-4) * xstride) as usize] as i32;
-        let p2 = plane[(base as isize + line_off + (-3) * xstride) as usize] as i32;
-        let p1 = plane[(base as isize + line_off + (-2) * xstride) as usize] as i32;
-        let p0 = plane[(base as isize + line_off + (-1) * xstride) as usize] as i32;
-        let q0 = plane[(base as isize + line_off + 0 * xstride) as usize] as i32;
-        let q1 = plane[(base as isize + line_off + 1 * xstride) as usize] as i32;
-        let q2 = plane[(base as isize + line_off + 2 * xstride) as usize] as i32;
-        let q3 = plane[(base as isize + line_off + 3 * xstride) as usize] as i32;
+        let p3 = plane[(base as isize + line_off + (-4) * xstride) as usize].to_i32();
+        let p2 = plane[(base as isize + line_off + (-3) * xstride) as usize].to_i32();
+        let p1 = plane[(base as isize + line_off + (-2) * xstride) as usize].to_i32();
+        let p0 = plane[(base as isize + line_off + (-1) * xstride) as usize].to_i32();
+        let q0 = plane[(base as isize + line_off + 0 * xstride) as usize].to_i32();
+        let q1 = plane[(base as isize + line_off + 1 * xstride) as usize].to_i32();
+        let q2 = plane[(base as isize + line_off + 2 * xstride) as usize].to_i32();
+        let q3 = plane[(base as isize + line_off + 3 * xstride) as usize].to_i32();
 
         let new_p0 = p0 + ((((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3) - p0).clamp(-tc3, tc3));
         let new_p1 = p1 + ((((p2 + p1 + p0 + q0 + 2) >> 2) - p1).clamp(-tc2, tc2));
@@ -111,72 +113,67 @@ fn loop_filter_luma_strong(
         let new_q1 = q1 + ((((p0 + q0 + q1 + q2 + 2) >> 2) - q1).clamp(-tc2, tc2));
         let new_q2 = q2 + ((((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3) - q2).clamp(-tc, tc));
 
-        plane[(base as isize + line_off + (-3) * xstride) as usize] = new_p2.clamp(0, 255) as u8;
-        plane[(base as isize + line_off + (-2) * xstride) as usize] = new_p1.clamp(0, 255) as u8;
-        plane[(base as isize + line_off + (-1) * xstride) as usize] = new_p0.clamp(0, 255) as u8;
-        plane[(base as isize + line_off + 0 * xstride) as usize] = new_q0.clamp(0, 255) as u8;
-        plane[(base as isize + line_off + 1 * xstride) as usize] = new_q1.clamp(0, 255) as u8;
-        plane[(base as isize + line_off + 2 * xstride) as usize] = new_q2.clamp(0, 255) as u8;
+        plane[(base as isize + line_off + (-3) * xstride) as usize] = P::from_i32_clamped(new_p2, bit_depth);
+        plane[(base as isize + line_off + (-2) * xstride) as usize] = P::from_i32_clamped(new_p1, bit_depth);
+        plane[(base as isize + line_off + (-1) * xstride) as usize] = P::from_i32_clamped(new_p0, bit_depth);
+        plane[(base as isize + line_off + 0 * xstride) as usize] = P::from_i32_clamped(new_q0, bit_depth);
+        plane[(base as isize + line_off + 1 * xstride) as usize] = P::from_i32_clamped(new_q1, bit_depth);
+        plane[(base as isize + line_off + 2 * xstride) as usize] = P::from_i32_clamped(new_q2, bit_depth);
     }
 }
 
 /// Weak (normal) luma filter.
 #[allow(clippy::too_many_arguments)]
-fn loop_filter_luma_weak(
-    plane: &mut [u8],
+fn loop_filter_luma_weak<P: Pixel>(
+    plane: &mut [P],
     base: usize,
     xstride: isize,
     ystride: isize,
     tc: i32,
     nd_p: i32,
     nd_q: i32,
+    bit_depth: u8,
 ) {
     let tc_2 = tc >> 1;
     for d in 0..4 {
         let line_off = d * ystride;
-        let p2 = plane[(base as isize + line_off + (-3) * xstride) as usize] as i32;
-        let p1 = plane[(base as isize + line_off + (-2) * xstride) as usize] as i32;
-        let p0 = plane[(base as isize + line_off + (-1) * xstride) as usize] as i32;
-        let q0 = plane[(base as isize + line_off + 0 * xstride) as usize] as i32;
-        let q1 = plane[(base as isize + line_off + 1 * xstride) as usize] as i32;
-        let q2 = plane[(base as isize + line_off + 2 * xstride) as usize] as i32;
+        let p2 = plane[(base as isize + line_off + (-3) * xstride) as usize].to_i32();
+        let p1 = plane[(base as isize + line_off + (-2) * xstride) as usize].to_i32();
+        let p0 = plane[(base as isize + line_off + (-1) * xstride) as usize].to_i32();
+        let q0 = plane[(base as isize + line_off + 0 * xstride) as usize].to_i32();
+        let q1 = plane[(base as isize + line_off + 1 * xstride) as usize].to_i32();
+        let q2 = plane[(base as isize + line_off + 2 * xstride) as usize].to_i32();
 
         let mut delta0 = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
         if delta0.abs() < 10 * tc {
             delta0 = delta0.clamp(-tc, tc);
-            let new_p0 = (p0 + delta0).clamp(0, 255);
-            let new_q0 = (q0 - delta0).clamp(0, 255);
-            plane[(base as isize + line_off + (-1) * xstride) as usize] = new_p0 as u8;
-            plane[(base as isize + line_off + 0 * xstride) as usize] = new_q0 as u8;
+            plane[(base as isize + line_off + (-1) * xstride) as usize] = P::from_i32_clamped(p0 + delta0, bit_depth);
+            plane[(base as isize + line_off + 0 * xstride) as usize] = P::from_i32_clamped(q0 - delta0, bit_depth);
             if nd_p > 1 {
                 let dp = (((p2 + p0 + 1) >> 1) - p1 + delta0) >> 1;
                 let dp = dp.clamp(-tc_2, tc_2);
-                let new_p1 = (p1 + dp).clamp(0, 255);
-                plane[(base as isize + line_off + (-2) * xstride) as usize] = new_p1 as u8;
+                plane[(base as isize + line_off + (-2) * xstride) as usize] = P::from_i32_clamped(p1 + dp, bit_depth);
             }
             if nd_q > 1 {
                 let dq = (((q2 + q0 + 1) >> 1) - q1 - delta0) >> 1;
                 let dq = dq.clamp(-tc_2, tc_2);
-                let new_q1 = (q1 + dq).clamp(0, 255);
-                plane[(base as isize + line_off + 1 * xstride) as usize] = new_q1 as u8;
+                plane[(base as isize + line_off + 1 * xstride) as usize] = P::from_i32_clamped(q1 + dq, bit_depth);
             }
         }
     }
 }
 
 /// Chroma weak filter (the only chroma filter HEVC has). 4 lines.
-fn loop_filter_chroma_weak(plane: &mut [u8], base: usize, xstride: isize, ystride: isize, tc: i32) {
+fn loop_filter_chroma_weak<P: Pixel>(plane: &mut [P], base: usize, xstride: isize, ystride: isize, tc: i32, bit_depth: u8) {
     for d in 0..4 {
         let line_off = d * ystride;
-        let p1 = plane[(base as isize + line_off + (-2) * xstride) as usize] as i32;
-        let p0 = plane[(base as isize + line_off + (-1) * xstride) as usize] as i32;
-        let q0 = plane[(base as isize + line_off + 0 * xstride) as usize] as i32;
-        let q1 = plane[(base as isize + line_off + 1 * xstride) as usize] as i32;
+        let p1 = plane[(base as isize + line_off + (-2) * xstride) as usize].to_i32();
+        let p0 = plane[(base as isize + line_off + (-1) * xstride) as usize].to_i32();
+        let q0 = plane[(base as isize + line_off + 0 * xstride) as usize].to_i32();
+        let q1 = plane[(base as isize + line_off + 1 * xstride) as usize].to_i32();
         let delta0 = ((((q0 - p0) * 4) + p1 - q1 + 4) >> 3).clamp(-tc, tc);
-        let new_p0 = (p0 + delta0).clamp(0, 255);
-        let new_q0 = (q0 - delta0).clamp(0, 255);
-        plane[(base as isize + line_off + (-1) * xstride) as usize] = new_p0 as u8;
-        plane[(base as isize + line_off + 0 * xstride) as usize] = new_q0 as u8;
+        plane[(base as isize + line_off + (-1) * xstride) as usize] = P::from_i32_clamped(p0 + delta0, bit_depth);
+        plane[(base as isize + line_off + 0 * xstride) as usize] = P::from_i32_clamped(q0 - delta0, bit_depth);
     }
 }
 
@@ -188,8 +185,8 @@ fn loop_filter_chroma_weak(plane: &mut [u8], base: usize, xstride: isize, ystrid
 /// the sample layout (vertical edge: xstride=1, ystride=plane_stride;
 /// horizontal edge: xstride=plane_stride, ystride=1).
 #[allow(clippy::too_many_arguments)]
-fn filter_luma_edge(
-    plane: &mut [u8],
+fn filter_luma_edge<P: Pixel>(
+    plane: &mut [P],
     pix_base: usize,
     xstride: isize,
     ystride: isize,
@@ -198,16 +195,17 @@ fn filter_luma_edge(
     bs1: i32,
     beta_offset: i32,
     tc_offset: i32,
+    bit_depth: u8,
 ) {
-    let beta = beta_lookup(qp_avg, beta_offset);
+    let beta = beta_lookup(qp_avg, beta_offset, bit_depth);
     let tcs = [
         if bs0 != 0 {
-            tc_lookup(qp_avg, bs0, tc_offset)
+            tc_lookup(qp_avg, bs0, tc_offset, bit_depth)
         } else {
             0
         },
         if bs1 != 0 {
-            tc_lookup(qp_avg, bs1, tc_offset)
+            tc_lookup(qp_avg, bs1, tc_offset, bit_depth)
         } else {
             0
         },
@@ -222,21 +220,21 @@ fn filter_luma_edge(
         let j_base = (pix_base as isize + (j as isize * 4) * ystride) as usize;
 
         // Compute d on lines 0 and 3 of this segment, per spec 8.7.2.5.
-        let d0_p = (plane[(j_base as isize + 0 * ystride + (-3) * xstride) as usize] as i32
-            - 2 * plane[(j_base as isize + 0 * ystride + (-2) * xstride) as usize] as i32
-            + plane[(j_base as isize + 0 * ystride + (-1) * xstride) as usize] as i32)
+        let d0_p = (plane[(j_base as isize + 0 * ystride + (-3) * xstride) as usize].to_i32()
+            - 2 * plane[(j_base as isize + 0 * ystride + (-2) * xstride) as usize].to_i32()
+            + plane[(j_base as isize + 0 * ystride + (-1) * xstride) as usize].to_i32())
             .abs();
-        let d0_q = (plane[(j_base as isize + 0 * ystride + 0 * xstride) as usize] as i32
-            - 2 * plane[(j_base as isize + 0 * ystride + 1 * xstride) as usize] as i32
-            + plane[(j_base as isize + 0 * ystride + 2 * xstride) as usize] as i32)
+        let d0_q = (plane[(j_base as isize + 0 * ystride + 0 * xstride) as usize].to_i32()
+            - 2 * plane[(j_base as isize + 0 * ystride + 1 * xstride) as usize].to_i32()
+            + plane[(j_base as isize + 0 * ystride + 2 * xstride) as usize].to_i32())
             .abs();
-        let d3_p = (plane[(j_base as isize + 3 * ystride + (-3) * xstride) as usize] as i32
-            - 2 * plane[(j_base as isize + 3 * ystride + (-2) * xstride) as usize] as i32
-            + plane[(j_base as isize + 3 * ystride + (-1) * xstride) as usize] as i32)
+        let d3_p = (plane[(j_base as isize + 3 * ystride + (-3) * xstride) as usize].to_i32()
+            - 2 * plane[(j_base as isize + 3 * ystride + (-2) * xstride) as usize].to_i32()
+            + plane[(j_base as isize + 3 * ystride + (-1) * xstride) as usize].to_i32())
             .abs();
-        let d3_q = (plane[(j_base as isize + 3 * ystride + 0 * xstride) as usize] as i32
-            - 2 * plane[(j_base as isize + 3 * ystride + 1 * xstride) as usize] as i32
-            + plane[(j_base as isize + 3 * ystride + 2 * xstride) as usize] as i32)
+        let d3_q = (plane[(j_base as isize + 3 * ystride + 0 * xstride) as usize].to_i32()
+            - 2 * plane[(j_base as isize + 3 * ystride + 1 * xstride) as usize].to_i32()
+            + plane[(j_base as isize + 3 * ystride + 2 * xstride) as usize].to_i32())
             .abs();
         let d0 = d0_p + d0_q;
         let d3 = d3_p + d3_q;
@@ -250,14 +248,14 @@ fn filter_luma_edge(
             let tc25 = (tc * 5 + 1) >> 1;
 
             // Strong filter check.
-            let p3_l0 = plane[(j_base as isize + 0 * ystride + (-4) * xstride) as usize] as i32;
-            let p0_l0 = plane[(j_base as isize + 0 * ystride + (-1) * xstride) as usize] as i32;
-            let q0_l0 = plane[(j_base as isize + 0 * ystride + 0 * xstride) as usize] as i32;
-            let q3_l0 = plane[(j_base as isize + 0 * ystride + 3 * xstride) as usize] as i32;
-            let p3_l3 = plane[(j_base as isize + 3 * ystride + (-4) * xstride) as usize] as i32;
-            let p0_l3 = plane[(j_base as isize + 3 * ystride + (-1) * xstride) as usize] as i32;
-            let q0_l3 = plane[(j_base as isize + 3 * ystride + 0 * xstride) as usize] as i32;
-            let q3_l3 = plane[(j_base as isize + 3 * ystride + 3 * xstride) as usize] as i32;
+            let p3_l0 = plane[(j_base as isize + 0 * ystride + (-4) * xstride) as usize].to_i32();
+            let p0_l0 = plane[(j_base as isize + 0 * ystride + (-1) * xstride) as usize].to_i32();
+            let q0_l0 = plane[(j_base as isize + 0 * ystride + 0 * xstride) as usize].to_i32();
+            let q3_l0 = plane[(j_base as isize + 0 * ystride + 3 * xstride) as usize].to_i32();
+            let p3_l3 = plane[(j_base as isize + 3 * ystride + (-4) * xstride) as usize].to_i32();
+            let p0_l3 = plane[(j_base as isize + 3 * ystride + (-1) * xstride) as usize].to_i32();
+            let q0_l3 = plane[(j_base as isize + 3 * ystride + 0 * xstride) as usize].to_i32();
+            let q3_l3 = plane[(j_base as isize + 3 * ystride + 3 * xstride) as usize].to_i32();
 
             let strong = (p3_l0 - p0_l0).abs() + (q3_l0 - q0_l0).abs() < beta_3
                 && (p0_l0 - q0_l0).abs() < tc25
@@ -268,7 +266,7 @@ fn filter_luma_edge(
 
             if strong {
                 let tc2 = tc << 1;
-                loop_filter_luma_strong(plane, j_base, xstride, ystride, tc2, tc2, tc2);
+                loop_filter_luma_strong(plane, j_base, xstride, ystride, tc2, tc2, tc2, bit_depth);
             } else {
                 let nd_p = if dp_total < ((beta + (beta >> 1)) >> 3) {
                     2
@@ -280,7 +278,7 @@ fn filter_luma_edge(
                 } else {
                     1
                 };
-                loop_filter_luma_weak(plane, j_base, xstride, ystride, tc, nd_p, nd_q);
+                loop_filter_luma_weak(plane, j_base, xstride, ystride, tc, nd_p, nd_q, bit_depth);
             }
         }
     }
@@ -289,8 +287,8 @@ fn filter_luma_edge(
 /// Filter one 8-pixel chroma edge (in chroma samples). `bs0` and `bs1`
 /// must both be 2 (otherwise this function isn't called).
 #[allow(clippy::too_many_arguments)]
-fn filter_chroma_edge(
-    plane: &mut [u8],
+fn filter_chroma_edge<P: Pixel>(
+    plane: &mut [P],
     pix_base: usize,
     xstride: isize,
     ystride: isize,
@@ -300,15 +298,16 @@ fn filter_chroma_edge(
     tc_offset: i32,
     bs0: i32,
     bs1: i32,
+    bit_depth: u8,
 ) {
     let tcs = [
         if bs0 == 2 {
-            chroma_tc(qp0_avg, qp_offset, tc_offset)
+            chroma_tc(qp0_avg, qp_offset, tc_offset, bit_depth)
         } else {
             0
         },
         if bs1 == 2 {
-            chroma_tc(qp1_avg, qp_offset, tc_offset)
+            chroma_tc(qp1_avg, qp_offset, tc_offset, bit_depth)
         } else {
             0
         },
@@ -318,7 +317,7 @@ fn filter_chroma_edge(
             continue;
         }
         let j_base = (pix_base as isize + (j as isize * 4) * ystride) as usize;
-        loop_filter_chroma_weak(plane, j_base, xstride, ystride, tcs[j]);
+        loop_filter_chroma_weak(plane, j_base, xstride, ystride, tcs[j], bit_depth);
     }
 }
 
@@ -390,6 +389,8 @@ pub fn deblock_picture(state: &mut PictureState, sps: &Sps, pps: &Pps, sh: &Slic
     let stride_uv = state.uv_stride;
     let beta_offset = (sh.slice_beta_offset_div2 + pps.pps_beta_offset_div2) * 2;
     let tc_offset = (sh.slice_tc_offset_div2 + pps.pps_tc_offset_div2) * 2;
+    let bit_depth_luma = sps.bit_depth_luma;
+    let bit_depth_chroma = sps.bit_depth_chroma;
 
     // ---- Luma vertical edges ----
     let mut y = 0usize;
@@ -408,7 +409,7 @@ pub fn deblock_picture(state: &mut PictureState, sps: &Sps, pps: &Pps, sh: &Slic
                     + 1)
                     >> 1;
                 let pix_base = y * stride_y + x;
-                filter_luma_edge(
+                filter_luma_edge::<u8>(
                     &mut state.y_plane,
                     pix_base,
                     1,
@@ -418,6 +419,7 @@ pub fn deblock_picture(state: &mut PictureState, sps: &Sps, pps: &Pps, sh: &Slic
                     bs1,
                     beta_offset,
                     tc_offset,
+                    bit_depth_luma,
                 );
             }
             x += 8;
@@ -442,7 +444,7 @@ pub fn deblock_picture(state: &mut PictureState, sps: &Sps, pps: &Pps, sh: &Slic
                     + 1)
                     >> 1;
                 let pix_base = y * stride_y + x;
-                filter_luma_edge(
+                filter_luma_edge::<u8>(
                     &mut state.y_plane,
                     pix_base,
                     stride_y as isize,
@@ -452,6 +454,7 @@ pub fn deblock_picture(state: &mut PictureState, sps: &Sps, pps: &Pps, sh: &Slic
                     bs1,
                     beta_offset,
                     tc_offset,
+                    bit_depth_luma,
                 );
             }
             x += 8;
@@ -561,9 +564,9 @@ pub fn deblock_picture(state: &mut PictureState, sps: &Sps, pps: &Pps, sh: &Slic
                 &mut state.v_plane
             };
             for e in &edges {
-                filter_chroma_edge(
+                filter_chroma_edge::<u8>(
                     plane, e.pix_base, e.xstride, e.ystride, e.qp0_avg, e.qp1_avg, qp_offset,
-                    tc_offset, e.bs0, e.bs1,
+                    tc_offset, e.bs0, e.bs1, bit_depth_chroma,
                 );
             }
         }
