@@ -20,6 +20,7 @@
 use crate::cabac::{CabacContexts, CabacReader};
 use crate::cabac_tables::ctx;
 use crate::cu_tree::PictureState;
+use crate::pixel::Pixel;
 use crate::slice::SliceHeader;
 use crate::sps::Sps;
 
@@ -210,9 +211,9 @@ pub fn decode_sao_param(
 /// band is in the 4 active bands starting at `sao_left_class`, the
 /// corresponding offset is added.
 #[allow(clippy::too_many_arguments)]
-fn sao_band_filter(
-    dst: &mut [u8],
-    src: &[u8],
+fn sao_band_filter<P: Pixel>(
+    dst: &mut [P],
+    src: &[P],
     stride_dst: usize,
     stride_src: usize,
     offset_val: &[i16; 5],
@@ -221,19 +222,20 @@ fn sao_band_filter(
     height: usize,
     x0: usize,
     y0: usize,
+    bit_depth: u8,
 ) {
     // Build a 32-entry offset table — only the 4 active bands have offsets.
     let mut offset_table = [0i16; 32];
     for k in 0..4 {
         offset_table[(k + sao_left_class as usize) & 31] = offset_val[k + 1];
     }
-    let shift = 8 - 5; // BIT_DEPTH (8) - 5 = 3
+    let shift = bit_depth - 5;
     for y in 0..height {
         for x in 0..width {
-            let sample = src[(y0 + y) * stride_src + (x0 + x)] as i32;
+            let sample = src[(y0 + y) * stride_src + (x0 + x)].to_i32();
             let band = (sample >> shift) & 31;
-            let new_val = (sample + offset_table[band as usize] as i32).clamp(0, 255);
-            dst[(y0 + y) * stride_dst + (x0 + x)] = new_val as u8;
+            let new_val = sample + offset_table[band as usize] as i32;
+            dst[(y0 + y) * stride_dst + (x0 + x)] = P::from_i32_clamped(new_val, bit_depth);
         }
     }
 }
@@ -250,9 +252,9 @@ fn cmp(a: i32, b: i32) -> i32 {
 /// the EO direction are skipped.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::needless_range_loop)]
-fn sao_edge_filter(
-    dst: &mut [u8],
-    src: &[u8],
+fn sao_edge_filter<P: Pixel>(
+    dst: &mut [P],
+    src: &[P],
     stride_dst: usize,
     stride_src: usize,
     offset_val: &[i16; 5],
@@ -267,6 +269,7 @@ fn sao_edge_filter(
     no_cross_right: bool,
     no_cross_top: bool,
     no_cross_bottom: bool,
+    bit_depth: u8,
 ) {
     // edge_idx maps (1 + cmp(a) + cmp(b)) → category.
     // FFmpeg uses { 1, 2, 0, 3, 4 } indexed by [2 + diff0 + diff1].
@@ -316,18 +319,18 @@ fn sao_edge_filter(
         for x in init_x..end_x {
             let cur_x = x0 + x;
             let cur_y = y0 + y;
-            let cur = src[cur_y * stride_src + cur_x] as i32;
+            let cur = src[cur_y * stride_src + cur_x].to_i32();
             let a_x = (cur_x as i32 + a_dx) as usize;
             let a_y = (cur_y as i32 + a_dy) as usize;
             let b_x = (cur_x as i32 + b_dx) as usize;
             let b_y = (cur_y as i32 + b_dy) as usize;
-            let a = src[a_y * stride_src + a_x] as i32;
-            let b = src[b_y * stride_src + b_x] as i32;
+            let a = src[a_y * stride_src + a_x].to_i32();
+            let b = src[b_y * stride_src + b_x].to_i32();
             let diff0 = cmp(cur, a);
             let diff1 = cmp(cur, b);
             let cat = EDGE_IDX[(2 + diff0 + diff1) as usize];
-            let new_val = (cur + offset_val[cat] as i32).clamp(0, 255);
-            dst[cur_y * stride_dst + cur_x] = new_val as u8;
+            let new_val = cur + offset_val[cat] as i32;
+            dst[cur_y * stride_dst + cur_x] = P::from_i32_clamped(new_val, bit_depth);
         }
     }
 }
@@ -383,8 +386,9 @@ pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) 
                 let y0 = ry * ctb_size;
                 let w = (x0 + ctb_size).min(pic_w) - x0;
                 let h = (y0 + ctb_size).min(pic_h) - y0;
+                let bit_depth_y = sps.bit_depth_luma;
                 match sao.type_idx[0] {
-                    SaoType::Band => sao_band_filter(
+                    SaoType::Band => sao_band_filter::<u8>(
                         &mut state.y_plane,
                         &y_src,
                         state.y_stride,
@@ -395,8 +399,9 @@ pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) 
                         h,
                         x0,
                         y0,
+                        bit_depth_y,
                     ),
-                    SaoType::Edge => sao_edge_filter(
+                    SaoType::Edge => sao_edge_filter::<u8>(
                         &mut state.y_plane,
                         &y_src,
                         state.y_stride,
@@ -413,6 +418,7 @@ pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) 
                         no_cross_right,
                         no_cross_top,
                         no_cross_bottom,
+                        bit_depth_y,
                     ),
                     SaoType::NotApplied => {}
                 }
@@ -433,8 +439,9 @@ pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) 
                     } else {
                         (&mut state.v_plane, &v_src)
                     };
+                    let bit_depth_c = sps.bit_depth_chroma;
                     match sao.type_idx[c_idx] {
-                        SaoType::Band => sao_band_filter(
+                        SaoType::Band => sao_band_filter::<u8>(
                             dst_plane,
                             src_plane,
                             state.uv_stride,
@@ -445,8 +452,9 @@ pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) 
                             h_c,
                             x0_c,
                             y0_c,
+                            bit_depth_c,
                         ),
-                        SaoType::Edge => sao_edge_filter(
+                        SaoType::Edge => sao_edge_filter::<u8>(
                             dst_plane,
                             src_plane,
                             state.uv_stride,
@@ -463,6 +471,7 @@ pub fn apply_sao_picture(state: &mut PictureState, sps: &Sps, sh: &SliceHeader) 
                             no_cross_right,
                             no_cross_top,
                             no_cross_bottom,
+                            bit_depth_c,
                         ),
                         SaoType::NotApplied => {}
                     }
