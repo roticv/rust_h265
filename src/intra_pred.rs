@@ -13,6 +13,8 @@
 //! indices 1..=size cover the immediate neighbors. The "extended" right and
 //! bottom samples occupy indices size+1..=2*size.
 
+use crate::pixel::Pixel;
+
 /// Default reference sample value when nothing is available
 /// (`1 << (BitDepth - 1)` per HEVC spec 8.4.4.2.2).
 pub fn default_ref_sample(bit_depth: u8) -> u8 {
@@ -42,8 +44,8 @@ pub struct ReferenceAvailability {
 /// (per spec 8.4.4.2.2). For each unavailable group, the substitution rule
 /// fills it from the nearest available sample.
 #[allow(clippy::too_many_arguments)]
-pub fn build_reference_samples(
-    plane: &[u8],
+pub fn build_reference_samples<P: Pixel>(
+    plane: &[P],
     stride: usize,
     pic_w: usize,
     pic_h: usize,
@@ -52,11 +54,11 @@ pub fn build_reference_samples(
     log2_size: u8,
     bit_depth: u8,
     avail: ReferenceAvailability,
-) -> (Vec<u8>, Vec<u8>) {
+) -> (Vec<P>, Vec<P>) {
     let size = 1usize << log2_size;
     let len = 2 * size + 1;
-    let mut top = vec![0u8; len];
-    let mut left = vec![0u8; len];
+    let mut top = vec![P::zero(); len];
+    let mut left = vec![P::zero(); len];
 
     // Track per-sample availability so we can substitute the unavailable
     // ones afterwards. `top_avail[i]` covers `top[i]` (i = 0 is the corner).
@@ -113,7 +115,7 @@ pub fn build_reference_samples(
     let any_top_avail = top_avail.iter().any(|&a| a);
     let any_left_avail = left_avail.iter().any(|&a| a);
     if !any_top_avail && !any_left_avail {
-        let fill = default_ref_sample(bit_depth);
+        let fill = P::from_i32_clamped(crate::pixel::default_ref_sample(bit_depth), bit_depth);
         for v in top.iter_mut() {
             *v = fill;
         }
@@ -134,7 +136,7 @@ pub fn build_reference_samples(
     //   [2*size]          = corner
     //   [2*size+1..4*size+1] = top[1..2*size+1]
     let total = 4 * size + 1;
-    let mut ref_array = vec![0u8; total];
+    let mut ref_array = vec![P::zero(); total];
     let mut ref_avail = vec![false; total];
     // left, reversed: index 0 = left[2*size], index 2*size-1 = left[1]
     for i in 0..2 * size {
@@ -189,41 +191,27 @@ pub fn build_reference_samples(
 ///
 /// `dst` is the destination buffer of `size * size` samples in row-major
 /// order with row stride `dst_stride`.
-pub fn predict_planar(dst: &mut [u8], dst_stride: usize, top: &[u8], left: &[u8], log2_size: u8) {
+pub fn predict_planar<P: Pixel>(
+    dst: &mut [P],
+    dst_stride: usize,
+    top: &[P],
+    left: &[P],
+    log2_size: u8,
+    bit_depth: u8,
+) {
     let size = 1usize << log2_size;
-    // Spec eq 8-26:
-    //   predSamples[x][y] = ((nT - 1 - x) * p[-1][y] + (x+1) * p[nT][-1]
-    //                      + (nT - 1 - y) * p[x][-1] + (y+1) * p[-1][nT] + nT)
-    //                      >> (Log2(nT) + 1)
-    //
-    // The reference layout offsets indices by 1 (corner at index 0), so:
-    //   p[-1][y]    = left[y + 1]
-    //   p[x][-1]    = top[x + 1]
-    //   p[nT][-1]   = top[nT + 1] is INCORRECT; FFmpeg uses top[size]
-    // Hmm — looking again at FFmpeg's pred_planar:
-    //   top[0..size-1] = p[0..size-1][-1]
-    //   top[size]     = p[size-1+1][-1] = p[nT][-1] ← FFmpeg uses index `size`
-    //   left[0..size-1] = p[-1][0..size-1]
-    //   left[size]    = p[-1][nT]
-    // FFmpeg's `top` and `left` pointers are indexed starting from 0 (not -1).
-    // We adopt the same convention here, but the underlying buffer has the
-    // corner at byte offset 0, so the "FFmpeg `top` pointer" lives at
-    // `&buffer[1..]`. For clarity we expose helpers that index that way.
-    //
-    // To match FFmpeg's pred_planar exactly, we treat the slices `top_p` and
-    // `left_p` as starting at index 0 = first non-corner sample.
-    let top_p = &top[1..]; // top_p[i] = p[i][-1] for i=0..2*size-1
-    let left_p = &left[1..]; // left_p[i] = p[-1][i]
+    let top_p = &top[1..];
+    let left_p = &left[1..];
 
     let shift = log2_size as u32 + 1;
     for y in 0..size {
         for x in 0..size {
-            let pred = (size - 1 - x) as i32 * left_p[y] as i32
-                + (x + 1) as i32 * top_p[size] as i32
-                + (size - 1 - y) as i32 * top_p[x] as i32
-                + (y + 1) as i32 * left_p[size] as i32
+            let pred = (size - 1 - x) as i32 * left_p[y].to_i32()
+                + (x + 1) as i32 * top_p[size].to_i32()
+                + (size - 1 - y) as i32 * top_p[x].to_i32()
+                + (y + 1) as i32 * left_p[size].to_i32()
                 + size as i32;
-            dst[y * dst_stride + x] = (pred >> shift) as u8;
+            dst[y * dst_stride + x] = P::from_i32_clamped(pred >> shift, bit_depth);
         }
     }
 }
@@ -233,22 +221,24 @@ pub fn predict_planar(dst: &mut [u8], dst_stride: usize, top: &[u8], left: &[u8]
 /// `apply_luma_filter` is true for luma TUs with `size < 32`, in which case
 /// the top row, left column, and top-left corner get a simple smoothing
 /// filter applied (spec eq. 8-23).
-pub fn predict_dc(
-    dst: &mut [u8],
+pub fn predict_dc<P: Pixel>(
+    dst: &mut [P],
     dst_stride: usize,
-    top: &[u8],
-    left: &[u8],
+    top: &[P],
+    left: &[P],
     log2_size: u8,
     apply_luma_filter: bool,
+    bit_depth: u8,
 ) {
     let size = 1usize << log2_size;
     let top_p = &top[1..];
     let left_p = &left[1..];
     let mut dc_sum: i32 = size as i32;
     for i in 0..size {
-        dc_sum += left_p[i] as i32 + top_p[i] as i32;
+        dc_sum += left_p[i].to_i32() + top_p[i].to_i32();
     }
-    let dc = (dc_sum >> (log2_size as u32 + 1)) as u8;
+    let dc_val = dc_sum >> (log2_size as u32 + 1);
+    let dc = P::from_i32_clamped(dc_val, bit_depth);
 
     for y in 0..size {
         for x in 0..size {
@@ -258,14 +248,23 @@ pub fn predict_dc(
 
     if apply_luma_filter && size < 32 {
         // Top-left corner: (left[0] + 2*dc + top[0] + 2) >> 2
-        dst[0] = (((left_p[0] as i32) + 2 * (dc as i32) + (top_p[0] as i32) + 2) >> 2) as u8;
+        dst[0] = P::from_i32_clamped(
+            ((left_p[0].to_i32()) + 2 * dc_val + (top_p[0].to_i32()) + 2) >> 2,
+            bit_depth,
+        );
         // Top row x = 1..size: (top[x] + 3*dc + 2) >> 2
         for x in 1..size {
-            dst[x] = (((top_p[x] as i32) + 3 * (dc as i32) + 2) >> 2) as u8;
+            dst[x] = P::from_i32_clamped(
+                ((top_p[x].to_i32()) + 3 * dc_val + 2) >> 2,
+                bit_depth,
+            );
         }
         // Left column y = 1..size: (left[y] + 3*dc + 2) >> 2
         for y in 1..size {
-            dst[y * dst_stride] = (((left_p[y] as i32) + 3 * (dc as i32) + 2) >> 2) as u8;
+            dst[y * dst_stride] = P::from_i32_clamped(
+                ((left_p[y].to_i32()) + 3 * dc_val + 2) >> 2,
+                bit_depth,
+            );
         }
     }
 }
@@ -278,14 +277,15 @@ pub fn predict_dc(
 ///
 /// `c_idx` is 0 for luma (needed for the boundary smoothing of pure
 /// horizontal/vertical modes).
-pub fn predict_angular(
-    dst: &mut [u8],
+pub fn predict_angular<P: Pixel>(
+    dst: &mut [P],
     dst_stride: usize,
-    top: &[u8],
-    left: &[u8],
+    top: &[P],
+    left: &[P],
     log2_size: u8,
     mode: u8,
     c_idx: u8,
+    bit_depth: u8,
 ) {
     debug_assert!((2..=34).contains(&mode));
 
@@ -306,30 +306,21 @@ pub fn predict_angular(
     let angle = INTRA_PRED_ANGLE[(mode - 2) as usize];
     let last = ((size as i32) * angle) >> 5;
 
-    // FFmpeg's `top` pointer starts at p[0..], i.e. one past the corner.
-    // Our arrays have index 0 = corner, so top_p / left_p skip index 0.
-    let top_p = &top[1..]; // top_p[i] = p[i][-1], top_p[-1] conceptually = top[0] = corner
-    let left_p = &left[1..]; // left_p[i] = p[-1][i]
-    let corner = top[0]; // p[-1][-1]
+    let top_p = &top[1..];
+    let left_p = &left[1..];
+    let corner = top[0];
 
     if mode >= 18 {
         // ---- Horizontal-like: iterate y (rows), index into top ref ----
-        // Build ref array. In FFmpeg: ref = top - 1, so ref[0] = corner,
-        // ref[1] = top[0], ..., ref[size] = top[size-1].
-        // For negative angles, left samples are projected into negative indices.
-        // For positive angles, max access = ref[size-1 + last + 2], so we
-        // need ref[0..=2*size] (i.e., corner + 2*size top samples).
-        let mut ref_buf = vec![0u8; 3 * size + 4];
-        let ref_origin = size; // ref_buf[ref_origin] corresponds to ref[0]
+        let mut ref_buf = vec![P::zero(); 3 * size + 4];
+        let ref_origin = size;
 
-        // Copy: ref[0] = corner, ref[1..=2*size] = top[0..2*size-1]
         ref_buf[ref_origin] = corner;
         for i in 0..2 * size {
             ref_buf[ref_origin + 1 + i] = top_p[i];
         }
 
         if angle < 0 && last < -1 {
-            // Project left samples into negative ref positions.
             for x in last..=-1 {
                 let left_idx = -1 + ((x * INV_ANGLE[(mode - 11) as usize] + 128) >> 8);
                 ref_buf[(ref_origin as i32 + x) as usize] = left_p[left_idx as usize];
@@ -342,9 +333,13 @@ pub fn predict_angular(
             if fact != 0 {
                 for x in 0..size {
                     let ri = (ref_origin as i32 + x as i32 + idx + 1) as usize;
-                    dst[y * dst_stride + x] =
-                        (((32 - fact) * ref_buf[ri] as i32 + fact * ref_buf[ri + 1] as i32 + 16)
-                            >> 5) as u8;
+                    dst[y * dst_stride + x] = P::from_i32_clamped(
+                        ((32 - fact) * ref_buf[ri].to_i32()
+                            + fact * ref_buf[ri + 1].to_i32()
+                            + 16)
+                            >> 5,
+                        bit_depth,
+                    );
                 }
             } else {
                 for x in 0..size {
@@ -357,17 +352,16 @@ pub fn predict_angular(
         // Mode 26 (pure vertical) luma boundary filter.
         if mode == 26 && c_idx == 0 && size < 32 {
             for y in 0..size {
-                let val = top_p[0] as i32 + ((left_p[y] as i32 - corner as i32) >> 1);
-                dst[y * dst_stride] = val.clamp(0, 255) as u8;
+                let val =
+                    top_p[0].to_i32() + ((left_p[y].to_i32() - corner.to_i32()) >> 1);
+                dst[y * dst_stride] = P::from_i32_clamped(val, bit_depth);
             }
         }
     } else {
         // ---- Vertical-like (modes 2..17): iterate x (cols), index into left ref ----
-        // Same sizing as above: need ref[0..=2*size] elements.
-        let mut ref_buf = vec![0u8; 3 * size + 4];
+        let mut ref_buf = vec![P::zero(); 3 * size + 4];
         let ref_origin = size;
 
-        // ref[0] = corner, ref[1..=2*size] = left[0..2*size-1]
         ref_buf[ref_origin] = corner;
         for i in 0..2 * size {
             ref_buf[ref_origin + 1 + i] = left_p[i];
@@ -386,9 +380,13 @@ pub fn predict_angular(
             if fact != 0 {
                 for y in 0..size {
                     let ri = (ref_origin as i32 + y as i32 + idx + 1) as usize;
-                    dst[y * dst_stride + x] =
-                        (((32 - fact) * ref_buf[ri] as i32 + fact * ref_buf[ri + 1] as i32 + 16)
-                            >> 5) as u8;
+                    dst[y * dst_stride + x] = P::from_i32_clamped(
+                        ((32 - fact) * ref_buf[ri].to_i32()
+                            + fact * ref_buf[ri + 1].to_i32()
+                            + 16)
+                            >> 5,
+                        bit_depth,
+                    );
                 }
             } else {
                 for y in 0..size {
@@ -401,8 +399,9 @@ pub fn predict_angular(
         // Mode 10 (pure horizontal) luma boundary filter.
         if mode == 10 && c_idx == 0 && size < 32 {
             for x in 0..size {
-                let val = left_p[0] as i32 + ((top_p[x] as i32 - corner as i32) >> 1);
-                dst[x] = val.clamp(0, 255) as u8;
+                let val =
+                    left_p[0].to_i32() + ((top_p[x].to_i32() - corner.to_i32()) >> 1);
+                dst[x] = P::from_i32_clamped(val, bit_depth);
             }
         }
     }
@@ -422,14 +421,15 @@ pub fn predict_angular(
 /// Note: intra_smoothing_disabled is always false for our supported streams
 /// (it's not even exposed in the SPS we parse).
 #[allow(clippy::too_many_arguments)]
-pub fn filter_reference_samples(
-    top: &mut Vec<u8>,
-    left: &mut Vec<u8>,
+pub fn filter_reference_samples<P: Pixel>(
+    top: &mut Vec<P>,
+    left: &mut Vec<P>,
     log2_size: u8,
     mode: u8,
     strong_intra_smoothing_enabled: bool,
     c_idx: u8,
     chroma_format_idc: u32,
+    bit_depth: u8,
 ) {
     let size = 1usize << log2_size;
 
@@ -454,73 +454,72 @@ pub fn filter_reference_samples(
         return;
     }
 
-    // Index convention: top[0] = left[0] = corner (p[-1][-1]).
-    // top[1..=2*size] = p[0..2*size-1][-1]
-    // left[1..=2*size] = p[-1][0..2*size-1]
-    //
-    // FFmpeg's pointers are offset by 1, so FFmpeg's top[-1] = our top[0],
-    // FFmpeg's top[i] = our top[i+1], etc.
-
     // Strong intra smoothing for 32x32 luma.
     if strong_intra_smoothing_enabled && c_idx == 0 && log2_size == 5 {
-        // threshold = 1 << (BitDepth - 5) = 1 << 3 = 8 for 8-bit
-        let threshold = 1i32 << 3; // 8-bit only for now
-        let top_smooth =
-            (top[0] as i32 + top[2 * size] as i32 - 2 * top[size] as i32).abs() < threshold;
-        let left_smooth =
-            (left[0] as i32 + left[2 * size] as i32 - 2 * left[size] as i32).abs() < threshold;
+        // threshold = 1 << (BitDepth - 5)
+        let threshold = 1i32 << (bit_depth as i32 - 5);
+        let top_smooth = (top[0].to_i32() + top[2 * size].to_i32()
+            - 2 * top[size].to_i32())
+        .abs()
+            < threshold;
+        let left_smooth = (left[0].to_i32() + left[2 * size].to_i32()
+            - 2 * left[size].to_i32())
+        .abs()
+            < threshold;
         if top_smooth && left_smooth {
             // Strong smoothing: linear interpolation between corner and edge.
-            let mut filtered_top = vec![0u8; 2 * size + 1];
+            let mut filtered_top = vec![P::zero(); 2 * size + 1];
             filtered_top[0] = top[0]; // corner
             filtered_top[2 * size] = top[2 * size]; // far end
             for i in 0..(2 * size - 1) {
-                // FFmpeg: filtered_top[i] = ((64 - (i+1)) * top[-1] + (i+1) * top[63] + 32) >> 6
-                // Our top[-1] = top[0], top[63] = top[2*size] = top[64]
-                filtered_top[i + 1] = (((64 - (i + 1) as i32) * top[0] as i32
-                    + (i + 1) as i32 * top[2 * size] as i32
-                    + 32)
-                    >> 6) as u8;
+                filtered_top[i + 1] = P::from_i32_clamped(
+                    ((64 - (i + 1) as i32) * top[0].to_i32()
+                        + (i + 1) as i32 * top[2 * size].to_i32()
+                        + 32)
+                        >> 6,
+                    bit_depth,
+                );
             }
-            // Left: done in place (FFmpeg writes to left[] directly for strong smoothing).
             let left_corner = left[0];
             let left_end = left[2 * size];
             for i in 0..(2 * size - 1) {
-                left[i + 1] = (((64 - (i + 1) as i32) * left_corner as i32
-                    + (i + 1) as i32 * left_end as i32
-                    + 32)
-                    >> 6) as u8;
+                left[i + 1] = P::from_i32_clamped(
+                    ((64 - (i + 1) as i32) * left_corner.to_i32()
+                        + (i + 1) as i32 * left_end.to_i32()
+                        + 32)
+                        >> 6,
+                    bit_depth,
+                );
             }
-            // Replace top with filtered version.
             *top = filtered_top;
             return;
         }
     }
 
     // Normal [1,2,1]/4 smoothing.
-    let mut filtered_top = vec![0u8; 2 * size + 1];
-    let mut filtered_left = vec![0u8; 2 * size + 1];
+    let mut filtered_top = vec![P::zero(); 2 * size + 1];
+    let mut filtered_left = vec![P::zero(); 2 * size + 1];
 
     // Last element stays unchanged.
     filtered_top[2 * size] = top[2 * size];
     filtered_left[2 * size] = left[2 * size];
 
-    // Interior samples (FFmpeg iterates from 2*size-2 down to 0).
-    // filtered_top[i] = (top[i+1] + 2*top[i] + top[i-1] + 2) >> 2
-    // But our indexing is shifted: FFmpeg's top[i] = our top[i+1].
-    // So for our arrays, we filter indices 1..=(2*size-1):
-    //   filtered_top[k] = (top[k+1] + 2*top[k] + top[k-1] + 2) >> 2  for k = 1..2*size-1
     for k in (1..2 * size).rev() {
-        filtered_top[k] =
-            ((top[k + 1] as i32 + 2 * top[k] as i32 + top[k - 1] as i32 + 2) >> 2) as u8;
-        filtered_left[k] =
-            ((left[k + 1] as i32 + 2 * left[k] as i32 + left[k - 1] as i32 + 2) >> 2) as u8;
+        filtered_top[k] = P::from_i32_clamped(
+            (top[k + 1].to_i32() + 2 * top[k].to_i32() + top[k - 1].to_i32() + 2) >> 2,
+            bit_depth,
+        );
+        filtered_left[k] = P::from_i32_clamped(
+            (left[k + 1].to_i32() + 2 * left[k].to_i32() + left[k - 1].to_i32() + 2) >> 2,
+            bit_depth,
+        );
     }
 
     // Corner: (left[1] + 2*corner + top[1] + 2) >> 2
-    // In our layout: left[0] is corner, left[1] is first left neighbor,
-    // top[1] is first top neighbor.
-    let new_corner = ((left[1] as i32 + 2 * left[0] as i32 + top[1] as i32 + 2) >> 2) as u8;
+    let new_corner = P::from_i32_clamped(
+        (left[1].to_i32() + 2 * left[0].to_i32() + top[1].to_i32() + 2) >> 2,
+        bit_depth,
+    );
     filtered_top[0] = new_corner;
     filtered_left[0] = new_corner;
 
@@ -528,16 +527,22 @@ pub fn filter_reference_samples(
     *left = filtered_left;
 }
 
-/// Add a residual block to a prediction in place, clipping to `[0, 255]`.
-/// `residual` and `dst` are the same shape (`size * size`); `dst_stride` is
-/// the row stride of `dst`. Used by callers to combine the intra prediction
-/// with the inverse-transformed residual.
-pub fn add_residual(dst: &mut [u8], dst_stride: usize, residual: &[i16], log2_size: u8) {
+/// Add a residual block to a prediction in place, clipping to the valid
+/// pixel range. `residual` and `dst` are the same shape (`size * size`);
+/// `dst_stride` is the row stride of `dst`. Used by callers to combine the
+/// intra prediction with the inverse-transformed residual.
+pub fn add_residual<P: Pixel>(
+    dst: &mut [P],
+    dst_stride: usize,
+    residual: &[i16],
+    log2_size: u8,
+    bit_depth: u8,
+) {
     let size = 1usize << log2_size;
     for y in 0..size {
         for x in 0..size {
-            let pixel = dst[y * dst_stride + x] as i32 + residual[y * size + x] as i32;
-            dst[y * dst_stride + x] = pixel.clamp(0, 255) as u8;
+            let pixel = dst[y * dst_stride + x].to_i32() + residual[y * size + x] as i32;
+            dst[y * dst_stride + x] = P::from_i32_clamped(pixel, bit_depth);
         }
     }
 }
@@ -601,7 +606,7 @@ mod tests {
         let top = vec![128u8; 33];
         let left = vec![128u8; 33];
         let mut dst = vec![0u8; 256];
-        predict_planar(&mut dst, 16, &top, &left, 4);
+        predict_planar(&mut dst, 16, &top, &left, 4, 8);
         assert!(dst.iter().all(|&p| p == 128), "first row: {:?}", &dst[..16]);
     }
 
@@ -612,7 +617,7 @@ mod tests {
         let top = vec![128u8; 33];
         let left = vec![128u8; 33];
         let mut dst = vec![0u8; 256];
-        predict_dc(&mut dst, 16, &top, &left, 4, true);
+        predict_dc(&mut dst, 16, &top, &left, 4, true, 8);
         assert!(dst.iter().all(|&p| p == 128));
     }
 
@@ -624,7 +629,7 @@ mod tests {
         residual[0] = 10;
         residual[1] = -200;
         residual[2] = 200;
-        add_residual(&mut dst, 4, &residual, 2);
+        add_residual(&mut dst, 4, &residual, 2, 8);
         assert_eq!(dst[0], 138);
         assert_eq!(dst[1], 0); // clamped from -72
         assert_eq!(dst[2], 255); // clamped from 328
@@ -640,9 +645,9 @@ mod tests {
         let avail = ReferenceAvailability::default();
         let (top, left) = build_reference_samples(&plane, 0, 0, 0, 0, 0, 4, 8, avail);
         let mut block = vec![0u8; 256];
-        predict_planar(&mut block, 16, &top, &left, 4);
+        predict_planar(&mut block, 16, &top, &left, 4, 8);
         let residual = vec![-2i16; 256];
-        add_residual(&mut block, 16, &residual, 4);
+        add_residual(&mut block, 16, &residual, 4, 8);
         assert!(
             block.iter().all(|&p| p == 0x7E),
             "expected all 0x7E (= 126), got first row: {:?}",
@@ -658,7 +663,7 @@ mod tests {
         let avail = ReferenceAvailability::default();
         let (top, left) = build_reference_samples(&plane, 0, 0, 0, 0, 0, 3, 8, avail);
         let mut block = vec![0u8; 64];
-        predict_planar(&mut block, 8, &top, &left, 3);
+        predict_planar(&mut block, 8, &top, &left, 3, 8);
         // No chroma residual in our fixture (cbf_cb = cbf_cr = 0).
         assert!(
             block.iter().all(|&p| p == 0x80),

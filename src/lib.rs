@@ -51,6 +51,8 @@ mod intra_pred;
 #[allow(dead_code)]
 mod inverse_transform;
 #[allow(dead_code)]
+pub(crate) mod pixel;
+#[allow(dead_code)]
 mod pps;
 #[allow(dead_code)]
 mod profile_tier_level;
@@ -80,6 +82,7 @@ pub mod nal;
 pub use decoder::{Decoder, Frame};
 pub use error::DecodeError;
 pub use nal::{parse_annex_b, NalUnit, NalUnitType};
+pub use pixel::Pixel;
 
 #[cfg(test)]
 mod parameter_set_tests {

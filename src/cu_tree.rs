@@ -3508,7 +3508,7 @@ fn decode_chroma_residuals(
         };
         let dst_offset = y_c * dst_stride + x_c;
         let dst = &mut dst_plane[dst_offset..dst_offset + (size_c - 1) * dst_stride + size_c];
-        add_residual(dst, dst_stride, &residual, log2_trafo_size_c);
+        add_residual(dst, dst_stride, &residual, log2_trafo_size_c, state.bit_depth);
     }
     Ok(())
 }
@@ -3581,6 +3581,7 @@ fn predict_intra_luma(
             sps.strong_intra_smoothing_enabled_flag,
             0, // c_idx = 0 (luma)
             sps.chroma_format_idc,
+            state.bit_depth,
         );
     }
 
@@ -3589,9 +3590,9 @@ fn predict_intra_luma(
     let dst = &mut state.y_plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
 
     match mode {
-        0 => predict_planar(dst, dst_stride, &top, &left, log2_size),
-        1 => predict_dc(dst, dst_stride, &top, &left, log2_size, true),
-        2..=34 => predict_angular(dst, dst_stride, &top, &left, log2_size, mode, 0),
+        0 => predict_planar(dst, dst_stride, &top, &left, log2_size, state.bit_depth),
+        1 => predict_dc(dst, dst_stride, &top, &left, log2_size, true, state.bit_depth),
+        2..=34 => predict_angular(dst, dst_stride, &top, &left, log2_size, mode, 0, state.bit_depth),
         _ => {
             return Err(DecodeError::Unsupported("invalid intra prediction mode"));
         }
@@ -3864,6 +3865,7 @@ fn predict_intra_chroma(
                 sps.strong_intra_smoothing_enabled_flag,
                 c_idx,
                 sps.chroma_format_idc,
+                state.bit_depth,
             );
         }
 
@@ -3875,9 +3877,9 @@ fn predict_intra_chroma(
         let dst_offset = y_c * dst_stride + x_c;
         let dst = &mut plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
         match mode {
-            0 => predict_planar(dst, dst_stride, &top, &left, log2_size),
-            1 => predict_dc(dst, dst_stride, &top, &left, log2_size, false),
-            2..=34 => predict_angular(dst, dst_stride, &top, &left, log2_size, mode, c_idx),
+            0 => predict_planar(dst, dst_stride, &top, &left, log2_size, state.bit_depth),
+            1 => predict_dc(dst, dst_stride, &top, &left, log2_size, false, state.bit_depth),
+            2..=34 => predict_angular(dst, dst_stride, &top, &left, log2_size, mode, c_idx, state.bit_depth),
             _ => {
                 return Err(DecodeError::Unsupported("invalid intra prediction mode"));
             }
@@ -3936,7 +3938,7 @@ fn apply_residual_to_luma(
     let dst_stride = state.y_stride;
     let dst_offset = (y0 as usize) * dst_stride + (x0 as usize);
     let dst = &mut state.y_plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
-    add_residual(dst, dst_stride, &residual_pixels, log2_size);
+    add_residual(dst, dst_stride, &residual_pixels, log2_size, state.bit_depth);
 }
 
 /// Pick `scan_idx` for residual_coding (spec 7.4.9.11). For intra TUs at
