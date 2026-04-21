@@ -3324,4 +3324,30 @@ mod tests {
             "multi_slice_sao_deblock hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
     }
+
+    /// 64×64, 1 I-frame with `pcm_enabled_flag = 1` and actual PCM-coded
+    /// blocks. Generated with the HM reference encoder at QP=4 on random
+    /// noise, which forces PCM selection (raw samples are cheaper than
+    /// coding random noise at near-lossless QP). The output is a lossless
+    /// roundtrip of the original random input — proving PCM samples are
+    /// decoded correctly, CABAC reinit after PCM blocks works, and the
+    /// `pcm_byte_position` / `skip_bytes` logic matches FFmpeg.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// python3 -c "import random; random.seed(42); ..." > /tmp/pcm_noise.yuv
+    /// TAppEncoder -c pcm.cfg   # HM reference encoder
+    ///   # pcm.cfg: 64×64, CTU=16, QP=4, PCMEnabledFlag=1,
+    ///   #          PCMLog2MaxSize=4, PCMLog2MinSize=3,
+    ///   #          LoopFilterDisable=1, SAO=0
+    /// ```
+    #[test]
+    fn test_decode_pcm_hm_hash() {
+        let hash = decode_and_hash("pcm_hm_64x64.h265", 1);
+        let expected = "f893ddcb970048ea87f2c2e2dbb2058152c625305adbd0fee5988b1c1bfb9853";
+        assert_eq!(
+            hash, expected,
+            "pcm_hm hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
 }
