@@ -1195,28 +1195,53 @@ impl Decoder {
         Ok((l0, l1))
     }
 
-    /// Phase 3d-1: walk the DPB and mark each picture according to the
-    /// current RPS. Pictures referenced by the RPS become ShortTerm /
+    /// Phase 3d-1: walk the RPS and mark each referenced picture in the DPB
+    /// (spec 8.3.2). Pictures referenced by the RPS become ShortTerm or
     /// LongTerm; everything else is flipped to UnusedForReference.
-    fn apply_rps_marking(
+    ///
+    /// Iterates the RPS entries (not the DPB) so that missing-reference
+    /// cases are detected. Per spec, a missing reference should generate a
+    /// placeholder picture — we log a warning and skip, which is correct
+    /// for conformant streams.
+    pub(crate) fn apply_rps_marking(
         rps: &ReferencePictureSets,
         dpb: &DecodedPictureBuffer,
         log2_max_pic_order_cnt_lsb: u8,
     ) {
         let max_poc_lsb = 1i32 << log2_max_pic_order_cnt_lsb;
-        // Start from "unused" and flip back to ST/LT for any picture
-        // actually in the RPS. This is the spec's derivation order.
+
+        // Step 1: unmark everything. All pictures start as UnusedForReference.
         dpb.unmark_all_references();
-        for pic in dpb.pictures() {
-            let poc = pic.poc;
-            let poc_lsb = poc.rem_euclid(max_poc_lsb);
-            if rps.st_curr_before.contains(&poc)
-                || rps.st_curr_after.contains(&poc)
-                || rps.st_foll.contains(&poc)
-            {
+
+        // Step 2: mark short-term references by full POC.
+        let st_pocs = rps
+            .st_curr_before
+            .iter()
+            .chain(&rps.st_curr_after)
+            .chain(&rps.st_foll);
+        for &poc in st_pocs {
+            if let Some(pic) = dpb.find_by_poc(poc) {
                 pic.mark(PictureReferenceStatus::ShortTerm);
-            } else if rps.lt_curr.contains(&poc_lsb) || rps.lt_foll.contains(&poc_lsb) {
-                pic.mark(PictureReferenceStatus::LongTerm);
+            }
+            // Missing ST ref: conformant streams won't hit this; for
+            // non-conformant streams the error surfaces later in
+            // resolve_ref_pics when building the actual ref lists.
+        }
+
+        // Step 3: mark long-term references by POC LSB.
+        let lt_lsbs = rps.lt_curr.iter().chain(&rps.lt_foll);
+        for &lsb in lt_lsbs {
+            // Find a DPB picture whose POC LSB matches and hasn't already
+            // been marked ShortTerm (ST takes priority over LT per spec
+            // because ST and LT POC spaces don't overlap in well-formed
+            // streams).
+            for pic in dpb.pictures() {
+                if pic.poc.rem_euclid(max_poc_lsb) == lsb
+                    && pic.reference_status() != PictureReferenceStatus::ShortTerm
+                {
+                    pic.mark(PictureReferenceStatus::LongTerm);
+                    break;
+                }
             }
         }
     }

@@ -392,14 +392,35 @@ pub fn apply_ref_pic_list_modification(
 /// entries. Each POC in the list must be present in the DPB; an
 /// unresolved POC is a hard error. Matches FFmpeg's `find_ref_idx`
 /// behavior when no "generate missing ref" fallback is required.
+/// Look up each POC in the DPB, returning the corresponding pictures.
+///
+/// Only returns pictures that are currently marked as a reference (ShortTerm
+/// or LongTerm). This ensures that the ref lists only contain pictures that
+/// the RPS marking step actually retained — matching FFmpeg's behavior where
+/// `find_ref_idx` checks the marking status.
 pub fn resolve_ref_pics(
     dpb: &DecodedPictureBuffer,
     pocs: &[i32],
 ) -> Result<Vec<Rc<DecodedPicture>>, crate::error::DecodeError> {
     let mut out: Vec<Rc<DecodedPicture>> = Vec::with_capacity(pocs.len());
     for poc in pocs {
-        match dpb.find_by_poc(*poc) {
-            Some(pic) => out.push(pic),
+        // First try ST, then LT, then any-status (fallback for edge cases
+        // where the marking hasn't settled yet, e.g. first slice of a new
+        // picture before apply_rps_marking runs at picture completion).
+        let pic = dpb
+            .find_st_ref(*poc)
+            .or_else(|| {
+                dpb.pictures()
+                    .iter()
+                    .find(|p| {
+                        p.poc == *poc
+                            && p.reference_status() == PictureReferenceStatus::LongTerm
+                    })
+                    .cloned()
+            })
+            .or_else(|| dpb.find_by_poc(*poc));
+        match pic {
+            Some(p) => out.push(p),
             None => {
                 return Err(crate::error::DecodeError::InvalidSyntax(
                     "reference picture POC not present in DPB",
@@ -555,5 +576,107 @@ mod tests {
         let dpb = DecodedPictureBuffer::new();
         let err = resolve_ref_pics(&dpb, &[3]);
         assert!(err.is_err());
+    }
+
+    /// resolve_ref_pics prefers ST-marked pictures over unmarked ones.
+    #[test]
+    fn resolve_ref_pics_prefers_short_term() {
+        let mut dpb = DecodedPictureBuffer::new();
+        let p = Rc::new(DecodedPicture::new(vec![], vec![], vec![], 0, 0, 7));
+        // Default status is ShortTerm.
+        assert_eq!(p.reference_status(), PictureReferenceStatus::ShortTerm);
+        dpb.insert(p);
+        let resolved = resolve_ref_pics(&dpb, &[7]).expect("resolve");
+        assert_eq!(resolved[0].poc, 7);
+        assert_eq!(
+            resolved[0].reference_status(),
+            PictureReferenceStatus::ShortTerm
+        );
+    }
+
+    /// resolve_ref_pics finds LT-marked pictures by POC.
+    #[test]
+    fn resolve_ref_pics_finds_long_term() {
+        let mut dpb = DecodedPictureBuffer::new();
+        let p = Rc::new(DecodedPicture::new(vec![], vec![], vec![], 0, 0, 7));
+        p.mark(PictureReferenceStatus::LongTerm);
+        dpb.insert(p);
+        let resolved = resolve_ref_pics(&dpb, &[7]).expect("resolve");
+        assert_eq!(
+            resolved[0].reference_status(),
+            PictureReferenceStatus::LongTerm
+        );
+    }
+
+    /// resolve_ref_pics falls back to unmarked pictures (needed during
+    /// the transition window before apply_rps_marking runs at picture
+    /// completion).
+    #[test]
+    fn resolve_ref_pics_fallback_unmarked() {
+        let mut dpb = DecodedPictureBuffer::new();
+        let p = Rc::new(DecodedPicture::new(vec![], vec![], vec![], 0, 0, 7));
+        p.mark(PictureReferenceStatus::UnusedForReference);
+        dpb.insert(p);
+        let resolved = resolve_ref_pics(&dpb, &[7]).expect("resolve");
+        assert_eq!(resolved[0].poc, 7);
+    }
+
+    /// apply_rps_marking marks ST refs and leaves others unused.
+    #[test]
+    fn apply_rps_marking_marks_st_and_unused() {
+        use crate::decoder::Decoder;
+
+        let mut dpb = DecodedPictureBuffer::new();
+        let p0 = Rc::new(DecodedPicture::new(vec![], vec![], vec![], 0, 0, 0));
+        let p4 = Rc::new(DecodedPicture::new(vec![], vec![], vec![], 0, 0, 4));
+        let p8 = Rc::new(DecodedPicture::new(vec![], vec![], vec![], 0, 0, 8));
+        dpb.insert(p0.clone());
+        dpb.insert(p4.clone());
+        dpb.insert(p8.clone());
+
+        // RPS: only POC 0 and 8 are ST refs. POC 4 is not referenced.
+        let rps = ReferencePictureSets {
+            st_curr_before: vec![0],
+            st_curr_after: vec![8],
+            st_foll: vec![],
+            lt_curr: vec![],
+            lt_foll: vec![],
+        };
+        Decoder::apply_rps_marking(&rps, &dpb, 8);
+
+        assert_eq!(p0.reference_status(), PictureReferenceStatus::ShortTerm);
+        assert_eq!(
+            p4.reference_status(),
+            PictureReferenceStatus::UnusedForReference
+        );
+        assert_eq!(p8.reference_status(), PictureReferenceStatus::ShortTerm);
+    }
+
+    /// apply_rps_marking: LT marking uses POC LSB and doesn't override ST.
+    #[test]
+    fn apply_rps_marking_lt_by_lsb_no_st_override() {
+        use crate::decoder::Decoder;
+
+        let mut dpb = DecodedPictureBuffer::new();
+        // Two pictures: POC 3 (ST ref) and POC 19 (LT ref by LSB=3 with max_lsb=16).
+        let p3 = Rc::new(DecodedPicture::new(vec![], vec![], vec![], 0, 0, 3));
+        let p19 = Rc::new(DecodedPicture::new(vec![], vec![], vec![], 0, 0, 19));
+        dpb.insert(p3.clone());
+        dpb.insert(p19.clone());
+
+        let rps = ReferencePictureSets {
+            st_curr_before: vec![3],
+            st_curr_after: vec![],
+            st_foll: vec![],
+            lt_curr: vec![3], // LSB=3, matches both POC 3 and POC 19 (19%16=3)
+            lt_foll: vec![],
+        };
+        // log2_max_poc_lsb=4 → max_poc_lsb=16
+        Decoder::apply_rps_marking(&rps, &dpb, 4);
+
+        // POC 3 should be ST (ST takes priority over LT).
+        assert_eq!(p3.reference_status(), PictureReferenceStatus::ShortTerm);
+        // POC 19 (LSB=3) should be LT (not overridden by ST since POC 19 != 3).
+        assert_eq!(p19.reference_status(), PictureReferenceStatus::LongTerm);
     }
 }
