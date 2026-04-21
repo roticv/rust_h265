@@ -119,10 +119,19 @@ pub fn decode_sao_param(
     let mut sao_merge_left = 0u32;
     let mut sao_merge_up = 0u32;
 
-    if rx > 0 {
+    // SAO merge flags are only decoded when the neighbor CTB is available
+    // (same slice and same tile). Spec 7.3.8.4 / FFmpeg hls_sao_param gates
+    // these on ctb_left_flag / ctb_up_flag from hls_decode_neighbour.
+    let ctb_rs = ry * pic_w_in_ctbs + rx;
+    let cur_slice = state.tab_slice_addr_rs[ctb_rs];
+
+    let left_avail = rx > 0 && state.tab_slice_addr_rs[ctb_rs - 1] == cur_slice;
+    let up_avail = ry > 0 && state.tab_slice_addr_rs[ctb_rs - pic_w_in_ctbs] == cur_slice;
+
+    if left_avail {
         sao_merge_left = decode_sao_merge_flag(cabac, contexts);
     }
-    if ry > 0 && sao_merge_left == 0 {
+    if up_avail && sao_merge_left == 0 {
         sao_merge_up = decode_sao_merge_flag(cabac, contexts);
     }
 

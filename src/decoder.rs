@@ -648,11 +648,12 @@ impl Decoder {
         // QP-prediction state per slice segment (spec 8.6.1 / FFmpeg
         // hevcdec.c:3066-3069). `first_qp_group` resets at every segment
         // start — to true for independent segments (fallback to slice_qp),
-        // to false for dependent ones (inherit parent's `qpy_pred`). When
-        // `cu_qp_delta_enabled_flag = 0` nothing else mutates `last_qp_y`,
-        // so re-seed it to `slice_qp` for independent segments.
+        // to false for dependent ones (inherit parent's `qpy_pred`).
+        // `last_qp_y` (FFmpeg: `lc->qp_y`) must be re-seeded to
+        // `slice_qp_y` at the start of every independent slice segment
+        // (FFmpeg `hls_decode_entry`: `lc->qp_y = s->sh.slice_qp_y`).
         state.first_qp_group = !sh.dependent_slice_segment_flag;
-        if !pps.cu_qp_delta_enabled_flag && !sh.dependent_slice_segment_flag {
+        if !sh.dependent_slice_segment_flag {
             state.last_qp_y = sh.slice_qp_y;
         }
 
@@ -3210,6 +3211,35 @@ mod tests {
         assert_eq!(
             hash, expected,
             "no_filter_across_slices hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// 256×256, 3 frames (I+P+P) with 2 independent slices per frame, WPP,
+    /// SAO + deblock enabled. Exercises the multi-slice SAO merge-flag
+    /// availability check: `sao_merge_left_flag` / `sao_merge_up_flag` must
+    /// NOT be decoded when the neighbor CTB is in a different slice (spec
+    /// 7.3.8.4 / FFmpeg `hls_sao_param` gates on `ctb_left_flag` /
+    /// `ctb_up_flag`). Before the fix, the decoder decoded a spurious
+    /// `sao_merge_up` bin at the first CTB of the second slice, desyncing
+    /// CABAC for the rest of that slice.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=256x256:rate=30:duration=0.2" \
+    ///   -frames:v 3 -pix_fmt yuv420p -f rawvideo /tmp/in.yuv
+    /// x265 --input /tmp/in.yuv --input-res 256x256 --fps 30 --frames 3 \
+    ///   --preset ultrafast --ctu 32 --keyint 30 --no-open-gop --bframes 0 \
+    ///   --slices 2 --wpp --qp 26 --no-cutree --no-aq --sao --deblock 0:0 \
+    ///   --no-info --no-psnr --no-ssim \
+    ///   -o multi_slice_sao_deblock_256x256.h265
+    /// ```
+    #[test]
+    fn test_decode_multi_slice_sao_deblock_hash() {
+        let hash = decode_and_hash("multi_slice_sao_deblock_256x256.h265", 3);
+        let expected = "3a8a37e3bd30b6b19b56b59945c6c6d97723b0b3161da20e985bf314800d3c83";
+        assert_eq!(
+            hash, expected,
+            "multi_slice_sao_deblock hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
     }
 }

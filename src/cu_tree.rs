@@ -604,9 +604,8 @@ pub fn decode_coding_quadtree(
 /// `split_cu_flag` neighbor context derivation (HEVC spec 9.3.4.2.2).
 ///
 /// `inc = (depth_left > cb_depth) + (depth_top > cb_depth)`. Neighbor depths
-/// come from `tab_ct_depth`. For now we treat anything outside the picture
-/// as "no neighbor" (depth 0); when multi-slice / multi-CTU support lands,
-/// we'll need to also track the per-CTU `ctb_left/up_flag`.
+/// come from `tab_ct_depth`. A neighbor is unavailable (depth 0) if it's
+/// outside the picture or in a different slice/tile (spec 6.4.1).
 fn decode_split_cu_flag(
     cabac: &mut CabacReader,
     contexts: &mut CabacContexts,
@@ -617,14 +616,31 @@ fn decode_split_cu_flag(
 ) -> Result<u32, DecodeError> {
     let x_cb = (x0 >> state.log2_min_cb_size) as usize;
     let y_cb = (y0 >> state.log2_min_cb_size) as usize;
+    let ctb_log2 = state.log2_ctb_size;
+    let ctb_w = state.width.div_ceil(1 << ctb_log2) as usize;
+
+    // Current CTB's slice address for cross-slice availability check.
+    let cur_ctb_rs = (y0 >> ctb_log2) as usize * ctb_w + (x0 >> ctb_log2) as usize;
+    let cur_slice = state.tab_slice_addr_rs[cur_ctb_rs];
 
     let depth_left = if x_cb > 0 {
-        state.tab_ct_depth[y_cb * state.min_cb_width + x_cb - 1]
+        // Check if the left neighbor is in the same slice.
+        let left_ctb_rs = (y0 >> ctb_log2) as usize * ctb_w + ((x0 - 1) >> ctb_log2) as usize;
+        if state.tab_slice_addr_rs[left_ctb_rs] == cur_slice {
+            state.tab_ct_depth[y_cb * state.min_cb_width + x_cb - 1]
+        } else {
+            0
+        }
     } else {
         0
     };
     let depth_top = if y_cb > 0 {
-        state.tab_ct_depth[(y_cb - 1) * state.min_cb_width + x_cb]
+        let top_ctb_rs = ((y0 - 1) >> ctb_log2) as usize * ctb_w + (x0 >> ctb_log2) as usize;
+        if state.tab_slice_addr_rs[top_ctb_rs] == cur_slice {
+            state.tab_ct_depth[(y_cb - 1) * state.min_cb_width + x_cb]
+        } else {
+            0
+        }
     } else {
         0
     };
