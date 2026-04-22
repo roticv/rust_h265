@@ -346,11 +346,14 @@ fn decode_coeff_abs_level_remaining(cabac: &mut CabacReader, c_rice_param: u32) 
         (prefix << c_rice_param) + suffix
     } else {
         let prefix_minus3 = prefix - 3;
-        let mut suffix = 0u32;
-        for _ in 0..(prefix_minus3 + c_rice_param) {
-            suffix = (suffix << 1) | cabac.decode_bypass();
+        let mut suffix = 0u64;
+        let num_suffix_bits = (prefix_minus3 + c_rice_param).min(32);
+        for _ in 0..num_suffix_bits {
+            suffix = (suffix << 1) | cabac.decode_bypass() as u64;
         }
-        (((1u32 << prefix_minus3) + 3 - 1) << c_rice_param) + suffix
+        // Use u64 to avoid overflow when prefix_minus3 + c_rice_param is large.
+        let val = (((1u64 << prefix_minus3) + 2) << c_rice_param) + suffix;
+        val.min(u32::MAX as u64) as u32
     }
 }
 
