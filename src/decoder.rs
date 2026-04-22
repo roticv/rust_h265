@@ -3402,4 +3402,32 @@ mod tests {
             let _ = decoder.decode_nal(nal);
         }
     }
+
+    /// Regression test for fuzz crash: `bit_depth_luma_minus8` from read_ue()
+    /// can be a large u32 value. Casting to u8 and adding 8 caused arithmetic
+    /// overflow. Now validated before the cast.
+    /// Found by: `cargo fuzz run decode_single_nal` (crash-affb98ea).
+    #[test]
+    fn test_fuzz_sps_bit_depth_overflow() {
+        // Replicate decode_single_nal framing: first two bytes select NAL
+        // type and tid, rest is payload. Wrap in Annex B start code.
+        let fuzz_input: &[u8] = &[
+            97, 20, 0, 0, 0, 64, 0, 235, 0, 0, 178, 0, 0, 178, 178, 0, 0,
+            64, 0, 235, 0, 0, 178, 0, 0, 178, 178, 0, 0, 0, 64, 0, 235, 0,
+            0, 178, 178, 178, 0, 0, 20, 165,
+        ];
+        // Build Annex B NAL from fuzz input (same as decode_single_nal target).
+        let nal_type = fuzz_input[0] & 0x3f;
+        let temporal_id = (fuzz_input[1] & 0x07).max(1);
+        let mut annex_b = vec![0x00, 0x00, 0x00, 0x01];
+        annex_b.push((nal_type << 1) & 0x7e);
+        annex_b.push(temporal_id & 0x07);
+        annex_b.extend_from_slice(&fuzz_input[2..]);
+
+        let nals = parse_annex_b(&annex_b);
+        let mut decoder = Decoder::new();
+        for nal in &nals {
+            let _ = decoder.decode_nal(nal);
+        }
+    }
 }

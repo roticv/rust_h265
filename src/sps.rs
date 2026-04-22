@@ -447,11 +447,11 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
 
     let bit_depth_luma_minus8 = r.read_ue()?;
     let bit_depth_chroma_minus8 = r.read_ue()?;
-    let bit_depth_luma = 8 + bit_depth_luma_minus8 as u8;
-    let bit_depth_chroma = 8 + bit_depth_chroma_minus8 as u8;
-    if bit_depth_luma > 16 || bit_depth_chroma > 16 {
+    if bit_depth_luma_minus8 > 8 || bit_depth_chroma_minus8 > 8 {
         return Err(DecodeError::Unsupported("bit depth > 16 not supported"));
     }
+    let bit_depth_luma = 8 + bit_depth_luma_minus8 as u8;
+    let bit_depth_chroma = 8 + bit_depth_chroma_minus8 as u8;
 
     let log2_max_pic_order_cnt_lsb_minus4 = r.read_ue()?;
     if log2_max_pic_order_cnt_lsb_minus4 > 12 {
