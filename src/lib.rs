@@ -1,11 +1,11 @@
 //! Pure Rust H.265 / HEVC video decoder.
 //!
-//! Decodes Main-profile 8-bit 4:2:0 HEVC bitstreams end-to-end, including
-//! I/P/B slices, hierarchical B-frames, WPP, tiles, dependent slice segments,
-//! SAO, deblocking, AQ, scaling lists, sign-data hiding, weighted prediction,
-//! PCM, transform skip, and transquant bypass. Byte-exact against FFmpeg on
-//! all in-tree fixtures plus real 1080p Big Buck Bunny at x265 presets
-//! ultrafast / medium / slow.
+//! Decodes Main and Main 10 profile (8-bit and 10-bit 4:2:0) HEVC bitstreams
+//! end-to-end. Supports both Annex B (start-code delimited) and HVCC
+//! (length-prefixed, MP4/MKV) input formats via [`parse_annex_b`] and
+//! [`parse_hvcc`]. Byte-exact against FFmpeg on all test fixtures plus
+//! real 1080p Big Buck Bunny at x265 presets ultrafast / medium / slow
+//! in both 8-bit and 10-bit.
 //!
 //! # Quick start
 //!
@@ -81,7 +81,7 @@ pub mod nal;
 // --- Top-level re-exports for convenience ---
 pub use decoder::{Decoder, Frame};
 pub use error::DecodeError;
-pub use nal::{NalUnit, NalUnitType, parse_annex_b};
+pub use nal::{parse_annex_b, parse_hvcc, parse_nal, NalUnit, NalUnitType};
 pub use pixel::{Pixel, PixelData};
 
 #[cfg(test)]

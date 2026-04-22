@@ -25,10 +25,13 @@ real-world Big Buck Bunny 1080p transcodes (8-bit and 10-bit). No SIMD yet.
 ### Public API
 
 ```rust
-use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, NalUnitType, Pixel, PixelData};
+use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_nal, NalUnitType, Pixel, PixelData};
 ```
 
 - `Decoder::new()` → `decode_nal(&NalUnit) -> Result<Option<Frame>>` → `flush() -> Option<Frame>`
+- `parse_annex_b(&[u8])` — split Annex B bytestream (start-code delimited, `.h265` files)
+- `parse_hvcc(&[u8], length_size)` — split length-prefixed NALs (MP4/MKV container packets)
+- `parse_nal(&[u8])` — parse a single raw NAL (no framing)
 - `Frame` has `y: PixelData`, `u: PixelData`, `v: PixelData`, `width`, `height`, `bit_depth`, `pic_order_cnt`
 - `PixelData::U8(Vec<u8>)` for 8-bit, `PixelData::U16(Vec<u16>)` for 10-bit
 - Frames emitted in **decode order** — callers sort by POC for display

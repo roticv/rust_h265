@@ -76,4 +76,6 @@ On Apple M4, 1080p Big Buck Bunny (single-threaded, no SIMD):
 - No SEI parsing (HDR metadata, timecodes silently skipped).
 - No Range Extension features beyond transform skip / transquant bypass.
 - No Screen Content Coding (palette, IBC).
-- Annex B input only (no HVCC/MP4 length-prefixed format).
+- HVCC parameter set extraction (parsing the `HEVCDecoderConfigurationRecord`
+  box itself) is left to the caller's container demuxer — `parse_hvcc()` handles
+  the per-packet length-prefixed NAL splitting.

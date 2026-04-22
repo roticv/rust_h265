@@ -1,4 +1,4 @@
-//! Annex B NAL unit parsing for HEVC.
+//! HEVC NAL unit parsing — Annex B and HVCC (length-prefixed) formats.
 //!
 //! HEVC NAL header is 2 bytes (vs. 1 byte in H.264):
 //!
@@ -265,6 +265,95 @@ fn remove_emulation_prevention(data: &[u8]) -> (Cow<'_, [u8]>, Vec<u32>) {
     (Cow::Owned(rbsp), epb_positions)
 }
 
+/// Parse a single raw NAL unit (no start code, no length prefix).
+///
+/// `nal_data` should start with the 2-byte NAL header. Returns `None` if
+/// the data is too short or the header is malformed (forbidden bit set,
+/// `nuh_temporal_id_plus1 == 0`).
+pub fn parse_nal(nal_data: &[u8]) -> Option<NalUnit<'_>> {
+    if nal_data.len() < 2 {
+        return None;
+    }
+    let b0 = nal_data[0];
+    let b1 = nal_data[1];
+    if b0 & 0x80 != 0 {
+        return None; // forbidden_zero_bit set
+    }
+    let nal_unit_type = NalUnitType::from((b0 >> 1) & 0x3F);
+    let nuh_layer_id = ((b0 & 0x01) << 5) | (b1 >> 3);
+    let temporal_id_plus1 = b1 & 0x07;
+    if temporal_id_plus1 == 0 {
+        return None;
+    }
+    let temporal_id = temporal_id_plus1 - 1;
+    let (rbsp, epb_positions) = remove_emulation_prevention(&nal_data[2..]);
+    Some(NalUnit {
+        nal_unit_type,
+        nuh_layer_id,
+        temporal_id,
+        rbsp,
+        epb_positions,
+    })
+}
+
+/// Split length-prefixed NAL units (HVCC / hvcC format from MP4/MKV containers).
+///
+/// Each NAL unit in `data` is preceded by a big-endian length field of
+/// `length_size` bytes (typically 4, from `HEVCDecoderConfigurationRecord.
+/// lengthSizeMinusOne + 1`). This is the format produced by MP4/MKV demuxers
+/// for each video packet.
+///
+/// Unlike Annex B, HVCC data does NOT contain start codes and does NOT
+/// require emulation-prevention-byte handling within the length field itself
+/// (EPBs still exist within the NAL payload and are removed as usual).
+///
+/// Returns an empty vec if `length_size` is 0 or > 4.
+///
+/// # Example
+///
+/// ```
+/// use rust_h265::parse_hvcc;
+///
+/// // Minimal VPS NAL: 4-byte length (6) + 2-byte header + 4 bytes payload
+/// let data = [
+///     0x00, 0x00, 0x00, 0x06,  // length = 6
+///     0x40, 0x01,              // NAL header: VPS, layer 0, tid 0
+///     0x00, 0x00, 0x00, 0x00,  // payload
+/// ];
+/// let nals = parse_hvcc(&data, 4);
+/// assert_eq!(nals.len(), 1);
+/// assert_eq!(nals[0].nal_unit_type, rust_h265::NalUnitType::Vps);
+/// ```
+pub fn parse_hvcc(data: &[u8], length_size: u8) -> Vec<NalUnit<'_>> {
+    if length_size == 0 || length_size > 4 {
+        return Vec::new();
+    }
+    let ls = length_size as usize;
+    let mut nals = Vec::new();
+    let mut i = 0;
+
+    while i + ls <= data.len() {
+        // Read big-endian length.
+        let mut nal_len: usize = 0;
+        for j in 0..ls {
+            nal_len = (nal_len << 8) | data[i + j] as usize;
+        }
+        i += ls;
+
+        if nal_len == 0 || i + nal_len > data.len() {
+            break;
+        }
+
+        let nal_data = &data[i..i + nal_len];
+        if let Some(nal) = parse_nal(nal_data) {
+            nals.push(nal);
+        }
+        i += nal_len;
+    }
+
+    nals
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +495,118 @@ mod tests {
         let nals = parse_annex_b(&data);
         assert_eq!(nals.len(), 1);
         assert_eq!(nals[0].nuh_layer_id, 33);
+    }
+
+    // ---- HVCC (length-prefixed) tests ----
+
+    #[test]
+    fn test_parse_hvcc_single_nal() {
+        let h = hdr(32, 0, 0); // VPS
+        let payload = [0xAA, 0xBB, 0xCC];
+        let nal_len: u32 = 2 + payload.len() as u32; // header + payload
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&nal_len.to_be_bytes()); // 4-byte length
+        data.extend_from_slice(&h);
+        data.extend_from_slice(&payload);
+
+        let nals = parse_hvcc(&data, 4);
+        assert_eq!(nals.len(), 1);
+        assert_eq!(nals[0].nal_unit_type, NalUnitType::Vps);
+        assert_eq!(nals[0].rbsp.as_ref(), &payload);
+    }
+
+    #[test]
+    fn test_parse_hvcc_multiple_nals() {
+        let mut data = Vec::new();
+
+        // VPS
+        let h_vps = hdr(32, 0, 0);
+        let payload_vps = [0x01, 0x02];
+        let len_vps: u32 = 2 + payload_vps.len() as u32;
+        data.extend_from_slice(&len_vps.to_be_bytes());
+        data.extend_from_slice(&h_vps);
+        data.extend_from_slice(&payload_vps);
+
+        // SPS
+        let h_sps = hdr(33, 0, 0);
+        let payload_sps = [0x03, 0x04, 0x05];
+        let len_sps: u32 = 2 + payload_sps.len() as u32;
+        data.extend_from_slice(&len_sps.to_be_bytes());
+        data.extend_from_slice(&h_sps);
+        data.extend_from_slice(&payload_sps);
+
+        let nals = parse_hvcc(&data, 4);
+        assert_eq!(nals.len(), 2);
+        assert_eq!(nals[0].nal_unit_type, NalUnitType::Vps);
+        assert_eq!(nals[1].nal_unit_type, NalUnitType::Sps);
+        assert_eq!(nals[1].rbsp.as_ref(), &payload_sps);
+    }
+
+    #[test]
+    fn test_parse_hvcc_2byte_length() {
+        let h = hdr(34, 0, 0); // PPS
+        let payload = [0xFF];
+        let nal_len: u16 = 2 + payload.len() as u16;
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&nal_len.to_be_bytes()); // 2-byte length
+        data.extend_from_slice(&h);
+        data.extend_from_slice(&payload);
+
+        let nals = parse_hvcc(&data, 2);
+        assert_eq!(nals.len(), 1);
+        assert_eq!(nals[0].nal_unit_type, NalUnitType::Pps);
+    }
+
+    #[test]
+    fn test_parse_hvcc_with_epb() {
+        let h = hdr(20, 0, 0); // IDR_N_LP
+        // Payload with EPB: 00 00 03 01 → RBSP: 00 00 01
+        let payload = [0x00, 0x00, 0x03, 0x01];
+        let nal_len: u32 = 2 + payload.len() as u32;
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&nal_len.to_be_bytes());
+        data.extend_from_slice(&h);
+        data.extend_from_slice(&payload);
+
+        let nals = parse_hvcc(&data, 4);
+        assert_eq!(nals.len(), 1);
+        assert_eq!(nals[0].rbsp.as_ref(), &[0x00, 0x00, 0x01]);
+        assert_eq!(nals[0].epb_positions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_hvcc_empty_and_invalid() {
+        assert!(parse_hvcc(&[], 4).is_empty());
+        assert!(parse_hvcc(&[0x00, 0x00], 4).is_empty()); // truncated length
+        assert!(parse_hvcc(&[0x00, 0x00, 0x00, 0x00], 4).is_empty()); // zero length
+        assert!(parse_hvcc(&[0x01], 0).is_empty()); // invalid length_size
+        assert!(parse_hvcc(&[0x01], 5).is_empty()); // invalid length_size
+    }
+
+    #[test]
+    fn test_parse_nal_single() {
+        let h = hdr(33, 0, 0); // SPS
+        let mut nal_data = Vec::new();
+        nal_data.extend_from_slice(&h);
+        nal_data.extend_from_slice(&[0xAA, 0xBB]);
+
+        let nal = parse_nal(&nal_data).expect("should parse");
+        assert_eq!(nal.nal_unit_type, NalUnitType::Sps);
+        assert_eq!(nal.rbsp.as_ref(), &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn test_parse_nal_too_short() {
+        assert!(parse_nal(&[]).is_none());
+        assert!(parse_nal(&[0x00]).is_none());
+    }
+
+    #[test]
+    fn test_parse_nal_forbidden_bit() {
+        // forbidden_zero_bit = 1
+        assert!(parse_nal(&[0x80, 0x01]).is_none());
     }
 }

@@ -19,7 +19,7 @@ A pure Rust H.264 decoder ([`rust_h264`](https://github.com/roticv/rust_h264)) a
 
 ## Design
 
-- **Input:** Annex B bytestream (start code delimited `00 00 00 01` / `00 00 01`). HVCC (length-prefixed, used in MP4) is **not** supported — callers must convert to Annex B before feeding data to the decoder.
+- **Input:** Both **Annex B** (start-code delimited, `.h265` raw files) and **HVCC** (length-prefixed, MP4/MKV containers) formats via `parse_annex_b()` and `parse_hvcc()`.
 - **Streaming:** `Decoder::decode_nal(&[u8]) -> Result<Option<Frame>, DecodeError>` plus `flush()`. NAL units are fed incrementally and decoded frames are emitted as they become available, in **decode order** (callers re-sort by POC for display).
 - **Performance:** The decoder aims to be fast, with FFmpeg's software HEVC decoder as the target benchmark. Current gap vs single-threaded FFmpeg: ~5× on 8-bit, ~2.5× on 10-bit real 1080p content. No NEON / SSE kernels yet.
 - **Multi-bit-depth:** 8-bit and 10-bit (Main / Main 10 profile) via a generic `Pixel` trait. 12-bit infrastructure is in place but untested. Pixel planes are `PixelData::U8(Vec<u8>)` or `PixelData::U16(Vec<u16>)` — check `frame.bit_depth` to determine which.
@@ -56,6 +56,26 @@ for nal in &nals {
 // Flush the last buffered frame
 if let Some(frame) = decoder.flush() {
     // handle final frame
+}
+```
+
+### HVCC (MP4/MKV) input
+
+For container-demuxed content (length-prefixed NALs instead of Annex B start codes):
+
+```rust
+use rust_h265::{Decoder, parse_hvcc};
+
+let mut decoder = Decoder::new();
+
+// length_size comes from HEVCDecoderConfigurationRecord (typically 4)
+let length_size = 4u8;
+
+// Feed each demuxed packet (already length-prefixed)
+for packet in demuxer.video_packets() {
+    for nal in parse_hvcc(&packet.data, length_size) {
+        decoder.decode_nal(&nal)?;
+    }
 }
 ```
 
