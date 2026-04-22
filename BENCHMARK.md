@@ -42,33 +42,45 @@ Reproduce:
 cargo run --release --example bench_realworld
 ```
 
-### Results
+### Results — 8-bit (Main profile)
 
 | Fixture | Resolution | Frames | ours | ff-t1 | ff-tN | gap (ff-t1) |
 |---|---:|---:|---:|---:|---:|---:|
-| `bbb_1080p_5s_safe` | 1920×1080 | 120 | 242 Mpx/s (117 fps) | 1147 Mpx/s (553 fps) | 3888 Mpx/s | **4.7× slower** |
-| `bbb_720p_10s_safe` | 1280×720 | 240 | 207 Mpx/s (225 fps) | 933 Mpx/s | 3749 Mpx/s | **4.5× slower** |
-| `bbb_1080p_5s_medium` | 1920×1080 | 120 | 172 Mpx/s (83 fps) | 928 Mpx/s | 2488 Mpx/s | **5.4× slower** |
-| `bbb_1080p_5s_slow` | 1920×1080 | 120 | 179 Mpx/s (86 fps) | 915 Mpx/s | 2488 Mpx/s | **5.1× slower** |
+| `bbb_1080p_5s_safe` | 1920×1080 | 120 | 223 Mpx/s (108 fps) | 1163 Mpx/s | 4217 Mpx/s | **5.2× slower** |
+| `bbb_720p_10s_safe` | 1280×720 | 240 | 191 Mpx/s (207 fps) | 925 Mpx/s | 3686 Mpx/s | **4.8× slower** |
+| `bbb_1080p_5s_medium` | 1920×1080 | 120 | 153 Mpx/s (74 fps) | 902 Mpx/s | 2326 Mpx/s | **5.9× slower** |
+| `bbb_1080p_5s_slow` | 1920×1080 | 120 | 157 Mpx/s (76 fps) | 886 Mpx/s | 2326 Mpx/s | **5.6× slower** |
+
+### Results — 10-bit (Main 10 profile)
+
+| Fixture | Resolution | Frames | ours | ff-t1 | ff-tN | gap (ff-t1) |
+|---|---:|---:|---:|---:|---:|---:|
+| `bbb_1080p_5s_10bit_safe` | 1920×1080 | 120 | 199 Mpx/s (96 fps) | 511 Mpx/s | 2326 Mpx/s | **2.6× slower** |
+| `bbb_1080p_5s_10bit_medium` | 1920×1080 | 120 | 146 Mpx/s (70 fps) | 357 Mpx/s | 1406 Mpx/s | **2.4× slower** |
 
 ### Headline
 
-**At 1080p on real content with our supported settings, `rust_h265` delivers
-~240 Mpx/s (116 fps); single-threaded FFmpeg delivers ~1150 Mpx/s. FFmpeg is
-≈ 4.8× faster.** With frame-parallel threading (which `rust_h265` does not
-support) FFmpeg reaches ~4000 Mpx/s — a 16× gap against `rust_h265` serial.
+**8-bit:** At 1080p on real content, `rust_h265` delivers ~220 Mpx/s
+(108 fps); single-threaded FFmpeg delivers ~1160 Mpx/s. FFmpeg is ≈ 5×
+faster. The gap is consistent (4.8–5.9×) across 720p and 1080p real content.
 
-The gap is **consistent (4.5–4.8×)** between 720p and 1080p real content, and
-matches the synthetic-fixture 1080p gap (4.5×). This is strong evidence that
-the dominant bottleneck is the same across content types.
+**10-bit:** The gap is **much smaller** — only 2.4–2.6× vs FFmpeg
+single-threaded. Our decoder at 199 Mpx/s (96 fps) vs FFmpeg at 511 Mpx/s.
+This is because FFmpeg's 10-bit NEON kernels have less of an advantage: u16
+samples halve the SIMD throughput (4 samples per 64-bit register instead of
+8 for u8), while our scalar code scales more linearly. Both decoders are
+significantly slower on 10-bit than 8-bit content (our safe preset: 223 →
+199 Mpx/s, FFmpeg: 1163 → 511 Mpx/s).
+
+All six fixtures are byte-exact against FFmpeg.
 
 ### Compatibility
 
-All four fixtures (`safe` / `medium` / `slow` presets + the 720p `safe`
-encode) are byte-exact against FFmpeg. The `safe` preset is
-`--preset ultrafast --no-sao --no-deblock` plus a few other simplifications
-used to make byte-exact comparison tractable with very small fixtures;
-`medium` and `slow` are stock x265 presets with SAO + deblock enabled.
+All six fixtures (`safe` / `medium` / `slow` 8-bit presets + 720p `safe` +
+two 10-bit presets) are byte-exact against FFmpeg. The `safe` preset is
+`--preset ultrafast` with `bframes=1:ref=4:no-wpp=1:no-cutree=1`; `medium`
+and `slow` are stock x265 presets with SAO + deblock enabled. 10-bit
+fixtures use `--output-depth 10` for Main 10 profile.
 
 Two correctness bugs surfaced during this benchmarking work, both fixed
 below: one in WPP entry-point handling (triggered by real 1080p content
@@ -180,10 +192,10 @@ Best-of-5 wall-clock: **1.027 s** (116.8 fps, 242 Mpx/s).
 | Function | Inclusive % | Notes |
 |---|---:|---|
 | `motion_compensation_pu` | **68.7%** | The dominant bottleneck |
-| - `mc_luma_i16` | 27.2% | 7/8-tap luma filter (i16 precision for weighted pred) |
-| - `mc_chroma_i16` | 11.1% | 4-tap chroma filter (i16 for weighted pred) |
-| - `mc_chroma` | 7.6% | 4-tap chroma filter (direct u8 path) |
-| - self (alloc, weighted-pred loop, memset) | ~22.8% | Vec allocation per PU is a major contributor |
+| - `mc_luma_i32` | 27.2% | 7/8-tap luma filter (i32 precision for weighted/bi-pred) |
+| - `mc_chroma_i32` | 11.1% | 4-tap chroma filter (i32 for weighted/bi-pred) |
+| - `mc_chroma` | 7.6% | 4-tap chroma filter (direct pixel-output path) |
+| - self (weighted-pred loop, combining) | ~22.8% | Filter arithmetic inner loops |
 | `decode_transform_tree` | 18.6% | Residual decode + IDCT + intra pred |
 | - `apply_inverse_transform` | 8.4% | IDCT (tr_32: 3.9%, tr_16: 1.8%) |
 | - `residual_coding` (CABAC) | 4.7% | sig_coeff_flag / coeff_abs_level bins |
@@ -201,12 +213,10 @@ Best-of-5 wall-clock: **1.027 s** (116.8 fps, 242 Mpx/s).
    On real 1080p content with dense inter blocks, MC runs on nearly every PU
    while IDCT only runs on non-zero TUs (many inter blocks have cbf_luma=0).
 
-2. **Vec allocation inside MC is a major cost.** The weighted-prediction
-   path (`mc_luma_i16`, `mc_chroma_i16`) allocates a `Vec<i16>` scratch
-   buffer per PU, plus the `mc_luma`/`mc_chroma` non-weighted path does
-   similar. The ~22.8% "self" time in `motion_compensation_pu` is dominated
-   by `malloc`/`free`/`memset` calls visible in the profile. Pre-allocating
-   a reusable scratch buffer would eliminate this.
+2. **MC self-time is filter arithmetic, not allocation.** After replacing
+   per-PU `Vec` allocations with stack arrays (`[i32; MAX_PB_LUMA]`), the
+   ~22.8% "self" time in `motion_compensation_pu` remained — it's the
+   weighted-pred combining loops and filter inner loops, not malloc/free.
 
 3. **PictureState::new at 6.3%** is pure allocation — Y/U/V planes
    (1920x1080x1.5 = 3.1 MB) plus deblocking/QP/MV bookkeeping arrays.
@@ -233,42 +243,59 @@ appears at 6.3% (slow-preset encodes with more SAO usage).
 
 ### Optimization attempt: stack-allocated MC scratch buffers
 
-Replaced all 13 per-PU `vec![0i16; ...]` allocations in the MC path with
-fixed-size stack arrays (`[0i16; MAX_PB_LUMA]`, etc.). Result: malloc/free
-call sites in the profile dropped from 79 to 40, but **wall-clock time was
-unchanged** (1.039 s -> 1.058 s, within noise). The allocation overhead was
-only a few percent at most — the "~23% self-time" initially attributed to
-allocation was actually spent in the filter arithmetic inner loops and the
-weighted-pred combining loops. The stack arrays are still worth keeping
+Replaced all per-PU heap allocations in the MC path with fixed-size stack
+arrays (`[0i32; MAX_PB_LUMA]`, etc. — widened from i16 to i32 for 10-bit
+safety). Result: malloc/free call sites in the profile dropped from 79 to
+40, but **wall-clock time was unchanged** (~1.04 s → ~1.06 s, within noise).
+The allocation overhead was only a few percent at most — the "~23%
+self-time" initially attributed to allocation was actually spent in the
+filter arithmetic inner loops. The stack arrays are still worth keeping
 (fewer heap allocations, better cache locality), but the gap is squarely in
 the per-pixel filter computation.
 
 ## Interpretation
 
-The 4.5–5.1x single-threaded gap at 1080p is dominated by two factors:
+### 8-bit gap (5–6×)
+
+The single-threaded gap on 8-bit 1080p content is dominated by:
 
 1. **Scalar filter kernels.** The MC 7/8-tap luma and 4-tap chroma sub-pel
    filters account for ~46% of decode time as pure per-pixel arithmetic.
-   FFmpeg's arm64 build uses NEON intrinsics for these — processing 4-8
-   pixels per instruction vs our 1. This alone explains roughly 3-4x of
-   the gap.
+   FFmpeg's arm64 build uses NEON intrinsics — processing 8 u8 pixels per
+   128-bit register vs our 1 pixel at a time.
 
 2. **Threading.** FFmpeg's `-threads 0` enables frame-parallel decode across
-   all cores. `rust_h265` is single-threaded by design. The `ff-t1 -> ff-tN`
-   delta is roughly 3-4x on workloads big enough to keep 10 cores busy.
+   all cores. `rust_h265` is single-threaded by design. The `ff-t1 → ff-tN`
+   delta is roughly 3–4× on workloads big enough to keep 10 cores busy.
 
-Allocation overhead (~6% for `PictureState::new`, now minimal for MC) and
-bounds-check overhead are second-order effects, not the primary bottleneck.
+### 10-bit gap (2.4–2.6×)
+
+The 10-bit gap is notably smaller because:
+
+1. **SIMD advantage halved.** 10-bit samples use u16 (2 bytes), so NEON
+   processes 4 samples per 64-bit lane instead of 8. FFmpeg's NEON kernels
+   exist for 10-bit but their throughput advantage is ~2× (not ~4×).
+
+2. **Our scalar code scales linearly.** The same `i32` arithmetic runs
+   regardless of the storage type; the `Pixel` trait abstraction adds
+   negligible overhead. Our 10-bit safe preset runs at 89% of 8-bit speed
+   (199/223), while FFmpeg drops to 44% (511/1163).
+
+### Allocation and bounds-check overhead
+
+Second-order effects. `PictureState::new` is ~6% (heap allocation per
+picture). MC scratch buffers use stack arrays. Bounds checks are present
+throughout (no `unsafe`) but are not the bottleneck per the profile.
 
 ## Priorities
 
-All four real-world fixtures decode byte-exact. Remaining focus is
+All six real-world fixtures decode byte-exact. Remaining focus is
 performance, ordered by profile-informed impact:
 
-1. **NEON SIMD for MC filters** (~46% self-time in filter kernels).
-   `mc_luma` / `mc_luma_i16` 7/8-tap filter first (27%), then
-   `mc_chroma` / `mc_chroma_i16` 4-tap (19%). These are textbook
-   NEON workloads: small fixed-tap FIR on contiguous rows.
+1. **NEON SIMD for MC filters** (~46% of 8-bit decode time).
+   `mc_luma` / `mc_luma_i32` 7/8-tap filter first (27%), then
+   `mc_chroma` / `mc_chroma_i32` 4-tap (19%). Needs both u8 and u16
+   kernel variants.
 
 2. **NEON SIMD for IDCT** (~8%). tr_32 first (4%), then tr_16 (2%).
 

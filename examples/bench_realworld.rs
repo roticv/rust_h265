@@ -48,6 +48,8 @@ struct Fixture {
     /// Additional x265-params string (colon-separated `key=value`).
     /// Useful for `no-sao=1:no-deblock=1:...` etc.
     x265_params: &'static str,
+    /// Pixel format for ffmpeg output. "yuv420p" for 8-bit, "yuv420p10le" for 10-bit.
+    pix_fmt: &'static str,
 }
 
 const FIXTURES: &[Fixture] = &[
@@ -63,6 +65,7 @@ const FIXTURES: &[Fixture] = &[
         rate_mode: "qp",
         rate_value: 26,
         x265_params: "bframes=1:ref=4:no-wpp=1:no-cutree=1",
+        pix_fmt: "yuv420p",
     },
     Fixture {
         name: "bbb_720p_10s_safe",
@@ -74,11 +77,9 @@ const FIXTURES: &[Fixture] = &[
         rate_mode: "qp",
         rate_value: 26,
         x265_params: "bframes=1:ref=4:no-wpp=1:no-cutree=1",
+        pix_fmt: "yuv420p",
     },
-    // "Full" presets that model real streaming workloads. These may fail on
-    // our decoder (missing advanced encoder features) — the bench harness
-    // reports N/A for our column in that case so FFmpeg numbers are still
-    // collected.
+    // "Full" presets that model real streaming workloads.
     Fixture {
         name: "bbb_1080p_5s_medium",
         start_sec: 60,
@@ -89,6 +90,7 @@ const FIXTURES: &[Fixture] = &[
         rate_mode: "crf",
         rate_value: 23,
         x265_params: "",
+        pix_fmt: "yuv420p",
     },
     Fixture {
         name: "bbb_1080p_5s_slow",
@@ -100,6 +102,32 @@ const FIXTURES: &[Fixture] = &[
         rate_mode: "crf",
         rate_value: 23,
         x265_params: "",
+        pix_fmt: "yuv420p",
+    },
+    // 10-bit (Main 10 profile) — models HDR content decode path.
+    Fixture {
+        name: "bbb_1080p_5s_10bit_safe",
+        start_sec: 60,
+        duration_sec: 5,
+        width: 1920,
+        height: 1080,
+        x265_preset: "ultrafast",
+        rate_mode: "qp",
+        rate_value: 26,
+        x265_params: "bframes=1:ref=4:no-wpp=1:no-cutree=1",
+        pix_fmt: "yuv420p10le",
+    },
+    Fixture {
+        name: "bbb_1080p_5s_10bit_medium",
+        start_sec: 60,
+        duration_sec: 5,
+        width: 1920,
+        height: 1080,
+        x265_preset: "medium",
+        rate_mode: "crf",
+        rate_value: 23,
+        x265_params: "",
+        pix_fmt: "yuv420p10le",
     },
 ];
 
@@ -139,6 +167,8 @@ fn ensure_fixture(f: &Fixture, source: &str) -> std::io::Result<PathBuf> {
         "-an", // drop audio
         "-vf",
         &format!("scale={}:{}", f.width, f.height),
+        "-pix_fmt",
+        f.pix_fmt,
         "-c:v",
         "libx265",
         "-preset",
