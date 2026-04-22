@@ -496,6 +496,12 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
 
     let log2_min_luma_coding_block_size_minus3 = r.read_ue()?;
     let log2_diff_max_min_luma_coding_block_size = r.read_ue()?;
+    // Validate before u8 cast to prevent overflow on malformed input.
+    if log2_min_luma_coding_block_size_minus3 > 3 || log2_diff_max_min_luma_coding_block_size > 3 {
+        return Err(DecodeError::InvalidSyntax(
+            "log2_min_luma_coding_block_size or diff out of range",
+        ));
+    }
     let min_cb_log2_size_y = (log2_min_luma_coding_block_size_minus3 + 3) as u8;
     let ctb_log2_size_y = min_cb_log2_size_y + log2_diff_max_min_luma_coding_block_size as u8;
     if !(4..=6).contains(&ctb_log2_size_y) {
