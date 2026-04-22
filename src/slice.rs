@@ -572,6 +572,14 @@ pub fn parse_slice_segment_header(
     let mut entry_point_offsets: Vec<u32> = Vec::new();
     if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag {
         let num_entry_point_offsets = r.read_ue()?;
+        // Sanity cap: max valid is ~(pic_w_ctbs * pic_h_ctbs) which for
+        // 16384×16384 at CTU=16 is 1M. Cap at 4096 to prevent OOM on
+        // crafted input while allowing any realistic stream.
+        if num_entry_point_offsets > 4096 {
+            return Err(DecodeError::InvalidSyntax(
+                "num_entry_point_offsets too large",
+            ));
+        }
         if num_entry_point_offsets > 0 {
             let offset_len_minus1 = r.read_ue()?;
             if offset_len_minus1 >= 32 {

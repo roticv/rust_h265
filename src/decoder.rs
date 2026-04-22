@@ -3511,4 +3511,14 @@ mod tests {
             0, 0, 0, 0, 0, 132, 36, 154, 23, 47, 34, 4,
         ]);
     }
+
+    /// Huge num_entry_point_offsets causing OOM (oom-0fa6f5c4).
+    #[test]
+    fn test_fuzz_entry_point_offsets_oom() {
+        fuzz_hvcc(&[
+            0, 31, 68, 68, 0, 59, 7, 198, 255, 44, 0, 0, 0, 4, 85, 85, 40,
+            1, 0, 170, 170, 170, 170, 170, 0, 0, 0, 0, 0, 14, 85, 219, 219,
+            153,
+        ]);
+    }
 }
