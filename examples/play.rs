@@ -142,9 +142,9 @@ fn main() {
         }
         if let Some(display_frame) = reorder_buf.pop_if_ready() {
             first_frame_argb = Some(yuv_to_argb(
-                &display_frame.y,
-                &display_frame.u,
-                &display_frame.v,
+                display_frame.y.as_u8().expect("8-bit"),
+                display_frame.u.as_u8().expect("8-bit"),
+                display_frame.v.as_u8().expect("8-bit"),
                 width,
                 height,
             ));
@@ -160,7 +160,7 @@ fn main() {
         if let Some(f) = flushed.into_iter().next() {
             width = f.width as usize;
             height = f.height as usize;
-            first_frame_argb = Some(yuv_to_argb(&f.y, &f.u, &f.v, width, height));
+            first_frame_argb = Some(yuv_to_argb(f.y.as_u8().expect("8-bit"), f.u.as_u8().expect("8-bit"), f.v.as_u8().expect("8-bit"), width, height));
         }
     }
 
@@ -297,7 +297,7 @@ fn main() {
         }
 
         let f = display_frame.unwrap();
-        last_argb = yuv_to_argb(&f.y, &f.u, &f.v, width, height);
+        last_argb = yuv_to_argb(f.y.as_u8().expect("8-bit"), f.u.as_u8().expect("8-bit"), f.v.as_u8().expect("8-bit"), width, height);
         frame_count += 1;
 
         // Wait for frame timing.

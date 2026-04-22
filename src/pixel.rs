@@ -8,6 +8,50 @@
 //! trait only handles the *storage type*. A `u16` pixel could represent 10-bit
 //! or 12-bit data depending on `bit_depth`.
 
+/// Pixel data that can be either 8-bit or 10/12-bit.
+///
+/// This enum is used by `Frame` and `DecodedPicture` to store pixel planes
+/// without fixing the bit depth at compile time. The decoder creates the
+/// appropriate variant based on the SPS `bit_depth_luma` / `bit_depth_chroma`.
+#[derive(Debug, Clone)]
+pub enum PixelData {
+    /// 8-bit samples, one byte per pixel.
+    U8(Vec<u8>),
+    /// 10-bit or 12-bit samples, two bytes per pixel (values in `0..2^bit_depth - 1`).
+    U16(Vec<u16>),
+}
+
+impl PixelData {
+    /// Access the data as `&[u8]`, returning `None` if this is a `U16` variant.
+    pub fn as_u8(&self) -> Option<&[u8]> {
+        match self {
+            PixelData::U8(v) => Some(v),
+            PixelData::U16(_) => None,
+        }
+    }
+
+    /// Access the data as `&[u16]`, returning `None` if this is a `U8` variant.
+    pub fn as_u16(&self) -> Option<&[u16]> {
+        match self {
+            PixelData::U16(v) => Some(v),
+            PixelData::U8(_) => None,
+        }
+    }
+
+    /// Number of pixel samples (not bytes) in this plane.
+    pub fn len(&self) -> usize {
+        match self {
+            PixelData::U8(v) => v.len(),
+            PixelData::U16(v) => v.len(),
+        }
+    }
+
+    /// Returns `true` if the plane contains no samples.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Trait for pixel sample types. Implemented for `u8` and `u16`.
 pub trait Pixel: Copy + Clone + Default + Send + Sync + Sized + 'static {
     /// Convert from a signed 32-bit computation result, clamping to the
@@ -19,6 +63,19 @@ pub trait Pixel: Copy + Clone + Default + Send + Sync + Sized + 'static {
 
     /// Create a zero value.
     fn zero() -> Self;
+
+    /// Extract a typed slice from a `PixelData` enum.
+    ///
+    /// Returns the inner `&[Self]` if the variant matches `Self`, panics otherwise.
+    /// This is safe because the decoder guarantees that all pictures in a sequence
+    /// have the same bit depth, so the variant always matches.
+    fn extract_slice(data: &PixelData) -> &[Self];
+
+    /// Extract a mutable typed slice from a `PixelData` enum.
+    fn extract_slice_mut(data: &mut PixelData) -> &mut [Self];
+
+    /// Wrap a `Vec<Self>` into the matching `PixelData` variant.
+    fn wrap_vec(v: Vec<Self>) -> PixelData;
 }
 
 impl Pixel for u8 {
@@ -35,6 +92,27 @@ impl Pixel for u8 {
     #[inline(always)]
     fn zero() -> Self {
         0
+    }
+
+    #[inline(always)]
+    fn extract_slice(data: &PixelData) -> &[Self] {
+        match data {
+            PixelData::U8(v) => v,
+            PixelData::U16(_) => panic!("PixelData::U16 accessed as u8"),
+        }
+    }
+
+    #[inline(always)]
+    fn extract_slice_mut(data: &mut PixelData) -> &mut [Self] {
+        match data {
+            PixelData::U8(v) => v,
+            PixelData::U16(_) => panic!("PixelData::U16 accessed as u8"),
+        }
+    }
+
+    #[inline(always)]
+    fn wrap_vec(v: Vec<Self>) -> PixelData {
+        PixelData::U8(v)
     }
 }
 
@@ -53,6 +131,27 @@ impl Pixel for u16 {
     #[inline(always)]
     fn zero() -> Self {
         0
+    }
+
+    #[inline(always)]
+    fn extract_slice(data: &PixelData) -> &[Self] {
+        match data {
+            PixelData::U16(v) => v,
+            PixelData::U8(_) => panic!("PixelData::U8 accessed as u16"),
+        }
+    }
+
+    #[inline(always)]
+    fn extract_slice_mut(data: &mut PixelData) -> &mut [Self] {
+        match data {
+            PixelData::U16(v) => v,
+            PixelData::U8(_) => panic!("PixelData::U8 accessed as u16"),
+        }
+    }
+
+    #[inline(always)]
+    fn wrap_vec(v: Vec<Self>) -> PixelData {
+        PixelData::U16(v)
     }
 }
 

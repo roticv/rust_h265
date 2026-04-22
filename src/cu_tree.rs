@@ -434,6 +434,35 @@ impl<P: Pixel> PictureState<P> {
         }
         self.min_tb_addr_zs[row * self.min_tb_addr_zs_stride + col]
     }
+
+    /// Take ownership of the pixel planes and motion field, wrapping them
+    /// as `PixelData` for storage in `DecodedPicture`. Returns
+    /// `(y, u, v, tab_mvf, log2_min_pu_size, min_pu_width, log2_ctb_size)`.
+    pub fn take_planes_and_mvf(
+        &mut self,
+    ) -> (
+        crate::pixel::PixelData,
+        crate::pixel::PixelData,
+        crate::pixel::PixelData,
+        Vec<MvField>,
+        u8,
+        usize,
+        u8,
+    ) {
+        let y = P::wrap_vec(std::mem::take(&mut self.y_plane));
+        let u = P::wrap_vec(std::mem::take(&mut self.u_plane));
+        let v = P::wrap_vec(std::mem::take(&mut self.v_plane));
+        let tab_mvf = std::mem::take(&mut self.tab_mvf);
+        (
+            y,
+            u,
+            v,
+            tab_mvf,
+            self.log2_min_pu_size,
+            self.min_pu_width,
+            self.log2_ctb_size,
+        )
+    }
 }
 
 /// Recursive coding tree decode (HEVC spec 7.3.8.4).

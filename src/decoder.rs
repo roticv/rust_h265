@@ -20,6 +20,7 @@ use std::rc::Rc;
 
 use crate::cabac::{CabacContexts, CabacReader};
 use crate::cu_tree::{PictureState, decode_coding_quadtree};
+use crate::pixel::{Pixel, PixelData};
 use crate::dpb::{
     DecodedPicture, DecodedPictureBuffer, PictureReferenceStatus, ReferencePictureSets,
     apply_ref_pic_list_modification, build_ref_pic_list_temp0, build_ref_pic_list_temp1,
@@ -32,20 +33,26 @@ use crate::slice::{SliceHeader, SliceType, parse_slice_segment_header};
 use crate::sps::{ShortTermRps, Sps, parse_sps};
 use crate::vps::{Vps, parse_vps};
 
-/// A reconstructed video frame in YUV420 8-bit planar layout.
+/// A reconstructed video frame in YUV420 planar layout.
 ///
 /// Plane lengths are `width * height` for luma and `(width/2) * (height/2)`
 /// for each chroma plane. `pic_order_cnt` is the full (signed) POC
 /// computed per spec 8.3.1 — 0 for IDR pictures, and the MSB-extended LSB
 /// for non-IDR pictures.
+///
+/// Pixel data is stored in a `PixelData` enum that can be either 8-bit (`U8`)
+/// or 10/12-bit (`U16`). Use `bit_depth` to distinguish; call
+/// `y.as_u8()` / `y.as_u16()` to access the underlying slices.
 #[derive(Debug, Clone)]
 pub struct Frame {
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
+    pub y: PixelData,
+    pub u: PixelData,
+    pub v: PixelData,
     pub width: u32,
     pub height: u32,
     pub pic_order_cnt: i32,
+    /// Bit depth of the luma (and chroma) samples: 8, 10, or 12.
+    pub bit_depth: u8,
 }
 
 /// Streaming HEVC decoder.
@@ -62,10 +69,38 @@ pub struct Frame {
 ///     // ... last buffered frame
 /// }
 /// ```
+/// Runtime-dispatched picture state that can hold either 8-bit or 16-bit pixels.
+enum PictureStateEnum {
+    U8(PictureState<u8>),
+    U16(PictureState<u16>),
+}
+
+/// Helper macro to dispatch on a `PictureStateEnum`, binding the inner
+/// `PictureState<P>` to `$state` and executing `$body` in a context where
+/// `P: Pixel` is known at compile time.
+macro_rules! with_picture_state {
+    ($pic:expr, |$state:ident| $body:expr) => {
+        match $pic {
+            &mut PictureStateEnum::U8(ref mut $state) => { $body }
+            &mut PictureStateEnum::U16(ref mut $state) => { $body }
+        }
+    };
+}
+
+/// Immutable variant of the dispatch macro.
+macro_rules! with_picture_state_ref {
+    ($pic:expr, |$state:ident| $body:expr) => {
+        match $pic {
+            &PictureStateEnum::U8(ref $state) => { $body }
+            &PictureStateEnum::U16(ref $state) => { $body }
+        }
+    };
+}
+
 /// In-flight picture state: the reconstruction buffers plus the bookkeeping
 /// needed to stitch multi-slice decode back together.
 struct PictureInProgress {
-    state: PictureState<u8>,
+    state: PictureStateEnum,
     /// Header of the most recently decoded slice segment. Phase 3c-1 uses
     /// it for deblock/SAO finalization — in the common case all slices in a
     /// picture share the same filter flags, which this approximation
@@ -246,8 +281,8 @@ pub struct Decoder {
 /// The pixel planes may have CTU-aligned strides larger than `coded_w`, so we
 /// always use `state.y_stride` / `state.uv_stride` for row addressing.
 #[allow(clippy::too_many_arguments)]
-fn crop_frame(
-    state: &crate::cu_tree::PictureState<u8>,
+fn crop_frame<P: Pixel>(
+    state: &crate::cu_tree::PictureState<P>,
     _coded_w: u32,
     _coded_h: u32,
     cropped_w: u32,
@@ -255,6 +290,7 @@ fn crop_frame(
     left_offset: u32, // in chroma sample units
     top_offset: u32,  // in chroma sample units
     poc: i32,
+    bit_depth: u8,
 ) -> Frame {
     // For 4:2:0, SubWidthC = SubHeightC = 2.
     let luma_left = (left_offset * 2) as usize;
@@ -270,12 +306,13 @@ fn crop_frame(
         luma_left == 0 && luma_top == 0 && cw == stride_y && ch == state.y_plane.len() / stride_y;
     if no_crop {
         return Frame {
-            y: state.y_plane.clone(),
-            u: state.u_plane.clone(),
-            v: state.v_plane.clone(),
+            y: P::wrap_vec(state.y_plane.clone()),
+            u: P::wrap_vec(state.u_plane.clone()),
+            v: P::wrap_vec(state.v_plane.clone()),
             width: cropped_w,
             height: cropped_h,
             pic_order_cnt: poc,
+            bit_depth,
         };
     }
 
@@ -296,12 +333,13 @@ fn crop_frame(
         v.extend_from_slice(&state.v_plane[start..start + cw_c]);
     }
     Frame {
-        y,
-        u,
-        v,
+        y: P::wrap_vec(y),
+        u: P::wrap_vec(u),
+        v: P::wrap_vec(v),
         width: cropped_w,
         height: cropped_h,
         pic_order_cnt: poc,
+        bit_depth,
     }
 }
 
@@ -357,16 +395,21 @@ impl Decoder {
             let cropped_w = sps.cropped_width();
             let cropped_h = sps.cropped_height();
             let poc = pic.last_slice_header.poc;
-            return Some(crop_frame(
-                &pic.state,
-                pic_width,
-                pic_height,
-                cropped_w,
-                cropped_h,
-                sps.conf_win_left_offset,
-                sps.conf_win_top_offset,
-                poc,
-            ));
+            let bd = sps.bit_depth_luma;
+            let frame = with_picture_state_ref!(&pic.state, |state| {
+                crop_frame(
+                    state,
+                    pic_width,
+                    pic_height,
+                    cropped_w,
+                    cropped_h,
+                    sps.conf_win_left_offset,
+                    sps.conf_win_top_offset,
+                    poc,
+                    bd,
+                )
+            });
+            return Some(frame);
         }
         None
     }
@@ -597,22 +640,34 @@ impl Decoder {
             }
 
             // Populate `tab_tile_id` on the fresh picture state so intra
-            // availability checks can see it.
-            let mut ps = PictureState::<u8>::new(sps);
-            let n = ps.tab_tile_id.len();
-            ps.tab_tile_id.copy_from_slice(&tile_tables.tile_id[..n]);
-            // QP-prediction state (spec 8.6.1 / FFmpeg hevcdec.c:3066-3069):
-            // at the first independent segment of a picture, seed `qpy_pred`
-            // and `last_qp_y` from `slice_qp` and arm `first_qp_group` so the
-            // first QP group predicts from `slice_qp` (fallback when left /
-            // above neighbors are unavailable). When `cu_qp_delta_enabled_flag
-            // = 0` nothing else updates `last_qp_y`, so it correctly stays at
-            // `slice_qp` for every CU.
-            ps.qpy_pred = sh.slice_qp_y;
-            ps.last_qp_y = sh.slice_qp_y;
-            ps.first_qp_group = !sh.dependent_slice_segment_flag;
+            // availability checks can see it. Create the right pixel type
+            // based on the SPS bit depth.
+            let ps_enum = if sps.bit_depth_luma > 8 {
+                let mut ps = PictureState::<u16>::new(sps);
+                let n = ps.tab_tile_id.len();
+                ps.tab_tile_id.copy_from_slice(&tile_tables.tile_id[..n]);
+                ps.qpy_pred = sh.slice_qp_y;
+                ps.last_qp_y = sh.slice_qp_y;
+                ps.first_qp_group = !sh.dependent_slice_segment_flag;
+                PictureStateEnum::U16(ps)
+            } else {
+                let mut ps = PictureState::<u8>::new(sps);
+                let n = ps.tab_tile_id.len();
+                ps.tab_tile_id.copy_from_slice(&tile_tables.tile_id[..n]);
+                // QP-prediction state (spec 8.6.1 / FFmpeg hevcdec.c:3066-3069):
+                // at the first independent segment of a picture, seed `qpy_pred`
+                // and `last_qp_y` from `slice_qp` and arm `first_qp_group` so the
+                // first QP group predicts from `slice_qp` (fallback when left /
+                // above neighbors are unavailable). When `cu_qp_delta_enabled_flag
+                // = 0` nothing else updates `last_qp_y`, so it correctly stays at
+                // `slice_qp` for every CU.
+                ps.qpy_pred = sh.slice_qp_y;
+                ps.last_qp_y = sh.slice_qp_y;
+                ps.first_qp_group = !sh.dependent_slice_segment_flag;
+                PictureStateEnum::U8(ps)
+            };
             self.current_picture = Some(PictureInProgress {
-                state: ps,
+                state: ps_enum,
                 last_slice_header: sh.clone(),
                 last_independent_slice_header: sh.clone(),
                 saved_cabac_state: None,
@@ -643,7 +698,6 @@ impl Decoder {
             .current_picture
             .as_mut()
             .expect("current_picture set above");
-        let state = &mut pic.state;
 
         // QP-prediction state per slice segment (spec 8.6.1 / FFmpeg
         // hevcdec.c:3066-3069). `first_qp_group` resets at every segment
@@ -652,10 +706,12 @@ impl Decoder {
         // `last_qp_y` (FFmpeg: `lc->qp_y`) must be re-seeded to
         // `slice_qp_y` at the start of every independent slice segment
         // (FFmpeg `hls_decode_entry`: `lc->qp_y = s->sh.slice_qp_y`).
-        state.first_qp_group = !sh.dependent_slice_segment_flag;
-        if !sh.dependent_slice_segment_flag {
-            state.last_qp_y = sh.slice_qp_y;
-        }
+        with_picture_state!(&mut pic.state, |state| {
+            state.first_qp_group = !sh.dependent_slice_segment_flag;
+            if !sh.dependent_slice_segment_flag {
+                state.last_qp_y = sh.slice_qp_y;
+            }
+        });
 
         let wpp = pps.entropy_coding_sync_enabled_flag;
         let tiles_on = pps.tiles_enabled_flag;
@@ -719,74 +775,60 @@ impl Decoder {
             pred_weight_table: sh.pred_weight_table.clone(),
         };
 
-        let mut more_data = true;
-        // Phase 3c-2: iterate in tile-scan order. For single-tile pictures
-        // `ctb_addr_ts_to_rs` is the identity, so the loop visits CTBs in
-        // raster order exactly as before.
-        let mut ctb_addr_ts: u32 = slice_start_ts;
+        // Pre-compute the recorded_slice_addr for use in the CTB loop.
+        let recorded_slice_addr = if sh.dependent_slice_segment_flag {
+            pic.last_independent_slice_header.slice_segment_address as i32
+        } else {
+            sh.slice_segment_address as i32
+        };
 
-        // Substream index within the slice — 0 for the first substream
-        // (implicit offset 0), 1 for the second (at entry_point_offsets[0]),
-        // etc. Bumped every time we cross a tile boundary (tiles) or a row
-        // start (WPP).
-        let mut substream_idx: u32 = 0;
+        // The CTB loop, deblock, SAO, and DPB insertion all operate on a
+        // generic PictureState<P>. Dispatch once via the enum variant and
+        // execute the entire inner body monomorphized for the right P.
+        let ctb_loop_result: Result<(u32, Option<[u8; crate::cabac_tables::HEVC_CONTEXTS]>, [u8; crate::cabac_tables::HEVC_CONTEXTS]), DecodeError> =
+            with_picture_state!(&mut pic.state, |state| {
+            let mut more_data = true;
+            let mut ctb_addr_ts: u32 = slice_start_ts;
+            let mut substream_idx: u32 = 0;
 
-        while more_data && ctb_addr_ts < total_ctbs {
-            let ctb_addr_rs = tile_tables.ctb_addr_ts_to_rs[ctb_addr_ts as usize];
-            let col = ctb_addr_rs % pic_width_in_ctbs;
-            let is_first_ctb_of_slice = ctb_addr_ts == slice_start_ts;
+            while more_data && ctb_addr_ts < total_ctbs {
+                let ctb_addr_rs = tile_tables.ctb_addr_ts_to_rs[ctb_addr_ts as usize];
+                let col = ctb_addr_rs % pic_width_in_ctbs;
+                let is_first_ctb_of_slice = ctb_addr_ts == slice_start_ts;
 
-            // Phase 3c-2: tile boundary reinit. At the start of every tile
-            // (other than the first CTB of the slice), re-init the CABAC
-            // reader at the tile's entry-point byte offset and reset the
-            // context state from the slice QP. The first tile of the slice
-            // was already set up above.
-            let is_tile_start = if is_first_ctb_of_slice {
-                false
-            } else {
-                let prev_ts = ctb_addr_ts - 1;
-                let prev_rs = tile_tables.ctb_addr_ts_to_rs[prev_ts as usize];
-                tile_tables.tile_id[ctb_addr_rs as usize] != tile_tables.tile_id[prev_rs as usize]
-            };
-
-            // Phase 3c-3 (WPP): row boundary reinit. Mutually exclusive with
-            // `is_tile_start` in practice because WPP entry points and tile
-            // entry points share the same mechanism. For single-tile
-            // pictures with WPP the row start is detected via `col == 0`.
-            let is_row_start = col == 0;
-            let needs_wpp_reinit = wpp && !tiles_on && is_row_start && !is_first_ctb_of_slice;
-
-            if is_tile_start || needs_wpp_reinit {
-                substream_idx += 1;
-                let ep_idx = substream_idx as usize;
-                if ep_idx == 0 || ep_idx > sh.entry_point_offsets.len() {
-                    return Err(DecodeError::InvalidSyntax(
-                        "slice missing entry_point_offset for substream",
-                    ));
-                }
-                // entry_point_offsets[i] is the cumulative NAL-space offset
-                // from slice_segment_data start (spec 7.4.7.1). Convert to
-                // RBSP-space by subtracting the count of EPBs in the NAL
-                // range [nal_slice_data_start, nal_slice_data_start + offset).
-                let nal_offset_from_start = sh.entry_point_offsets[ep_idx - 1];
-                let nal_target = nal_slice_data_start + nal_offset_from_start;
-                let epbs_in_data_prefix = epb_positions
-                    .iter()
-                    .filter(|&&p| p >= nal_slice_data_start && p < nal_target)
-                    .count() as u32;
-                let rbsp_offset_from_start = nal_offset_from_start - epbs_in_data_prefix;
-                let byte_offset = cabac_byte_offset + rbsp_offset_from_start as usize;
-                cabac.reinit_at(byte_offset);
-
-                if is_tile_start {
-                    // Per-tile CABAC context reinit from the slice QP.
-                    contexts =
-                        CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag);
+                let is_tile_start = if is_first_ctb_of_slice {
+                    false
                 } else {
-                    // WPP row start: fresh init on single-column pictures,
-                    // otherwise load the state saved after the previous
-                    // row's 2nd CTB.
-                    if pic_width_in_ctbs == 1 {
+                    let prev_ts = ctb_addr_ts - 1;
+                    let prev_rs = tile_tables.ctb_addr_ts_to_rs[prev_ts as usize];
+                    tile_tables.tile_id[ctb_addr_rs as usize] != tile_tables.tile_id[prev_rs as usize]
+                };
+
+                let is_row_start = col == 0;
+                let needs_wpp_reinit = wpp && !tiles_on && is_row_start && !is_first_ctb_of_slice;
+
+                if is_tile_start || needs_wpp_reinit {
+                    substream_idx += 1;
+                    let ep_idx = substream_idx as usize;
+                    if ep_idx == 0 || ep_idx > sh.entry_point_offsets.len() {
+                        return Err(DecodeError::InvalidSyntax(
+                            "slice missing entry_point_offset for substream",
+                        ));
+                    }
+                    let nal_offset_from_start = sh.entry_point_offsets[ep_idx - 1];
+                    let nal_target = nal_slice_data_start + nal_offset_from_start;
+                    let epbs_in_data_prefix = epb_positions
+                        .iter()
+                        .filter(|&&p| p >= nal_slice_data_start && p < nal_target)
+                        .count() as u32;
+                    let rbsp_offset_from_start = nal_offset_from_start - epbs_in_data_prefix;
+                    let byte_offset = cabac_byte_offset + rbsp_offset_from_start as usize;
+                    cabac.reinit_at(byte_offset);
+
+                    if is_tile_start {
+                        contexts =
+                            CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag);
+                    } else if pic_width_in_ctbs == 1 {
                         contexts =
                             CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag);
                     } else if let Some(saved) = saved_state.as_ref() {
@@ -796,107 +838,57 @@ impl Decoder {
                             "WPP row start without a saved context state",
                         ));
                     }
+                    state.first_qp_group = true;
                 }
-                // Spec 8.6.1 / FFmpeg hls_decode_neighbour:2712-2720: WPP row
-                // starts and tile boundaries reset the first-QP-group flag so
-                // the next CU with `cu_qp_delta_enabled_flag` predicts from
-                // `slice_qp` rather than the previous region's trailing QP.
-                state.first_qp_group = true;
-            }
 
-            let x_ctb = col * ctb_size;
-            let y_ctb = (ctb_addr_rs / pic_width_in_ctbs) * ctb_size;
-            // Phase 3b-2: per-CTB SAO parameters decoded BEFORE the coding tree.
-            let rx = (x_ctb >> sps.ctb_log2_size_y) as usize;
-            let ry = (y_ctb >> sps.ctb_log2_size_y) as usize;
-            // Record the slice this CTB belongs to BEFORE decoding, so the
-            // intra prediction availability check can see the current CTB's
-            // slice address. `tab_slice_addr_rs` is indexed by raster.
-            //
-            // Phase 3c-4: for a dependent slice segment we store the
-            // **independent** parent slice's segment address, not this
-            // dependent segment's address. Dependent slice segments are
-            // logically part of the same slice as their parent, so
-            // cross-segment intra prediction MUST be allowed (spec 3.162:
-            // "independent slice segment: [...] the slice segment header
-            // information is not inferred from that of a preceding slice
-            // segment"; dependent segments inherit and therefore extend
-            // the same logical slice). Matches FFmpeg's
-            // `tab_slice_address[ctb_addr_rs] = s->sh.slice_addr`, where
-            // `sh->slice_addr` is only updated on independent segments
-            // (hevcdec.c line 824-826).
-            let recorded_slice_addr = if sh.dependent_slice_segment_flag {
-                pic.last_independent_slice_header.slice_segment_address as i32
-            } else {
-                sh.slice_segment_address as i32
-            };
-            state.tab_slice_addr_rs[ctb_addr_rs as usize] = recorded_slice_addr;
-            state.filter_slice_edges[ctb_addr_rs as usize] =
-                sh.slice_loop_filter_across_slices_enabled_flag;
-            crate::sao::decode_sao_param(&mut cabac, &mut contexts, state, sps, &sh, rx, ry);
-            more_data = decode_coding_quadtree(
-                &mut cabac,
-                &mut contexts,
-                state,
-                sps,
-                pps,
-                sh.slice_qp_y,
-                &slice_params,
-                x_ctb,
-                y_ctb,
-                sps.ctb_log2_size_y,
-                0,
-            )?;
-            ctb_addr_ts += 1;
+                let x_ctb = col * ctb_size;
+                let y_ctb = (ctb_addr_rs / pic_width_in_ctbs) * ctb_size;
+                let rx = (x_ctb >> sps.ctb_log2_size_y) as usize;
+                let ry = (y_ctb >> sps.ctb_log2_size_y) as usize;
+                state.tab_slice_addr_rs[ctb_addr_rs as usize] = recorded_slice_addr;
+                state.filter_slice_edges[ctb_addr_rs as usize] =
+                    sh.slice_loop_filter_across_slices_enabled_flag;
+                crate::sao::decode_sao_param(&mut cabac, &mut contexts, state, sps, &sh, rx, ry);
+                more_data = decode_coding_quadtree(
+                    &mut cabac,
+                    &mut contexts,
+                    state,
+                    sps,
+                    pps,
+                    sh.slice_qp_y,
+                    &slice_params,
+                    x_ctb,
+                    y_ctb,
+                    sps.ctb_log2_size_y,
+                    0,
+                )?;
+                ctb_addr_ts += 1;
 
-            // Phase 3c-3 (WPP): snapshot the CABAC contexts after the 2nd
-            // CTB of each row so the next row can load them. Only active in
-            // pure WPP mode — with tiles the per-tile reinit supersedes it.
-            if wpp && !tiles_on {
-                // For single-tile pictures raster and tile-scan agree, so
-                // we can use `ctb_addr_ts` directly as the raster post-index.
-                let col_after = ctb_addr_ts % pic_width_in_ctbs;
-                let should_save = col_after == 2
-                    || (pic_width_in_ctbs == 2 && col_after == 0)
-                    || pic_width_in_ctbs == 1;
-                if should_save {
-                    saved_state = Some(contexts.state);
+                if wpp && !tiles_on {
+                    let col_after = ctb_addr_ts % pic_width_in_ctbs;
+                    let should_save = col_after == 2
+                        || (pic_width_in_ctbs == 2 && col_after == 0)
+                        || pic_width_in_ctbs == 1;
+                    if should_save {
+                        saved_state = Some(contexts.state);
+                    }
                 }
             }
 
-            // `end_of_slice_flag` (terminate bin) is decoded at the end of
-            // every CTB. For non-final rows of a WPP slice / non-final tiles
-            // of a tiled slice it's 0 → `more_data` stays true → we fall
-            // through to the next substream, which triggers the reinit
-            // block above.
-        }
+            if more_data {
+                return Err(DecodeError::InvalidSyntax(
+                    "slice did not end on terminate bin",
+                ));
+            }
 
-        // `more_data == false` means we decoded an `end_of_slice_flag = 1`
-        // terminate bin — the slice has finished its CTB range. Any slice
-        // must end on a terminate bin or the CABAC state is out of sync.
-        if more_data {
-            return Err(DecodeError::InvalidSyntax(
-                "slice did not end on terminate bin",
-            ));
-        }
+            Ok((ctb_addr_ts, saved_state, contexts.state))
+        });
 
-        pic.ctbs_decoded = ctb_addr_ts;
-        // Phase 3c-4: snapshot the CABAC contexts at the end of the slice
-        // segment so the next dependent slice segment can restore them.
-        // We take the snapshot after `more_data` has gone false (i.e. after
-        // the final `end_of_slice_flag = 1` terminate bin has been decoded)
-        // which places us immediately after the slice's last CTB — exactly
-        // the state a dependent slice segment should start from (per spec
-        // 9.3.2.3 storage process for context variables).
-        //
-        // NOTE: `contexts.state` at this point includes the effects of the
-        // terminate bin decode, which doesn't mutate the context table
-        // (it's a bypass/terminate path), so the snapshot is equivalent to
-        // the "after last CTB" state the spec asks for.
-        pic.saved_cabac_state = Some(contexts.state);
-        // Persist the WPP row-state snapshot so a subsequent dependent
-        // slice segment starting on a WPP row boundary can restore it.
-        pic.saved_wpp_cabac_state = saved_state;
+        let (final_ctb_addr_ts, final_saved_state, final_contexts_state) = ctb_loop_result?;
+
+        pic.ctbs_decoded = final_ctb_addr_ts;
+        pic.saved_cabac_state = Some(final_contexts_state);
+        pic.saved_wpp_cabac_state = final_saved_state;
         if !sh.dependent_slice_segment_flag {
             pic.last_independent_slice_header = sh.clone();
         }
@@ -915,52 +907,49 @@ impl Decoder {
         let last_sh = &pic.last_slice_header;
 
         // Phase 3b-1: in-loop deblocking filter.
-        if !last_sh.slice_deblocking_filter_disabled_flag {
-            crate::deblock::deblock_picture(&mut pic.state, sps, pps, last_sh);
-        }
-
-        // Phase 3b-2: SAO filter (after deblocking).
-        crate::sao::apply_sao_picture(&mut pic.state, sps, last_sh);
+        let deblock_disabled = last_sh.slice_deblocking_filter_disabled_flag;
+        let last_sh_for_filters = last_sh.clone();
 
         // Phase 3d-1: snapshot everything we need from the SPS and the
-        // completed slice header so we can release the outstanding
-        // `sps` / `pps` / `tile_tables` borrows (they're tied to `self`)
-        // and mutably touch `self.dpb` / `self.prev_tid0_poc` /
-        // `self.current_rps`.
+        // completed slice header so we can release the outstanding borrows.
         let pic_width = sps.pic_width_in_luma_samples;
         let pic_height = sps.pic_height_in_luma_samples;
         let log2_max_poc_lsb = sps.log2_max_pic_order_cnt_lsb;
         let sps_st_ref_pic_sets = sps.st_ref_pic_sets.clone();
         let last_sh_cloned = last_sh.clone();
         let picture_poc = last_sh_cloned.poc;
-
-        // Build the output Frame now (while `sps`/etc. are still in
-        // scope) so the `pic` state can be moved into the DPB afterwards.
-        // Apply the conformance window crop so the output dimensions match
-        // the visible picture (not the CTU-padded coded picture).
         let cropped_w = sps.cropped_width();
         let cropped_h = sps.cropped_height();
-        let emitted_frame = crop_frame(
-            &pic.state,
-            pic_width,
-            pic_height,
-            cropped_w,
-            cropped_h,
-            sps.conf_win_left_offset,
-            sps.conf_win_top_offset,
-            picture_poc,
-        );
+        let conf_left = sps.conf_win_left_offset;
+        let conf_top = sps.conf_win_top_offset;
+        let bd = sps.bit_depth_luma;
+
+        // Run deblock + SAO + crop + DPB insert, dispatching on pixel type.
+        let emitted_frame = with_picture_state!(&mut pic.state, |state| {
+            if !deblock_disabled {
+                crate::deblock::deblock_picture(state, sps, pps, &last_sh_for_filters);
+            }
+            crate::sao::apply_sao_picture(state, sps, &last_sh_for_filters);
+
+            crop_frame(
+                state,
+                pic_width,
+                pic_height,
+                cropped_w,
+                cropped_h,
+                conf_left,
+                conf_top,
+                picture_poc,
+                bd,
+            )
+        });
 
         // The borrows `sps` / `pps` / `tile_tables` / `last_sh` are no
         // longer used beyond this point — NLL will release them here so
         // we can take mutable borrows of `self.*` below.
 
-        // Phase 3d-1: configure DPB from the active SPS (idempotent) and
-        // derive the current picture's reference picture set. The DPB
-        // still isn't used for actual decoding at this phase, but we wire
-        // the bookkeeping so the scaffolding is in place.
+        // Phase 3d-1: configure DPB from the active SPS (idempotent).
         {
-            // Fresh `&Sps` scoped to this block only.
             let sps_for_dpb = self.sps.as_ref().expect("sps still present after decode");
             self.dpb.configure_from_sps(sps_for_dpb);
         }
@@ -970,13 +959,8 @@ impl Decoder {
             &sps_st_ref_pic_sets,
             log2_max_poc_lsb,
         );
-        // Mark DPB pictures based on the newly derived RPS.
         Self::apply_rps_marking(&self.current_rps, &self.dpb, log2_max_poc_lsb);
 
-        // Phase 3d-2: build RefPicList0 / RefPicList1 per spec 8.3.2.
-        // I slices never reference other pictures → leave both lists empty.
-        // P/B slices use the lists for merge/AMVP candidate derivation
-        // (Phase 3d-4/3d-5).
         self.current_ref_list_l0.clear();
         self.current_ref_list_l1.clear();
         if last_sh_cloned.slice_type != SliceType::I {
@@ -986,14 +970,6 @@ impl Decoder {
             self.current_ref_list_l1 = l1;
         }
 
-        // Phase 3d-1: update prev_tid0_poc per spec 8.3.1 — done BEFORE
-        // the picture is inserted into the DPB, so subsequent non-IDR
-        // slice headers will see the current picture's POC as the seed.
-        //
-        // The spec excludes sub-layer non-reference (N-type) NAL types
-        // and RASL/RADL pictures. For Phase 3d-1 we only see IDR pictures
-        // in practice, so we take the simple approximation described in
-        // the phase plan: update on every IDR or temporal_id == 0.
         let nut_for_tid0 = last_sh_cloned.nal_unit_type;
         let is_tid0 = last_sh_cloned.temporal_id == 0
             && !matches!(
@@ -1012,29 +988,28 @@ impl Decoder {
             self.prev_tid0_poc = last_sh_cloned.poc;
         }
 
-        // Insert the fresh picture into the DPB so later frames can look
-        // it up by POC. Also clean up any unreferenced + already-output
-        // pictures (none exist today; this is future-proofing).
-        // Phase 3e: store tab_mvf + ref list POCs for temporal MVP.
+        // Insert the fresh picture into the DPB.
         let ref_list_l0_pocs: Vec<i32> = self.current_ref_list_l0.iter().map(|p| p.poc).collect();
         let ref_list_l1_pocs: Vec<i32> = self.current_ref_list_l1.iter().map(|p| p.poc).collect();
-        let decoded_pic = Rc::new(DecodedPicture::new_with_mvf(
-            pic.state.y_plane,
-            pic.state.u_plane,
-            pic.state.v_plane,
-            pic_width,
-            pic_height,
-            picture_poc,
-            pic.state.tab_mvf,
-            pic.state.log2_min_pu_size,
-            pic.state.min_pu_width,
-            pic.state.log2_ctb_size,
-            [ref_list_l0_pocs, ref_list_l1_pocs],
-        ));
-        // Mark as short-term reference initially — a subsequent frame's
-        // RPS will flip it to long-term / unused as needed.
+
+        let decoded_pic = with_picture_state!(&mut pic.state, |state| {
+            let (y, u, v, tab_mvf, log2_min_pu_size, min_pu_width, log2_ctb_size) =
+                state.take_planes_and_mvf();
+            Rc::new(DecodedPicture::new_with_mvf(
+                y,
+                u,
+                v,
+                pic_width,
+                pic_height,
+                picture_poc,
+                tab_mvf,
+                log2_min_pu_size,
+                min_pu_width,
+                log2_ctb_size,
+                [ref_list_l0_pocs, ref_list_l1_pocs],
+            ))
+        });
         decoded_pic.mark(PictureReferenceStatus::ShortTerm);
-        // Mark as output immediately (Phase 3d-1 has no reorder buffer).
         *decoded_pic.output.borrow_mut() = true;
         self.dpb.insert(decoded_pic);
         self.dpb.cleanup_unused();
@@ -1414,7 +1389,7 @@ mod tests {
     }
 
     fn test_decoded_picture(poc: i32) -> Rc<DecodedPicture> {
-        Rc::new(DecodedPicture::new(vec![], vec![], vec![], 16, 16, poc))
+        Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 16, 16, poc))
     }
 
     #[test]
@@ -1591,9 +1566,9 @@ mod tests {
 
         // Reassemble in the same layout as the reference YUV (Y then U then V).
         let mut decoded = Vec::with_capacity(384);
-        decoded.extend_from_slice(&frame.y);
-        decoded.extend_from_slice(&frame.u);
-        decoded.extend_from_slice(&frame.v);
+        decoded.extend_from_slice(frame.y.as_u8().unwrap());
+        decoded.extend_from_slice(frame.u.as_u8().unwrap());
+        decoded.extend_from_slice(frame.v.as_u8().unwrap());
 
         assert_eq!(
             decoded.len(),
@@ -1633,9 +1608,9 @@ mod tests {
         }
         let frame = frame.expect("expected one decoded frame");
         let mut decoded = Vec::with_capacity(ref_yuv.len());
-        decoded.extend_from_slice(&frame.y);
-        decoded.extend_from_slice(&frame.u);
-        decoded.extend_from_slice(&frame.v);
+        decoded.extend_from_slice(frame.y.as_u8().unwrap());
+        decoded.extend_from_slice(frame.u.as_u8().unwrap());
+        decoded.extend_from_slice(frame.v.as_u8().unwrap());
         assert_eq!(
             decoded, ref_yuv,
             "decoded planes do not match reference YUV byte-for-byte"
@@ -1666,9 +1641,9 @@ mod tests {
         }
         let frame = frame.expect("expected one decoded frame");
         let mut decoded = Vec::with_capacity(ref_yuv.len());
-        decoded.extend_from_slice(&frame.y);
-        decoded.extend_from_slice(&frame.u);
-        decoded.extend_from_slice(&frame.v);
+        decoded.extend_from_slice(frame.y.as_u8().unwrap());
+        decoded.extend_from_slice(frame.u.as_u8().unwrap());
+        decoded.extend_from_slice(frame.v.as_u8().unwrap());
         assert_eq!(
             decoded, ref_yuv,
             "decoded planes do not match reference YUV byte-for-byte"
@@ -1713,9 +1688,9 @@ mod tests {
         }
         let frame = frame.expect("expected one decoded frame");
         let mut decoded = Vec::with_capacity(1536);
-        decoded.extend_from_slice(&frame.y);
-        decoded.extend_from_slice(&frame.u);
-        decoded.extend_from_slice(&frame.v);
+        decoded.extend_from_slice(frame.y.as_u8().unwrap());
+        decoded.extend_from_slice(frame.u.as_u8().unwrap());
+        decoded.extend_from_slice(frame.v.as_u8().unwrap());
         assert_eq!(
             decoded, ref_yuv,
             "decoded planes do not match reference YUV byte-for-byte"
@@ -1749,9 +1724,9 @@ mod tests {
         assert_eq!(frame.width, 32);
         assert_eq!(frame.height, 32);
         let mut decoded = Vec::with_capacity(1536);
-        decoded.extend_from_slice(&frame.y);
-        decoded.extend_from_slice(&frame.u);
-        decoded.extend_from_slice(&frame.v);
+        decoded.extend_from_slice(frame.y.as_u8().unwrap());
+        decoded.extend_from_slice(frame.u.as_u8().unwrap());
+        decoded.extend_from_slice(frame.v.as_u8().unwrap());
         assert_eq!(
             decoded, ref_yuv,
             "decoded planes do not match reference YUV byte-for-byte"
@@ -1795,9 +1770,9 @@ mod tests {
         assert_eq!(frame.v.len(), 256);
 
         let mut decoded = Vec::with_capacity(1536);
-        decoded.extend_from_slice(&frame.y);
-        decoded.extend_from_slice(&frame.u);
-        decoded.extend_from_slice(&frame.v);
+        decoded.extend_from_slice(frame.y.as_u8().unwrap());
+        decoded.extend_from_slice(frame.u.as_u8().unwrap());
+        decoded.extend_from_slice(frame.v.as_u8().unwrap());
         assert_eq!(
             decoded, ref_yuv,
             "decoded planes do not match reference YUV byte-for-byte"
@@ -1848,9 +1823,9 @@ mod tests {
         assert_eq!(frame.height as usize, h);
 
         let mut decoded = Vec::with_capacity(ref_yuv.len());
-        decoded.extend_from_slice(&frame.y);
-        decoded.extend_from_slice(&frame.u);
-        decoded.extend_from_slice(&frame.v);
+        decoded.extend_from_slice(frame.y.as_u8().unwrap());
+        decoded.extend_from_slice(frame.u.as_u8().unwrap());
+        decoded.extend_from_slice(frame.v.as_u8().unwrap());
 
         assert_eq!(
             decoded.len(),
@@ -1925,9 +1900,9 @@ mod tests {
         assert_eq!(frame.height as usize, h);
 
         let mut decoded = Vec::with_capacity(ref_yuv.len());
-        decoded.extend_from_slice(&frame.y);
-        decoded.extend_from_slice(&frame.u);
-        decoded.extend_from_slice(&frame.v);
+        decoded.extend_from_slice(frame.y.as_u8().unwrap());
+        decoded.extend_from_slice(frame.u.as_u8().unwrap());
+        decoded.extend_from_slice(frame.v.as_u8().unwrap());
 
         assert_eq!(
             decoded.len(),
@@ -2008,9 +1983,9 @@ mod tests {
         assert_eq!(frame.height as usize, h);
 
         let mut decoded = Vec::with_capacity(ref_yuv.len());
-        decoded.extend_from_slice(&frame.y);
-        decoded.extend_from_slice(&frame.u);
-        decoded.extend_from_slice(&frame.v);
+        decoded.extend_from_slice(frame.y.as_u8().unwrap());
+        decoded.extend_from_slice(frame.u.as_u8().unwrap());
+        decoded.extend_from_slice(frame.v.as_u8().unwrap());
 
         assert_eq!(
             decoded.len(),
@@ -2101,9 +2076,9 @@ mod tests {
         assert_eq!(frame.height as usize, h);
 
         let mut decoded = Vec::with_capacity(ref_yuv.len());
-        decoded.extend_from_slice(&frame.y);
-        decoded.extend_from_slice(&frame.u);
-        decoded.extend_from_slice(&frame.v);
+        decoded.extend_from_slice(frame.y.as_u8().unwrap());
+        decoded.extend_from_slice(frame.u.as_u8().unwrap());
+        decoded.extend_from_slice(frame.v.as_u8().unwrap());
 
         assert_eq!(
             decoded.len(),
@@ -2179,9 +2154,9 @@ mod tests {
         assert_eq!(frame.height as usize, h);
 
         let mut decoded = Vec::with_capacity(ref_yuv.len());
-        decoded.extend_from_slice(&frame.y);
-        decoded.extend_from_slice(&frame.u);
-        decoded.extend_from_slice(&frame.v);
+        decoded.extend_from_slice(frame.y.as_u8().unwrap());
+        decoded.extend_from_slice(frame.u.as_u8().unwrap());
+        decoded.extend_from_slice(frame.v.as_u8().unwrap());
 
         assert_eq!(
             decoded.len(),
@@ -2256,9 +2231,9 @@ mod tests {
         assert_eq!(frame.height, 64);
 
         let mut decoded = Vec::with_capacity(ref_yuv.len());
-        decoded.extend_from_slice(&frame.y);
-        decoded.extend_from_slice(&frame.u);
-        decoded.extend_from_slice(&frame.v);
+        decoded.extend_from_slice(frame.y.as_u8().unwrap());
+        decoded.extend_from_slice(frame.u.as_u8().unwrap());
+        decoded.extend_from_slice(frame.v.as_u8().unwrap());
         if decoded != ref_yuv {
             let w = frame.width as usize;
             let h = frame.height as usize;
@@ -2344,9 +2319,9 @@ mod tests {
         assert_eq!(frame.height as usize, h);
 
         let mut decoded = Vec::with_capacity(ref_yuv.len());
-        decoded.extend_from_slice(&frame.y);
-        decoded.extend_from_slice(&frame.u);
-        decoded.extend_from_slice(&frame.v);
+        decoded.extend_from_slice(frame.y.as_u8().unwrap());
+        decoded.extend_from_slice(frame.u.as_u8().unwrap());
+        decoded.extend_from_slice(frame.v.as_u8().unwrap());
 
         assert_eq!(
             decoded.len(),
@@ -2474,9 +2449,9 @@ mod tests {
         assert_eq!(frame.height as usize, h);
 
         let mut decoded = Vec::with_capacity(ref_yuv.len());
-        decoded.extend_from_slice(&frame.y);
-        decoded.extend_from_slice(&frame.u);
-        decoded.extend_from_slice(&frame.v);
+        decoded.extend_from_slice(frame.y.as_u8().unwrap());
+        decoded.extend_from_slice(frame.u.as_u8().unwrap());
+        decoded.extend_from_slice(frame.v.as_u8().unwrap());
 
         assert_eq!(
             decoded.len(),
@@ -2568,9 +2543,9 @@ mod tests {
 
         let ref_frame0 = &ref_yuv[..frame_size];
         let mut decoded0 = Vec::with_capacity(frame_size);
-        decoded0.extend_from_slice(&frame0.y);
-        decoded0.extend_from_slice(&frame0.u);
-        decoded0.extend_from_slice(&frame0.v);
+        decoded0.extend_from_slice(frame0.y.as_u8().unwrap());
+        decoded0.extend_from_slice(frame0.u.as_u8().unwrap());
+        decoded0.extend_from_slice(frame0.v.as_u8().unwrap());
         assert_eq!(
             decoded0, ref_frame0,
             "frame 0 (IDR) is not byte-exact against FFmpeg reference"
@@ -2588,9 +2563,9 @@ mod tests {
 
         let ref_frame1 = &ref_yuv[frame_size..frame_size * 2];
         let mut decoded1 = Vec::with_capacity(frame_size);
-        decoded1.extend_from_slice(&frame1.y);
-        decoded1.extend_from_slice(&frame1.u);
-        decoded1.extend_from_slice(&frame1.v);
+        decoded1.extend_from_slice(frame1.y.as_u8().unwrap());
+        decoded1.extend_from_slice(frame1.u.as_u8().unwrap());
+        decoded1.extend_from_slice(frame1.v.as_u8().unwrap());
         assert_eq!(
             decoded1, ref_frame1,
             "frame 1 (P-slice) is not byte-exact against FFmpeg reference"
@@ -2665,9 +2640,9 @@ mod tests {
 
             let ref_frame = &ref_yuv[i * frame_size..(i + 1) * frame_size];
             let mut decoded = Vec::with_capacity(frame_size);
-            decoded.extend_from_slice(&frame.y);
-            decoded.extend_from_slice(&frame.u);
-            decoded.extend_from_slice(&frame.v);
+            decoded.extend_from_slice(frame.y.as_u8().unwrap());
+            decoded.extend_from_slice(frame.u.as_u8().unwrap());
+            decoded.extend_from_slice(frame.v.as_u8().unwrap());
             assert_eq!(
                 decoded, ref_frame,
                 "frame {} (POC {}) is not byte-exact against FFmpeg reference",
@@ -2708,9 +2683,9 @@ mod tests {
         for (i, nal) in nals.iter().enumerate() {
             match decoder.decode_nal(nal) {
                 Ok(Some(frame)) => {
-                    our_hasher.update(&frame.y);
-                    our_hasher.update(&frame.u);
-                    our_hasher.update(&frame.v);
+                    our_hasher.update(frame.y.as_u8().unwrap());
+                    our_hasher.update(frame.u.as_u8().unwrap());
+                    our_hasher.update(frame.v.as_u8().unwrap());
                     frame_count += 1;
                 }
                 Ok(None) => {}
@@ -2722,9 +2697,9 @@ mod tests {
         }
         // Flush any remaining frames.
         while let Some(frame) = decoder.flush() {
-            our_hasher.update(&frame.y);
-            our_hasher.update(&frame.u);
-            our_hasher.update(&frame.v);
+            our_hasher.update(frame.y.as_u8().unwrap());
+            our_hasher.update(frame.u.as_u8().unwrap());
+            our_hasher.update(frame.v.as_u8().unwrap());
             frame_count += 1;
         }
 
@@ -2763,6 +2738,21 @@ mod tests {
 
     /// Helper: decode a fixture, sort by POC, and return the SHA-256 hash
     /// of all planes concatenated in display order.
+    /// Hash a PixelData plane into a SHA-256 hasher. 8-bit hashes raw bytes;
+    /// 10-bit hashes each sample as two little-endian bytes (matching FFmpeg's
+    /// yuv420p10le output format).
+    fn hash_pixel_data(hasher: &mut sha2::Sha256, data: &crate::pixel::PixelData) {
+        use sha2::Digest;
+        match data {
+            crate::pixel::PixelData::U8(v) => hasher.update(v),
+            crate::pixel::PixelData::U16(v) => {
+                for &sample in v {
+                    hasher.update(&sample.to_le_bytes());
+                }
+            }
+        }
+    }
+
     fn decode_and_hash(fixture_name: &str, expected_frames: usize) -> String {
         use sha2::{Digest, Sha256};
 
@@ -2807,9 +2797,9 @@ mod tests {
 
         let mut hasher = Sha256::new();
         for frame in &frames {
-            hasher.update(&frame.y);
-            hasher.update(&frame.u);
-            hasher.update(&frame.v);
+            hash_pixel_data(&mut hasher, &frame.y);
+            hash_pixel_data(&mut hasher, &frame.u);
+            hash_pixel_data(&mut hasher, &frame.v);
         }
         hasher
             .finalize()
@@ -3348,6 +3338,35 @@ mod tests {
         assert_eq!(
             hash, expected,
             "pcm_hm hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// 128×128, 3 frames (I+P+P), **10-bit** Main 10 profile.
+    /// Exercises the full 10-bit decode path: `PictureState<u16>` planes,
+    /// 10-bit dequantization (with `qp_bd_offset = 12`), 10-bit inverse
+    /// transform (`shift = 20 - 10 = 10`), 10-bit MC filter shifts
+    /// (`mc_shift = 4`, `shift1 = 2`), 10-bit intra prediction, and
+    /// `PixelData::U16` output. Byte-exact against FFmpeg with
+    /// `yuv420p10le` output.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=128x128:rate=30:duration=0.2" \
+    ///   -frames:v 3 -pix_fmt yuv420p10le -f rawvideo /tmp/in10.yuv
+    /// x265 --input /tmp/in10.yuv --input-res 128x128 --fps 30 --frames 3 \
+    ///   --input-depth 10 --output-depth 10 \
+    ///   --preset ultrafast --ctu 16 --keyint 30 --no-open-gop --bframes 0 \
+    ///   --qp 26 --no-cutree --no-aq --no-sao --no-deblock --no-wpp \
+    ///   --no-info --no-psnr --no-ssim \
+    ///   -o 10bit_128x128.h265
+    /// ```
+    #[test]
+    fn test_decode_10bit_hash() {
+        let hash = decode_and_hash("10bit_128x128.h265", 3);
+        let expected = "27867ceb486a4a0996970873ee0725c1e82ee72a585e5e51c4939eb6916059c9";
+        assert_eq!(
+            hash, expected,
+            "10bit hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
     }
 }

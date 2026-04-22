@@ -543,7 +543,16 @@ pub fn decode_residual_coding(
     num_coeff += 1;
     let num_last_subset = ((num_coeff - 1) >> 4) as usize;
 
-    let (shift, add, scale) = compute_dequant_scale(qp, log2_trafo_size, sps.bit_depth_luma);
+    // Spec 8.6.3: the QP used for dequantization includes the bit-depth
+    // offset: qP = qPY + QpBdOffsetY (luma) or qP = qPC + QpBdOffsetC (chroma).
+    // QpBdOffset = 6 * (BitDepth - 8). For 8-bit this is 0; for 10-bit it's 12.
+    let bd = if plane == ResidualPlane::Luma {
+        sps.bit_depth_luma
+    } else {
+        sps.bit_depth_chroma
+    };
+    let qp_bd_offset = 6 * (bd as i32 - 8);
+    let (shift, add, scale) = compute_dequant_scale(qp + qp_bd_offset, log2_trafo_size, bd);
 
     // Resolve the active scaling matrix and DC scale value.
     let (scale_matrix, dc_scale) =

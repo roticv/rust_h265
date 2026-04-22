@@ -82,7 +82,7 @@ pub mod nal;
 pub use decoder::{Decoder, Frame};
 pub use error::DecodeError;
 pub use nal::{parse_annex_b, NalUnit, NalUnitType};
-pub use pixel::Pixel;
+pub use pixel::{Pixel, PixelData};
 
 #[cfg(test)]
 mod parameter_set_tests {

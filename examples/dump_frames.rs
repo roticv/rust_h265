@@ -4,10 +4,25 @@
 //!   cargo run --release --example dump_frames -- <in.h265> <out.yuv>
 //!
 //! Intended for byte-exact verification against FFmpeg's HEVC decoder:
-//!   ffmpeg -i <in.h265> -f rawvideo -pix_fmt yuv420p ref.yuv
+//!   ffmpeg -i <in.h265> -f rawvideo -pix_fmt yuv420p ref.yuv      # 8-bit
+//!   ffmpeg -i <in.h265> -f rawvideo -pix_fmt yuv420p10le ref.yuv  # 10-bit
 //!   cmp ref.yuv out.yuv
 
+use rust_h265::PixelData;
 use std::io::Write;
+
+/// Write a pixel plane to the output. 8-bit writes raw bytes; 10-bit writes
+/// each sample as two little-endian bytes (matching FFmpeg's yuv420p10le).
+fn write_plane(out: &mut impl Write, plane: &PixelData) {
+    match plane {
+        PixelData::U8(data) => out.write_all(data).unwrap(),
+        PixelData::U16(data) => {
+            for &sample in data {
+                out.write_all(&sample.to_le_bytes()).unwrap();
+            }
+        }
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -39,9 +54,9 @@ fn main() {
     frames.sort_by_key(|f| f.pic_order_cnt);
 
     for f in &frames {
-        out.write_all(&f.y).unwrap();
-        out.write_all(&f.u).unwrap();
-        out.write_all(&f.v).unwrap();
+        write_plane(&mut out, &f.y);
+        write_plane(&mut out, &f.u);
+        write_plane(&mut out, &f.v);
     }
     eprintln!(
         "wrote {} frames ({}x{}) to {}",
