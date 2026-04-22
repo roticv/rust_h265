@@ -223,6 +223,13 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
     if tiles_enabled_flag {
         let num_tile_columns_minus1 = r.read_ue()?;
         let num_tile_rows_minus1 = r.read_ue()?;
+        // Max valid: one tile per CTB. At 16384/16=1024 CTBs per dimension,
+        // 1024 tiles is the absolute max. Cap to prevent OOM on crafted input.
+        if num_tile_columns_minus1 > 1024 || num_tile_rows_minus1 > 1024 {
+            return Err(DecodeError::InvalidSyntax(
+                "num_tile_columns/rows too large",
+            ));
+        }
         num_tile_columns = (num_tile_columns_minus1 + 1) as usize;
         num_tile_rows = (num_tile_rows_minus1 + 1) as usize;
         uniform_spacing_flag = r.read_bit()? == 1;

@@ -3539,6 +3539,15 @@ mod tests {
         ]);
     }
 
+    /// PPS huge tile columns/rows causing OOM (oom-b1c9dbd8).
+    #[test]
+    fn test_fuzz_pps_tile_oom() {
+        fuzz_hvcc(&[
+            0, 12, 68, 9, 255, 253, 10, 237, 0, 0, 0, 2, 239, 0, 0, 6, 2,
+            3, 3, 0, 1, 0, 0, 0, 0, 115, 237, 42, 0, 2,
+        ]);
+    }
+
     /// SPS log2 transform block size overflow on u8 add (crash-249a158e).
     #[test]
     fn test_fuzz_sps_tb_size_overflow() {
