@@ -3381,116 +3381,104 @@ mod tests {
         );
     }
 
-    /// Regression test for fuzz crash: CABAC reinit with byte offset past
-    /// end of RBSP. Before the fix, `CabacReader::reinit_at` used `assert!`
-    /// which panicked on malformed input. Now returns `DecodeError`.
-    /// Found by: `cargo fuzz run decode_annex_b` (crash-aeb0d7c8).
-    #[test]
-    fn test_fuzz_cabac_reinit_oob() {
-        let data: &[u8] = &[
-            0, 0, 0, 1, 64, 1, 12, 2, 255, 255, 1, 96, 0, 0, 3, 0, 128, 0,
-            0, 3, 0, 0, 3, 0, 186, 0, 0, 4, 2, 16, 36, 0, 0, 0, 1, 66, 1, 2,
-            1, 96, 0, 0, 3, 0, 128, 0, 0, 3, 0, 0, 3, 0, 186, 0, 0, 160, 8,
-            8, 4, 5, 176, 64, 33, 146, 76, 42, 1, 0, 0, 3, 3, 232, 0, 0,
-            117, 48, 8, 0, 0, 0, 1, 68, 1, 224, 113, 130, 153, 32, 0, 0, 1,
-            38, 1, 172, 228, 25, 11, 39, 192, 105, 240, 16,
-        ];
+    // ---- Fuzz regression helpers ----
+    // Each helper decodes malformed input and asserts no panic. Errors are
+    // expected — the invariant is "return Err, don't crash".
+
+    /// Decode raw Annex B data — must not panic.
+    fn fuzz_annex_b(data: &[u8]) {
         let nals = parse_annex_b(data);
         let mut decoder = Decoder::new();
         for nal in &nals {
-            // Must not panic — should return Ok or Err.
             let _ = decoder.decode_nal(nal);
         }
+        while decoder.flush().is_some() {}
     }
 
-    /// Regression test for fuzz crash: `bit_depth_luma_minus8` from read_ue()
-    /// can be a large u32 value. Casting to u8 and adding 8 caused arithmetic
-    /// overflow. Now validated before the cast.
-    /// Found by: `cargo fuzz run decode_single_nal` (crash-affb98ea).
+    /// Replicate `decode_single_nal` fuzz target framing: first two bytes
+    /// select NAL type and tid, rest is payload wrapped in Annex B.
+    fn fuzz_single_nal(fuzz_input: &[u8]) {
+        if fuzz_input.len() < 3 {
+            return;
+        }
+        let nal_type = fuzz_input[0] & 0x3f;
+        let temporal_id = (fuzz_input[1] & 0x07).max(1);
+        let mut annex_b = vec![0x00, 0x00, 0x00, 0x01];
+        annex_b.push((nal_type << 1) & 0x7e);
+        annex_b.push(temporal_id & 0x07);
+        annex_b.extend_from_slice(&fuzz_input[2..]);
+        fuzz_annex_b(&annex_b);
+    }
+
+    /// Replicate `decode_hvcc` fuzz target framing: first byte selects
+    /// length_size, rest is HVCC payload.
+    fn fuzz_hvcc(fuzz_input: &[u8]) {
+        if fuzz_input.is_empty() {
+            return;
+        }
+        let length_size = (fuzz_input[0] % 4) + 1;
+        let nals = crate::nal::parse_hvcc(&fuzz_input[1..], length_size);
+        let mut decoder = Decoder::new();
+        for nal in &nals {
+            let _ = decoder.decode_nal(nal);
+        }
+        while decoder.flush().is_some() {}
+    }
+
+    // ---- Fuzz regression tests ----
+
+    /// CABAC reinit with byte offset past end of RBSP (crash-aeb0d7c8).
+    #[test]
+    fn test_fuzz_cabac_reinit_oob() {
+        fuzz_annex_b(&[
+            0, 0, 0, 1, 64, 1, 12, 2, 255, 255, 1, 96, 0, 0, 3, 0, 128, 0,
+            0, 3, 0, 0, 3, 0, 186, 0, 0, 4, 2, 16, 36, 0, 0, 0, 1, 66, 1,
+            2, 1, 96, 0, 0, 3, 0, 128, 0, 0, 3, 0, 0, 3, 0, 186, 0, 0, 160,
+            8, 8, 4, 5, 176, 64, 33, 146, 76, 42, 1, 0, 0, 3, 3, 232, 0, 0,
+            117, 48, 8, 0, 0, 0, 1, 68, 1, 224, 113, 130, 153, 32, 0, 0, 1,
+            38, 1, 172, 228, 25, 11, 39, 192, 105, 240, 16,
+        ]);
+    }
+
+    /// `bit_depth_luma_minus8` overflow on cast to u8 (crash-affb98ea).
     #[test]
     fn test_fuzz_sps_bit_depth_overflow() {
-        // Replicate decode_single_nal framing: first two bytes select NAL
-        // type and tid, rest is payload. Wrap in Annex B start code.
-        let fuzz_input: &[u8] = &[
+        fuzz_single_nal(&[
             97, 20, 0, 0, 0, 64, 0, 235, 0, 0, 178, 0, 0, 178, 178, 0, 0,
             64, 0, 235, 0, 0, 178, 0, 0, 178, 178, 0, 0, 0, 64, 0, 235, 0,
             0, 178, 178, 178, 0, 0, 20, 165,
-        ];
-        // Build Annex B NAL from fuzz input (same as decode_single_nal target).
-        let nal_type = fuzz_input[0] & 0x3f;
-        let temporal_id = (fuzz_input[1] & 0x07).max(1);
-        let mut annex_b = vec![0x00, 0x00, 0x00, 0x01];
-        annex_b.push((nal_type << 1) & 0x7e);
-        annex_b.push(temporal_id & 0x07);
-        annex_b.extend_from_slice(&fuzz_input[2..]);
-
-        let nals = parse_annex_b(&annex_b);
-        let mut decoder = Decoder::new();
-        for nal in &nals {
-            let _ = decoder.decode_nal(nal);
-        }
+        ]);
     }
 
-    /// Regression test for fuzz OOM: crafted SPS with huge dimensions caused
-    /// unbounded allocation in PictureState::new. Now validated in parse_sps.
-    /// Found by: `cargo fuzz run decode_hvcc` (oom-7aff3154).
+    /// Huge SPS dimensions causing OOM (oom-7aff3154).
     #[test]
     fn test_fuzz_sps_huge_dimensions_oom() {
-        let fuzz_input: &[u8] = &[
+        fuzz_hvcc(&[
             0, 20, 69, 7, 126, 10, 31, 0, 0, 0, 250, 48, 0, 47, 28, 0, 0,
             0, 4, 7, 250, 0, 0, 28, 117, 0, 4, 7, 250, 0, 0, 0,
-        ];
-        // decode_hvcc framing: first byte selects length_size
-        let length_size = (fuzz_input[0] % 4) + 1;
-        let payload = &fuzz_input[1..];
-        let nals = crate::nal::parse_hvcc(payload, length_size);
-        let mut decoder = Decoder::new();
-        for nal in &nals {
-            let _ = decoder.decode_nal(nal);
-        }
+        ]);
     }
 
-    /// Regression test for fuzz crash: bitstream reader read past end of
-    /// data in read_bit(). Now bounds-checked on every read_bit() call.
-    /// Found by: `cargo fuzz run decode_single_nal` (crash-393a61db).
+    /// Bitstream reader read past end (crash-393a61db).
     #[test]
     fn test_fuzz_bitstream_read_oob() {
-        let fuzz_input: &[u8] = &[
+        fuzz_single_nal(&[
             160, 0, 16, 188, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255, 255,
             0, 57, 0, 0, 35, 192, 61, 1, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 3,
             62, 0, 78, 0, 3, 6, 0, 160,
-        ];
-        let nal_type = fuzz_input[0] & 0x3f;
-        let temporal_id = (fuzz_input[1] & 0x07).max(1);
-        let mut annex_b = vec![0x00, 0x00, 0x00, 0x01];
-        annex_b.push((nal_type << 1) & 0x7e);
-        annex_b.push(temporal_id & 0x07);
-        annex_b.extend_from_slice(&fuzz_input[2..]);
-        let nals = parse_annex_b(&annex_b);
-        let mut decoder = Decoder::new();
-        for nal in &nals {
-            let _ = decoder.decode_nal(nal);
-        }
+        ]);
     }
 
-    /// Regression test for fuzz crash: truncated slice data causes bitstream
-    /// reader to read past end in SPS/slice parsing. Same root cause as
-    /// test_fuzz_bitstream_read_oob but via decode_annex_b path.
-    /// Found by: `cargo fuzz run decode_annex_b` (crash-5db2d906).
+    /// Truncated slice data bitstream overread (crash-5db2d906).
     #[test]
     fn test_fuzz_bitstream_read_oob_annex_b() {
-        let data: &[u8] = &[
+        fuzz_annex_b(&[
             0, 0, 0, 1, 64, 1, 12, 1, 255, 255, 3, 112, 0, 0, 3, 0, 144,
             0, 49, 3, 0, 0, 3, 0, 30, 186, 2, 64, 0, 0, 0, 1, 66, 1, 1, 3,
             112, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 30, 160, 136, 42,
             150, 233, 111, 133, 192, 32, 0, 0, 121, 0, 0, 3, 0, 125, 1, 0,
             0, 0, 1, 70, 1, 192, 113, 129, 164, 128, 0, 0, 1, 40, 1, 172,
             76, 220, 96, 80, 128,
-        ];
-        let nals = parse_annex_b(data);
-        let mut decoder = Decoder::new();
-        for nal in &nals {
-            let _ = decoder.decode_nal(nal);
-        }
+        ]);
     }
 }
