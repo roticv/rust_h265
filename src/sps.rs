@@ -432,6 +432,19 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
 
     let pic_width_in_luma_samples = r.read_ue()?;
     let pic_height_in_luma_samples = r.read_ue()?;
+    // Sanity-check dimensions to prevent OOM on crafted bitstreams.
+    // HEVC Level 6.2 max is 8192×4320; we allow up to 16384×16384 for
+    // headroom. The pixel plane allocation is O(w*h) so unchecked values
+    // from a malicious SPS could exhaust memory.
+    if pic_width_in_luma_samples == 0
+        || pic_height_in_luma_samples == 0
+        || pic_width_in_luma_samples > 16384
+        || pic_height_in_luma_samples > 16384
+    {
+        return Err(DecodeError::InvalidSyntax(
+            "pic_width/height_in_luma_samples out of range (0 or >16384)",
+        ));
+    }
 
     let conformance_window_flag = r.read_bit()? == 1;
     let mut conf_win_left_offset = 0u32;

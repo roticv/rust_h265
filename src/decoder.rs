@@ -3430,4 +3430,23 @@ mod tests {
             let _ = decoder.decode_nal(nal);
         }
     }
+
+    /// Regression test for fuzz OOM: crafted SPS with huge dimensions caused
+    /// unbounded allocation in PictureState::new. Now validated in parse_sps.
+    /// Found by: `cargo fuzz run decode_hvcc` (oom-7aff3154).
+    #[test]
+    fn test_fuzz_sps_huge_dimensions_oom() {
+        let fuzz_input: &[u8] = &[
+            0, 20, 69, 7, 126, 10, 31, 0, 0, 0, 250, 48, 0, 47, 28, 0, 0,
+            0, 4, 7, 250, 0, 0, 28, 117, 0, 4, 7, 250, 0, 0, 0,
+        ];
+        // decode_hvcc framing: first byte selects length_size
+        let length_size = (fuzz_input[0] % 4) + 1;
+        let payload = &fuzz_input[1..];
+        let nals = crate::nal::parse_hvcc(payload, length_size);
+        let mut decoder = Decoder::new();
+        for nal in &nals {
+            let _ = decoder.decode_nal(nal);
+        }
+    }
 }
