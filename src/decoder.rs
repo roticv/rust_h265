@@ -3472,4 +3472,25 @@ mod tests {
             let _ = decoder.decode_nal(nal);
         }
     }
+
+    /// Regression test for fuzz crash: truncated slice data causes bitstream
+    /// reader to read past end in SPS/slice parsing. Same root cause as
+    /// test_fuzz_bitstream_read_oob but via decode_annex_b path.
+    /// Found by: `cargo fuzz run decode_annex_b` (crash-5db2d906).
+    #[test]
+    fn test_fuzz_bitstream_read_oob_annex_b() {
+        let data: &[u8] = &[
+            0, 0, 0, 1, 64, 1, 12, 1, 255, 255, 3, 112, 0, 0, 3, 0, 144,
+            0, 49, 3, 0, 0, 3, 0, 30, 186, 2, 64, 0, 0, 0, 1, 66, 1, 1, 3,
+            112, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 30, 160, 136, 42,
+            150, 233, 111, 133, 192, 32, 0, 0, 121, 0, 0, 3, 0, 125, 1, 0,
+            0, 0, 1, 70, 1, 192, 113, 129, 164, 128, 0, 0, 1, 40, 1, 172,
+            76, 220, 96, 80, 128,
+        ];
+        let nals = parse_annex_b(data);
+        let mut decoder = Decoder::new();
+        for nal in &nals {
+            let _ = decoder.decode_nal(nal);
+        }
+    }
 }
