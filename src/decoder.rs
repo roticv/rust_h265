@@ -213,7 +213,9 @@ impl TileScanTables {
                 + (tb_x - col_bd[tile_x]);
 
             rs_to_ts[ctb_addr_rs] = val;
-            ts_to_rs[val as usize] = ctb_addr_rs as u32;
+            if (val as usize) < total {
+                ts_to_rs[val as usize] = ctb_addr_rs as u32;
+            }
         }
 
         // Tile id per CTB raster address. Flattening by tile-row then
@@ -224,7 +226,9 @@ impl TileScanTables {
                 for y in row_bd[j]..row_bd[j + 1] {
                     for x in col_bd[i]..col_bd[i + 1] {
                         let rs = (y as usize) * pic_w_ctbs + x as usize;
-                        tile_id[rs] = cur_id;
+                        if rs < total {
+                            tile_id[rs] = cur_id;
+                        }
                     }
                 }
                 cur_id += 1;
@@ -3519,6 +3523,19 @@ mod tests {
             0, 31, 68, 68, 0, 59, 7, 198, 255, 44, 0, 0, 0, 4, 85, 85, 40,
             1, 0, 170, 170, 170, 170, 170, 0, 0, 0, 0, 0, 14, 85, 219, 219,
             153,
+        ]);
+    }
+
+    /// TileScanTables::build index OOB with malformed PPS tile geometry
+    /// (crash-2ae82f61). Truncated to VPS+SPS+PPS that trigger the issue.
+    #[test]
+    fn test_fuzz_tile_scan_oob() {
+        fuzz_annex_b(&[
+            0, 0, 0, 1, 64, 1, 12, 2, 255, 255, 1, 96, 0, 0, 3, 0, 128, 0,
+            0, 3, 0, 0, 3, 0, 186, 0, 0, 44, 9, 0, 0, 0, 1, 66, 1, 2, 1,
+            96, 0, 0, 3, 0, 128, 0, 0, 3, 0, 0, 3, 0, 186, 0, 0, 160, 8, 8,
+            4, 5, 203, 146, 76, 34, 1, 0, 0, 3, 3, 232, 0, 0, 3, 3, 232, 8,
+            0, 0, 0, 1, 68, 1, 192, 108, 97, 37, 41, 32,
         ]);
     }
 }
