@@ -31,10 +31,11 @@ impl BitstreamReader {
     }
 
     /// Read a single bit, returning 0 or 1.
-    /// Does not bounds-check on every call; relies on padding to avoid
-    /// out-of-bounds reads. Call `bits_remaining` to check before bulk reads.
     #[inline(always)]
     pub fn read_bit(&mut self) -> Result<u8, &'static str> {
+        if self.byte_offset >= self.data.len() {
+            return Err("unexpected end of bitstream");
+        }
         let bit = (self.data[self.byte_offset] >> (7 - self.bit_offset)) & 1;
         self.bit_offset += 1;
         if self.bit_offset == 8 {

@@ -3449,4 +3449,27 @@ mod tests {
             let _ = decoder.decode_nal(nal);
         }
     }
+
+    /// Regression test for fuzz crash: bitstream reader read past end of
+    /// data in read_bit(). Now bounds-checked on every read_bit() call.
+    /// Found by: `cargo fuzz run decode_single_nal` (crash-393a61db).
+    #[test]
+    fn test_fuzz_bitstream_read_oob() {
+        let fuzz_input: &[u8] = &[
+            160, 0, 16, 188, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255, 255,
+            0, 57, 0, 0, 35, 192, 61, 1, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 3,
+            62, 0, 78, 0, 3, 6, 0, 160,
+        ];
+        let nal_type = fuzz_input[0] & 0x3f;
+        let temporal_id = (fuzz_input[1] & 0x07).max(1);
+        let mut annex_b = vec![0x00, 0x00, 0x00, 0x01];
+        annex_b.push((nal_type << 1) & 0x7e);
+        annex_b.push(temporal_id & 0x07);
+        annex_b.extend_from_slice(&fuzz_input[2..]);
+        let nals = parse_annex_b(&annex_b);
+        let mut decoder = Decoder::new();
+        for nal in &nals {
+            let _ = decoder.decode_nal(nal);
+        }
+    }
 }
