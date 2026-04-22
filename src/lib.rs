@@ -81,7 +81,7 @@ pub mod nal;
 // --- Top-level re-exports for convenience ---
 pub use decoder::{Decoder, Frame};
 pub use error::DecodeError;
-pub use nal::{parse_annex_b, NalUnit, NalUnitType};
+pub use nal::{NalUnit, NalUnitType, parse_annex_b};
 pub use pixel::{Pixel, PixelData};
 
 #[cfg(test)]

@@ -20,7 +20,6 @@ use std::rc::Rc;
 
 use crate::cabac::{CabacContexts, CabacReader};
 use crate::cu_tree::{PictureState, decode_coding_quadtree};
-use crate::pixel::{Pixel, PixelData};
 use crate::dpb::{
     DecodedPicture, DecodedPictureBuffer, PictureReferenceStatus, ReferencePictureSets,
     apply_ref_pic_list_modification, build_ref_pic_list_temp0, build_ref_pic_list_temp1,
@@ -28,6 +27,7 @@ use crate::dpb::{
 };
 use crate::error::DecodeError;
 use crate::nal::{NalUnit, NalUnitType};
+use crate::pixel::{Pixel, PixelData};
 use crate::pps::{Pps, parse_pps};
 use crate::slice::{SliceHeader, SliceType, parse_slice_segment_header};
 use crate::sps::{ShortTermRps, Sps, parse_sps};
@@ -81,8 +81,8 @@ enum PictureStateEnum {
 macro_rules! with_picture_state {
     ($pic:expr, |$state:ident| $body:expr) => {
         match $pic {
-            &mut PictureStateEnum::U8(ref mut $state) => { $body }
-            &mut PictureStateEnum::U16(ref mut $state) => { $body }
+            &mut PictureStateEnum::U8(ref mut $state) => $body,
+            &mut PictureStateEnum::U16(ref mut $state) => $body,
         }
     };
 }
@@ -91,8 +91,8 @@ macro_rules! with_picture_state {
 macro_rules! with_picture_state_ref {
     ($pic:expr, |$state:ident| $body:expr) => {
         match $pic {
-            &PictureStateEnum::U8(ref $state) => { $body }
-            &PictureStateEnum::U16(ref $state) => { $body }
+            &PictureStateEnum::U8(ref $state) => $body,
+            &PictureStateEnum::U16(ref $state) => $body,
         }
     };
 }
@@ -631,7 +631,8 @@ impl Decoder {
                 let sps_st_rps = sps_for_rps.st_ref_pic_sets.clone();
                 let log2_max_poc_lsb = sps_for_rps.log2_max_pic_order_cnt_lsb;
                 self.dpb.configure_from_sps(sps_for_rps);
-                let rps = Self::derive_rps_from_slice_header_parts(&sh, &sps_st_rps, log2_max_poc_lsb);
+                let rps =
+                    Self::derive_rps_from_slice_header_parts(&sh, &sps_st_rps, log2_max_poc_lsb);
                 Self::apply_rps_marking(&rps, &self.dpb, log2_max_poc_lsb);
                 self.current_rps = rps;
                 let (l0, l1) = Self::build_ref_pic_lists(&self.current_rps, &self.dpb, &sh)?;
@@ -785,8 +786,14 @@ impl Decoder {
         // The CTB loop, deblock, SAO, and DPB insertion all operate on a
         // generic PictureState<P>. Dispatch once via the enum variant and
         // execute the entire inner body monomorphized for the right P.
-        let ctb_loop_result: Result<(u32, Option<[u8; crate::cabac_tables::HEVC_CONTEXTS]>, [u8; crate::cabac_tables::HEVC_CONTEXTS]), DecodeError> =
-            with_picture_state!(&mut pic.state, |state| {
+        let ctb_loop_result: Result<
+            (
+                u32,
+                Option<[u8; crate::cabac_tables::HEVC_CONTEXTS]>,
+                [u8; crate::cabac_tables::HEVC_CONTEXTS],
+            ),
+            DecodeError,
+        > = with_picture_state!(&mut pic.state, |state| {
             let mut more_data = true;
             let mut ctb_addr_ts: u32 = slice_start_ts;
             let mut substream_idx: u32 = 0;
@@ -801,7 +808,8 @@ impl Decoder {
                 } else {
                     let prev_ts = ctb_addr_ts - 1;
                     let prev_rs = tile_tables.ctb_addr_ts_to_rs[prev_ts as usize];
-                    tile_tables.tile_id[ctb_addr_rs as usize] != tile_tables.tile_id[prev_rs as usize]
+                    tile_tables.tile_id[ctb_addr_rs as usize]
+                        != tile_tables.tile_id[prev_rs as usize]
                 };
 
                 let is_row_start = col == 0;
@@ -1113,11 +1121,10 @@ impl Decoder {
         let cur_poc = sh.poc;
         let cur_poc_lsb = sh.slice_pic_order_cnt_lsb as i32;
         let num_lt_sps = sh.long_term_rps.poc_lsb_lt.len()
-            - sh.long_term_rps.poc_lsb_lt.len().min(
-                sh.long_term_rps
-                    .delta_poc_msb_cycle_lt
-                    .len(),
-            );
+            - sh.long_term_rps
+                .poc_lsb_lt
+                .len()
+                .min(sh.long_term_rps.delta_poc_msb_cycle_lt.len());
         let _ = num_lt_sps; // suppress unused warning
         let mut prev_delta_msb: i64 = 0;
 
@@ -1147,9 +1154,8 @@ impl Decoder {
                 };
                 prev_delta_msb = delta;
                 // FFmpeg: poc = rps->poc[i] + cur_poc - delta * max_poc_lsb - poc_lsb
-                (*poc_lsb as i64 + cur_poc as i64
-                    - delta * max_poc_lsb as i64
-                    - cur_poc_lsb as i64) as i32
+                (*poc_lsb as i64 + cur_poc as i64 - delta * max_poc_lsb as i64 - cur_poc_lsb as i64)
+                    as i32
             } else {
                 *poc_lsb as i32
             };
@@ -1389,7 +1395,14 @@ mod tests {
     }
 
     fn test_decoded_picture(poc: i32) -> Rc<DecodedPicture> {
-        Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 16, 16, poc))
+        Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            16,
+            16,
+            poc,
+        ))
     }
 
     #[test]

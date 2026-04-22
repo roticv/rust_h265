@@ -451,10 +451,11 @@ pub fn decode_residual_coding(
     // In Main Profile, transform_skip is only allowed for 4×4 TUs
     // (log2_max_transform_skip_block_size defaults to 2 without range extensions).
     // When cu_transquant_bypass is set, transform_skip_flag is not decoded (spec 7.3.8.11).
-    let transform_skip = !cu_transquant_bypass && pps.transform_skip_enabled_flag && log2_trafo_size <= 2 && {
-        let inc = if plane == ResidualPlane::Luma { 0 } else { 1 };
-        cabac.decode_bin(&mut contexts.state[ctx::TRANSFORM_SKIP_FLAG + inc]) != 0
-    };
+    let transform_skip =
+        !cu_transquant_bypass && pps.transform_skip_enabled_flag && log2_trafo_size <= 2 && {
+            let inc = if plane == ResidualPlane::Luma { 0 } else { 1 };
+            cabac.decode_bin(&mut contexts.state[ctx::TRANSFORM_SKIP_FLAG + inc]) != 0
+        };
 
     // Horizontal and vertical scan orders are used for angular intra modes
     // 6..14 (vert) and 22..30 (horiz) at log2_trafo_size <= 3.
@@ -735,8 +736,9 @@ pub fn decode_residual_coding(
         // implicit_rdpcm_enabled is active (a Range Extension feature we
         // don't support). cu_transquant_bypass_flag disables SDH per spec.
         // See FFmpeg cabac.c:1348-1355 for the full gate.
-        let sign_hidden =
-            pps.sign_data_hiding_enabled_flag && !cu_transquant_bypass && (last_nz_pos_in_cg - first_nz_pos_in_cg >= 4);
+        let sign_hidden = pps.sign_data_hiding_enabled_flag
+            && !cu_transquant_bypass
+            && (last_nz_pos_in_cg - first_nz_pos_in_cg >= 4);
 
         // Sign flags (bypass). When SDH is active on this sub-block, the
         // encoder omitted the sign bit of the first non-zero coefficient in

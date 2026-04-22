@@ -254,17 +254,12 @@ pub fn predict_dc<P: Pixel>(
         );
         // Top row x = 1..size: (top[x] + 3*dc + 2) >> 2
         for x in 1..size {
-            dst[x] = P::from_i32_clamped(
-                ((top_p[x].to_i32()) + 3 * dc_val + 2) >> 2,
-                bit_depth,
-            );
+            dst[x] = P::from_i32_clamped(((top_p[x].to_i32()) + 3 * dc_val + 2) >> 2, bit_depth);
         }
         // Left column y = 1..size: (left[y] + 3*dc + 2) >> 2
         for y in 1..size {
-            dst[y * dst_stride] = P::from_i32_clamped(
-                ((left_p[y].to_i32()) + 3 * dc_val + 2) >> 2,
-                bit_depth,
-            );
+            dst[y * dst_stride] =
+                P::from_i32_clamped(((left_p[y].to_i32()) + 3 * dc_val + 2) >> 2, bit_depth);
         }
     }
 }
@@ -334,9 +329,7 @@ pub fn predict_angular<P: Pixel>(
                 for x in 0..size {
                     let ri = (ref_origin as i32 + x as i32 + idx + 1) as usize;
                     dst[y * dst_stride + x] = P::from_i32_clamped(
-                        ((32 - fact) * ref_buf[ri].to_i32()
-                            + fact * ref_buf[ri + 1].to_i32()
-                            + 16)
+                        ((32 - fact) * ref_buf[ri].to_i32() + fact * ref_buf[ri + 1].to_i32() + 16)
                             >> 5,
                         bit_depth,
                     );
@@ -352,8 +345,7 @@ pub fn predict_angular<P: Pixel>(
         // Mode 26 (pure vertical) luma boundary filter.
         if mode == 26 && c_idx == 0 && size < 32 {
             for y in 0..size {
-                let val =
-                    top_p[0].to_i32() + ((left_p[y].to_i32() - corner.to_i32()) >> 1);
+                let val = top_p[0].to_i32() + ((left_p[y].to_i32() - corner.to_i32()) >> 1);
                 dst[y * dst_stride] = P::from_i32_clamped(val, bit_depth);
             }
         }
@@ -381,9 +373,7 @@ pub fn predict_angular<P: Pixel>(
                 for y in 0..size {
                     let ri = (ref_origin as i32 + y as i32 + idx + 1) as usize;
                     dst[y * dst_stride + x] = P::from_i32_clamped(
-                        ((32 - fact) * ref_buf[ri].to_i32()
-                            + fact * ref_buf[ri + 1].to_i32()
-                            + 16)
+                        ((32 - fact) * ref_buf[ri].to_i32() + fact * ref_buf[ri + 1].to_i32() + 16)
                             >> 5,
                         bit_depth,
                     );
@@ -399,8 +389,7 @@ pub fn predict_angular<P: Pixel>(
         // Mode 10 (pure horizontal) luma boundary filter.
         if mode == 10 && c_idx == 0 && size < 32 {
             for x in 0..size {
-                let val =
-                    left_p[0].to_i32() + ((top_p[x].to_i32() - corner.to_i32()) >> 1);
+                let val = left_p[0].to_i32() + ((top_p[x].to_i32() - corner.to_i32()) >> 1);
                 dst[x] = P::from_i32_clamped(val, bit_depth);
             }
         }
@@ -458,13 +447,10 @@ pub fn filter_reference_samples<P: Pixel>(
     if strong_intra_smoothing_enabled && c_idx == 0 && log2_size == 5 {
         // threshold = 1 << (BitDepth - 5)
         let threshold = 1i32 << (bit_depth as i32 - 5);
-        let top_smooth = (top[0].to_i32() + top[2 * size].to_i32()
-            - 2 * top[size].to_i32())
-        .abs()
-            < threshold;
-        let left_smooth = (left[0].to_i32() + left[2 * size].to_i32()
-            - 2 * left[size].to_i32())
-        .abs()
+        let top_smooth =
+            (top[0].to_i32() + top[2 * size].to_i32() - 2 * top[size].to_i32()).abs() < threshold;
+        let left_smooth = (left[0].to_i32() + left[2 * size].to_i32() - 2 * left[size].to_i32())
+            .abs()
             < threshold;
         if top_smooth && left_smooth {
             // Strong smoothing: linear interpolation between corner and edge.

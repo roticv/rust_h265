@@ -113,7 +113,14 @@ pub fn mc_luma<P: Pixel>(
         for j in 0..n_pb_h {
             for i in 0..n_pb_w {
                 dst[j * dst_stride + i] = P::from_i32_clamped(
-                    ref_sample(ref_plane, ref_stride, x_int + i as i32, y_int + j as i32, ref_w, ref_h),
+                    ref_sample(
+                        ref_plane,
+                        ref_stride,
+                        x_int + i as i32,
+                        y_int + j as i32,
+                        ref_w,
+                        ref_h,
+                    ),
                     bit_depth,
                 );
             }
@@ -130,7 +137,8 @@ pub fn mc_luma<P: Pixel>(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx + k as i32 - 3, ry, ref_w, ref_h);
                 }
-                dst[j * dst_stride + i] = P::from_i32_clamped(((val >> shift1) + offset) >> shift, bit_depth);
+                dst[j * dst_stride + i] =
+                    P::from_i32_clamped(((val >> shift1) + offset) >> shift, bit_depth);
             }
         }
     } else if x_frac == 0 {
@@ -145,7 +153,8 @@ pub fn mc_luma<P: Pixel>(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx, ry + k as i32 - 3, ref_w, ref_h);
                 }
-                dst[j * dst_stride + i] = P::from_i32_clamped(((val >> shift1) + offset) >> shift, bit_depth);
+                dst[j * dst_stride + i] =
+                    P::from_i32_clamped(((val >> shift1) + offset) >> shift, bit_depth);
             }
         }
     } else {
@@ -438,7 +447,14 @@ pub fn mc_chroma<P: Pixel>(
         for j in 0..n_pb_h_c {
             for i in 0..n_pb_w_c {
                 dst[j * dst_stride + i] = P::from_i32_clamped(
-                    ref_sample(ref_plane, ref_stride, x_int + i as i32, y_int + j as i32, ref_w, ref_h),
+                    ref_sample(
+                        ref_plane,
+                        ref_stride,
+                        x_int + i as i32,
+                        y_int + j as i32,
+                        ref_w,
+                        ref_h,
+                    ),
                     bit_depth,
                 );
             }
@@ -454,7 +470,8 @@ pub fn mc_chroma<P: Pixel>(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx + k as i32 - 1, ry, ref_w, ref_h);
                 }
-                dst[j * dst_stride + i] = P::from_i32_clamped(((val >> shift1) + offset) >> shift, bit_depth);
+                dst[j * dst_stride + i] =
+                    P::from_i32_clamped(((val >> shift1) + offset) >> shift, bit_depth);
             }
         }
     } else if x_frac == 0 {
@@ -468,7 +485,8 @@ pub fn mc_chroma<P: Pixel>(
                     val += coeff as i32
                         * ref_sample(ref_plane, ref_stride, rx, ry + k as i32 - 1, ref_w, ref_h);
                 }
-                dst[j * dst_stride + i] = P::from_i32_clamped(((val >> shift1) + offset) >> shift, bit_depth);
+                dst[j * dst_stride + i] =
+                    P::from_i32_clamped(((val >> shift1) + offset) >> shift, bit_depth);
             }
         }
     } else {
@@ -686,8 +704,7 @@ pub fn motion_compensation_pu<P: Pixel>(
         for j in 0..h {
             for i in 0..w {
                 let idx = j * w + i;
-                let avg =
-                    (pred_l0_y[idx] + pred_l1_y[idx] + bi_offset) >> bi_shift;
+                let avg = (pred_l0_y[idx] + pred_l1_y[idx] + bi_offset) >> bi_shift;
                 let dst_idx = y_off + j * y_stride + i;
                 if dst_idx < state.y_plane.len() {
                     state.y_plane[dst_idx] = P::from_i32_clamped(avg, bit_depth);

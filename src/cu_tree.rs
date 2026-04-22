@@ -23,10 +23,10 @@ use crate::intra_pred::{
     predict_angular, predict_dc, predict_planar,
 };
 use crate::inverse_transform::apply_inverse_transform;
+use crate::pixel::Pixel;
 use crate::pps::Pps;
 use crate::residual_coding::{ResidualBlock, ResidualPlane, ScanOrder, decode_residual_coding};
 use crate::slice::SliceType;
-use crate::pixel::Pixel;
 use crate::sps::Sps;
 
 /// HEVC luma intra prediction mode constants (spec table 8-1).
@@ -686,7 +686,13 @@ fn decode_split_cu_flag<P: Pixel>(
     Ok(cabac.decode_bin(&mut contexts.state[ctx::SPLIT_CODING_UNIT_FLAG + inc]))
 }
 
-fn set_ct_depth<P: Pixel>(state: &mut PictureState<P>, x0: u32, y0: u32, log2_cb_size: u8, cb_depth: u8) {
+fn set_ct_depth<P: Pixel>(
+    state: &mut PictureState<P>,
+    x0: u32,
+    y0: u32,
+    log2_cb_size: u8,
+    cb_depth: u8,
+) {
     let length = ((1u32 << log2_cb_size) >> state.log2_min_cb_size) as usize;
     let x_cb = (x0 >> state.log2_min_cb_size) as usize;
     let y_cb = (y0 >> state.log2_min_cb_size) as usize;
@@ -803,7 +809,13 @@ fn tab_mvf_at<P: Pixel>(state: &PictureState<P>, x: i32, y: i32) -> MvField {
 /// merge candidate for a PU at `(x0, y0)`.  The position must be inside
 /// the picture, belong to an inter-coded PU (`pred_flag != 0`), be in the
 /// same slice and same tile, and already decoded (z-scan order).
-fn spatial_cand_available<P: Pixel>(state: &PictureState<P>, x0: i32, y0: i32, x_n: i32, y_n: i32) -> bool {
+fn spatial_cand_available<P: Pixel>(
+    state: &PictureState<P>,
+    x0: i32,
+    y0: i32,
+    x_n: i32,
+    y_n: i32,
+) -> bool {
     // Out of picture bounds?
     if x_n < 0 || y_n < 0 || x_n >= state.width as i32 || y_n >= state.height as i32 {
         return false;
@@ -2722,7 +2734,8 @@ fn decode_pcm_block<P: Pixel>(
         for j in 0..cb_size {
             for i in 0..cb_size {
                 let sample = reader.read_bits(pcm_bd_luma);
-                state.y_plane[dst_off + j * stride + i] = P::from_i32_clamped((sample << luma_shift) as i32, state.bit_depth);
+                state.y_plane[dst_off + j * stride + i] =
+                    P::from_i32_clamped((sample << luma_shift) as i32, state.bit_depth);
             }
         }
     }
@@ -2743,7 +2756,8 @@ fn decode_pcm_block<P: Pixel>(
             for j in 0..cb_chroma {
                 for i in 0..cb_chroma {
                     let sample = reader.read_bits(pcm_bd_chroma);
-                    plane[dst_off + j * stride + i] = P::from_i32_clamped((sample << chroma_shift) as i32, state.bit_depth);
+                    plane[dst_off + j * stride + i] =
+                        P::from_i32_clamped((sample << chroma_shift) as i32, state.bit_depth);
                 }
             }
         }
@@ -3080,7 +3094,15 @@ fn decode_transform_unit<P: Pixel>(
         let x_pu = (x0 >> state.log2_min_pu_size) as usize;
         let y_pu = (y0 >> state.log2_min_pu_size) as usize;
         let luma_mode = state.tab_ipm[y_pu * state.min_pu_width + x_pu];
-        predict_intra_luma(state, sps, x0, y0, log2_trafo_size, luma_mode, pps.constrained_intra_pred_flag)?;
+        predict_intra_luma(
+            state,
+            sps,
+            x0,
+            y0,
+            log2_trafo_size,
+            luma_mode,
+            pps.constrained_intra_pred_flag,
+        )?;
     }
 
     // ---- Step 2: cbf_luma decode.
@@ -3161,10 +3183,8 @@ fn decode_transform_unit<P: Pixel>(
                         cu_chroma_qp_offset_idx += 1;
                     }
                 }
-                state.cu_qp_offset_cb =
-                    pps.cb_qp_offset_list[cu_chroma_qp_offset_idx as usize];
-                state.cu_qp_offset_cr =
-                    pps.cr_qp_offset_list[cu_chroma_qp_offset_idx as usize];
+                state.cu_qp_offset_cb = pps.cb_qp_offset_list[cu_chroma_qp_offset_idx as usize];
+                state.cu_qp_offset_cr = pps.cr_qp_offset_list[cu_chroma_qp_offset_idx as usize];
             } else {
                 state.cu_qp_offset_cb = 0;
                 state.cu_qp_offset_cr = 0;
@@ -3216,7 +3236,15 @@ fn decode_transform_unit<P: Pixel>(
         if is_intra {
             if do_chroma_inline {
                 let chroma_mode = state.last_chroma_pred_mode;
-                predict_intra_chroma(state, sps, x0, y0, log2_trafo_size - 1, chroma_mode, pps.constrained_intra_pred_flag)?;
+                predict_intra_chroma(
+                    state,
+                    sps,
+                    x0,
+                    y0,
+                    log2_trafo_size - 1,
+                    chroma_mode,
+                    pps.constrained_intra_pred_flag,
+                )?;
                 decode_chroma_residuals(
                     cabac,
                     contexts,
@@ -3237,7 +3265,15 @@ fn decode_transform_unit<P: Pixel>(
                 )?;
             } else if do_chroma_deferred {
                 let chroma_mode = state.last_chroma_pred_mode;
-                predict_intra_chroma(state, sps, x_base, y_base, log2_trafo_size, chroma_mode, pps.constrained_intra_pred_flag)?;
+                predict_intra_chroma(
+                    state,
+                    sps,
+                    x_base,
+                    y_base,
+                    log2_trafo_size,
+                    chroma_mode,
+                    pps.constrained_intra_pred_flag,
+                )?;
                 decode_chroma_residuals(
                     cabac,
                     contexts,
@@ -3310,10 +3346,26 @@ fn decode_transform_unit<P: Pixel>(
     } else if is_intra {
         if do_chroma_inline {
             let chroma_mode = state.last_chroma_pred_mode;
-            predict_intra_chroma(state, sps, x0, y0, log2_trafo_size - 1, chroma_mode, pps.constrained_intra_pred_flag)?;
+            predict_intra_chroma(
+                state,
+                sps,
+                x0,
+                y0,
+                log2_trafo_size - 1,
+                chroma_mode,
+                pps.constrained_intra_pred_flag,
+            )?;
         } else if do_chroma_deferred {
             let chroma_mode = state.last_chroma_pred_mode;
-            predict_intra_chroma(state, sps, x_base, y_base, log2_trafo_size, chroma_mode, pps.constrained_intra_pred_flag)?;
+            predict_intra_chroma(
+                state,
+                sps,
+                x_base,
+                y_base,
+                log2_trafo_size,
+                chroma_mode,
+                pps.constrained_intra_pred_flag,
+            )?;
         }
     }
 
@@ -3430,7 +3482,13 @@ fn maybe_save_qpy_pred<P: Pixel>(
 /// Write `qp_y` into the per-min-CB QP table for all min-CB positions
 /// covered by the TU at `(x0, y0)` of size `1 << log2_size`. Used by
 /// the deblock pass to look up tc/β.
-fn write_qp_y_table<P: Pixel>(state: &mut PictureState<P>, x0: u32, y0: u32, log2_size: u8, qp_y: i32) {
+fn write_qp_y_table<P: Pixel>(
+    state: &mut PictureState<P>,
+    x0: u32,
+    y0: u32,
+    log2_size: u8,
+    qp_y: i32,
+) {
     let length = ((1u32 << log2_size) >> state.log2_min_cb_size).max(1) as usize;
     let x_cb = (x0 >> state.log2_min_cb_size) as usize;
     let y_cb = (y0 >> state.log2_min_cb_size) as usize;
@@ -3538,7 +3596,13 @@ fn decode_chroma_residuals<P: Pixel>(
         };
         let dst_offset = y_c * dst_stride + x_c;
         let dst = &mut dst_plane[dst_offset..dst_offset + (size_c - 1) * dst_stride + size_c];
-        add_residual(dst, dst_stride, &residual, log2_trafo_size_c, state.bit_depth);
+        add_residual(
+            dst,
+            dst_stride,
+            &residual,
+            log2_trafo_size_c,
+            state.bit_depth,
+        );
     }
     Ok(())
 }
@@ -3546,7 +3610,12 @@ fn decode_chroma_residuals<P: Pixel>(
 /// Mark the top and left edges of an intra TU at `(x0, y0)` of size
 /// `1 << log2_size` with boundary strength 2 in the per-4×4 BS grid.
 /// Skips picture borders.
-fn mark_intra_tu_boundaries<P: Pixel>(state: &mut PictureState<P>, x0: u32, y0: u32, log2_size: u8) {
+fn mark_intra_tu_boundaries<P: Pixel>(
+    state: &mut PictureState<P>,
+    x0: u32,
+    y0: u32,
+    log2_size: u8,
+) {
     let size = 1u32 << log2_size;
     let pic_w = state.width as usize;
     let bs_w = pic_w >> 2; // entries per row in the BS grid
@@ -3621,8 +3690,25 @@ fn predict_intra_luma<P: Pixel>(
 
     match mode {
         0 => predict_planar(dst, dst_stride, &top, &left, log2_size, state.bit_depth),
-        1 => predict_dc(dst, dst_stride, &top, &left, log2_size, true, state.bit_depth),
-        2..=34 => predict_angular(dst, dst_stride, &top, &left, log2_size, mode, 0, state.bit_depth),
+        1 => predict_dc(
+            dst,
+            dst_stride,
+            &top,
+            &left,
+            log2_size,
+            true,
+            state.bit_depth,
+        ),
+        2..=34 => predict_angular(
+            dst,
+            dst_stride,
+            &top,
+            &left,
+            log2_size,
+            mode,
+            0,
+            state.bit_depth,
+        ),
         _ => {
             return Err(DecodeError::Unsupported("invalid intra prediction mode"));
         }
@@ -3637,7 +3723,12 @@ fn predict_intra_luma<P: Pixel>(
 /// picture. Phase 3c-1 adds a cross-slice check: a neighbor pixel belonging
 /// to a CTB in a different slice is treated as unavailable, matching the
 /// spec rule (`ctb_addr_in_slice > 0` / `>= ctb_width`).
-fn compute_luma_avail<P: Pixel>(state: &PictureState<P>, x0: u32, y0: u32, size: u32) -> ReferenceAvailability {
+fn compute_luma_avail<P: Pixel>(
+    state: &PictureState<P>,
+    x0: u32,
+    y0: u32,
+    size: u32,
+) -> ReferenceAvailability {
     compute_luma_avail_inner(state, x0, y0, size, false)
 }
 
@@ -3861,7 +3952,13 @@ fn predict_intra_chroma<P: Pixel>(
     let pic_h_c = (state.height / 2) as usize;
     let x_c = (x0_luma >> 1) as usize;
     let y_c = (y0_luma >> 1) as usize;
-    let avail = compute_chroma_avail(state, x0_luma, y0_luma, (size as u32) * 2, constrained_intra_pred_flag);
+    let avail = compute_chroma_avail(
+        state,
+        x0_luma,
+        y0_luma,
+        (size as u32) * 2,
+        constrained_intra_pred_flag,
+    );
     let dst_stride = state.uv_stride;
 
     for plane_idx in 0..2 {
@@ -3908,8 +4005,25 @@ fn predict_intra_chroma<P: Pixel>(
         let dst = &mut plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
         match mode {
             0 => predict_planar(dst, dst_stride, &top, &left, log2_size, state.bit_depth),
-            1 => predict_dc(dst, dst_stride, &top, &left, log2_size, false, state.bit_depth),
-            2..=34 => predict_angular(dst, dst_stride, &top, &left, log2_size, mode, c_idx, state.bit_depth),
+            1 => predict_dc(
+                dst,
+                dst_stride,
+                &top,
+                &left,
+                log2_size,
+                false,
+                state.bit_depth,
+            ),
+            2..=34 => predict_angular(
+                dst,
+                dst_stride,
+                &top,
+                &left,
+                log2_size,
+                mode,
+                c_idx,
+                state.bit_depth,
+            ),
             _ => {
                 return Err(DecodeError::Unsupported("invalid intra prediction mode"));
             }
@@ -3968,7 +4082,13 @@ fn apply_residual_to_luma<P: Pixel>(
     let dst_stride = state.y_stride;
     let dst_offset = (y0 as usize) * dst_stride + (x0 as usize);
     let dst = &mut state.y_plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
-    add_residual(dst, dst_stride, &residual_pixels, log2_size, state.bit_depth);
+    add_residual(
+        dst,
+        dst_stride,
+        &residual_pixels,
+        log2_size,
+        state.bit_depth,
+    );
 }
 
 /// Pick `scan_idx` for residual_coding (spec 7.4.9.11). For intra TUs at
@@ -4064,7 +4184,13 @@ fn decode_intra_mode_signaling<P: Pixel>(
     Ok(())
 }
 
-fn write_intra_pred_mode<P: Pixel>(state: &mut PictureState<P>, x0: u32, y0: u32, pu_size: u32, mode: u8) {
+fn write_intra_pred_mode<P: Pixel>(
+    state: &mut PictureState<P>,
+    x0: u32,
+    y0: u32,
+    pu_size: u32,
+    mode: u8,
+) {
     let size_in_pus = (pu_size >> state.log2_min_pu_size).max(1) as usize;
     let x_pu = (x0 >> state.log2_min_pu_size) as usize;
     let y_pu = (y0 >> state.log2_min_pu_size) as usize;
@@ -4444,8 +4570,7 @@ mod tests {
             } else if qp_i > 43 {
                 qp_i - 6
             } else {
-                const QP_C: [i32; 14] =
-                    [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37];
+                const QP_C: [i32; 14] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37];
                 QP_C[(qp_i - 30) as usize]
             }
         };

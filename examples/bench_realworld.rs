@@ -182,7 +182,10 @@ fn probe_frame_count(path: &Path) -> u32 {
         ])
         .output()
         .expect("ffprobe");
-    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
 }
 
 // ------------------------- timing --------------------------
@@ -325,7 +328,9 @@ fn main() -> std::io::Result<()> {
                 i += 1;
             }
             "-h" | "--help" => {
-                println!("usage: bench_realworld [--only NAME] [--source URL_OR_PATH] [--only-generate] [--no-generate]");
+                println!(
+                    "usage: bench_realworld [--only NAME] [--source URL_OR_PATH] [--only-generate] [--no-generate]"
+                );
                 println!("\nFixtures:");
                 for f in FIXTURES {
                     println!(
@@ -422,7 +427,16 @@ fn main() -> std::io::Result<()> {
         );
         raw.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\n",
-            f.name, f.width, f.height, frames, ours_ms_str, ours_mpxs_str, ff1_ms, mpx_1, ffn_ms, mpx_n
+            f.name,
+            f.width,
+            f.height,
+            frames,
+            ours_ms_str,
+            ours_mpxs_str,
+            ff1_ms,
+            mpx_1,
+            ffn_ms,
+            mpx_n
         ));
         if !ours_ok {
             if let Some(e) = &ours.error {

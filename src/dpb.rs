@@ -73,7 +73,14 @@ pub struct DecodedPicture {
 }
 
 impl DecodedPicture {
-    pub fn new(y: PixelData, u: PixelData, v: PixelData, width: u32, height: u32, poc: i32) -> Self {
+    pub fn new(
+        y: PixelData,
+        u: PixelData,
+        v: PixelData,
+        width: u32,
+        height: u32,
+        poc: i32,
+    ) -> Self {
         Self {
             y,
             u,
@@ -422,8 +429,7 @@ pub fn resolve_ref_pics(
                 dpb.pictures()
                     .iter()
                     .find(|p| {
-                        p.poc == *poc
-                            && p.reference_status() == PictureReferenceStatus::LongTerm
+                        p.poc == *poc && p.reference_status() == PictureReferenceStatus::LongTerm
                     })
                     .cloned()
             })
@@ -463,7 +469,14 @@ mod tests {
 
     #[test]
     fn mark_short_term_reference() {
-        let pic = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 10));
+        let pic = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            10,
+        ));
         assert_eq!(pic.reference_status(), PictureReferenceStatus::ShortTerm);
         pic.mark(PictureReferenceStatus::LongTerm);
         assert_eq!(pic.reference_status(), PictureReferenceStatus::LongTerm);
@@ -474,10 +487,24 @@ mod tests {
     #[test]
     fn cleanup_drops_unreferenced_and_output() {
         let mut dpb = DecodedPictureBuffer::new();
-        let a = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 0));
+        let a = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            0,
+        ));
         a.mark(PictureReferenceStatus::UnusedForReference);
         *a.output.borrow_mut() = true;
-        let b = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 1));
+        let b = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            1,
+        ));
         // b is still a reference.
         dpb.insert(a);
         dpb.insert(b);
@@ -574,8 +601,22 @@ mod tests {
     #[test]
     fn resolve_ref_pics_looks_up_by_poc() {
         let mut dpb = DecodedPictureBuffer::new();
-        let p0 = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 2));
-        let p1 = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 5));
+        let p0 = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            2,
+        ));
+        let p1 = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            5,
+        ));
         dpb.insert(p0);
         dpb.insert(p1);
         let resolved = resolve_ref_pics(&dpb, &[5, 2]).expect("resolve");
@@ -595,7 +636,14 @@ mod tests {
     #[test]
     fn resolve_ref_pics_prefers_short_term() {
         let mut dpb = DecodedPictureBuffer::new();
-        let p = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 7));
+        let p = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            7,
+        ));
         // Default status is ShortTerm.
         assert_eq!(p.reference_status(), PictureReferenceStatus::ShortTerm);
         dpb.insert(p);
@@ -611,7 +659,14 @@ mod tests {
     #[test]
     fn resolve_ref_pics_finds_long_term() {
         let mut dpb = DecodedPictureBuffer::new();
-        let p = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 7));
+        let p = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            7,
+        ));
         p.mark(PictureReferenceStatus::LongTerm);
         dpb.insert(p);
         let resolved = resolve_ref_pics(&dpb, &[7]).expect("resolve");
@@ -627,7 +682,14 @@ mod tests {
     #[test]
     fn resolve_ref_pics_fallback_unmarked() {
         let mut dpb = DecodedPictureBuffer::new();
-        let p = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 7));
+        let p = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            7,
+        ));
         p.mark(PictureReferenceStatus::UnusedForReference);
         dpb.insert(p);
         let resolved = resolve_ref_pics(&dpb, &[7]).expect("resolve");
@@ -640,9 +702,30 @@ mod tests {
         use crate::decoder::Decoder;
 
         let mut dpb = DecodedPictureBuffer::new();
-        let p0 = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 0));
-        let p4 = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 4));
-        let p8 = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 8));
+        let p0 = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            0,
+        ));
+        let p4 = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            4,
+        ));
+        let p8 = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            8,
+        ));
         dpb.insert(p0.clone());
         dpb.insert(p4.clone());
         dpb.insert(p8.clone());
@@ -673,8 +756,22 @@ mod tests {
 
         let mut dpb = DecodedPictureBuffer::new();
         // Two pictures: POC 3 (ST ref) and POC 19 (LT ref by LSB=3 with max_lsb=16).
-        let p3 = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 3));
-        let p19 = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 19));
+        let p3 = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            3,
+        ));
+        let p19 = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            19,
+        ));
         dpb.insert(p3.clone());
         dpb.insert(p19.clone());
 
@@ -703,8 +800,22 @@ mod tests {
         let mut dpb = DecodedPictureBuffer::new();
         // Two pictures with the SAME POC LSB (3) but different full POCs.
         // log2_max_poc_lsb=4 → max_poc_lsb=16
-        let p3 = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 3));
-        let p19 = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 19));
+        let p3 = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            3,
+        ));
+        let p19 = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            19,
+        ));
         dpb.insert(p3.clone());
         dpb.insert(p19.clone());
 
@@ -734,7 +845,14 @@ mod tests {
 
         let mut dpb = DecodedPictureBuffer::new();
         // POC 19 has LSB=3 (19%16=3)
-        let p19 = Rc::new(DecodedPicture::new(PixelData::U8(vec![]), PixelData::U8(vec![]), PixelData::U8(vec![]), 0, 0, 19));
+        let p19 = Rc::new(DecodedPicture::new(
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            PixelData::U8(vec![]),
+            0,
+            0,
+            19,
+        ));
         dpb.insert(p19.clone());
 
         // LT ref with poc_msb_present=false and LSB=3 → matches POC 19

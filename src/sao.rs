@@ -371,12 +371,11 @@ pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &
             let sao = state.sao_params[ctb_rs].clone();
 
             // Compute slice-boundary "no cross" flags for this CTB.
-            let no_cross_left = rx > 0
-                && sao_skip_slice_boundary(state, ctb_rs, ctb_rs - 1);
-            let no_cross_right = rx + 1 < pic_w_in_ctbs
-                && sao_skip_slice_boundary(state, ctb_rs, ctb_rs + 1);
-            let no_cross_top = ry > 0
-                && sao_skip_slice_boundary(state, ctb_rs, ctb_rs - pic_w_in_ctbs);
+            let no_cross_left = rx > 0 && sao_skip_slice_boundary(state, ctb_rs, ctb_rs - 1);
+            let no_cross_right =
+                rx + 1 < pic_w_in_ctbs && sao_skip_slice_boundary(state, ctb_rs, ctb_rs + 1);
+            let no_cross_top =
+                ry > 0 && sao_skip_slice_boundary(state, ctb_rs, ctb_rs - pic_w_in_ctbs);
             let no_cross_bottom = ry + 1 < pic_h_in_ctbs
                 && sao_skip_slice_boundary(state, ctb_rs, ctb_rs + pic_w_in_ctbs);
 

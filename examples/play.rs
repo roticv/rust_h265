@@ -8,7 +8,7 @@
 
 use minifb::{Key, Window, WindowOptions};
 use rust_h265::decoder::{Decoder, Frame};
-use rust_h265::nal::{parse_annex_b, NalUnitType};
+use rust_h265::nal::{NalUnitType, parse_annex_b};
 use std::time::{Duration, Instant};
 
 /// Convert YUV420 frame to ARGB pixel buffer for display.
@@ -160,7 +160,13 @@ fn main() {
         if let Some(f) = flushed.into_iter().next() {
             width = f.width as usize;
             height = f.height as usize;
-            first_frame_argb = Some(yuv_to_argb(f.y.as_u8().expect("8-bit"), f.u.as_u8().expect("8-bit"), f.v.as_u8().expect("8-bit"), width, height));
+            first_frame_argb = Some(yuv_to_argb(
+                f.y.as_u8().expect("8-bit"),
+                f.u.as_u8().expect("8-bit"),
+                f.v.as_u8().expect("8-bit"),
+                width,
+                height,
+            ));
         }
     }
 
@@ -297,7 +303,13 @@ fn main() {
         }
 
         let f = display_frame.unwrap();
-        last_argb = yuv_to_argb(f.y.as_u8().expect("8-bit"), f.u.as_u8().expect("8-bit"), f.v.as_u8().expect("8-bit"), width, height);
+        last_argb = yuv_to_argb(
+            f.y.as_u8().expect("8-bit"),
+            f.u.as_u8().expect("8-bit"),
+            f.v.as_u8().expect("8-bit"),
+            width,
+            height,
+        );
         frame_count += 1;
 
         // Wait for frame timing.
