@@ -2,14 +2,16 @@
 
 A pure Rust H.265 / HEVC video decoder.
 
-> **Status:** functional. Main-profile 8-bit 4:2:0 HEVC decodes end-to-end
-> with CTU 16/32/64, I/P/B slices (including hierarchical B), WPP, tiles,
-> dependent slice segments, SAO, deblocking, AQ (`cu_qp_delta`), scaling
-> lists, sign-data hiding, weighted prediction, and PCM. 104 tests pass.
-> Byte-exact against FFmpeg on every in-tree fixture plus real 1080p Big
-> Buck Bunny transcoded with x265 presets `ultrafast` / `medium` / `slow`.
-> No threading or SIMD yet — currently ~4.7× slower than single-threaded
-> FFmpeg on real 1080p content; see [`BENCHMARK.md`](BENCHMARK.md).
+> **Status:** functional. Main and Main 10 profile HEVC (8-bit and 10-bit
+> 4:2:0) decodes end-to-end with CTU 16/32/64, I/P/B slices (including
+> hierarchical B), WPP, tiles, dependent slice segments, SAO, deblocking,
+> AQ (`cu_qp_delta`), scaling lists, sign-data hiding, weighted prediction,
+> transform skip, transquant bypass, constrained intra prediction, and PCM.
+> 127 tests pass. Byte-exact against FFmpeg on every in-tree fixture plus
+> real 1080p Big Buck Bunny at x265 presets `ultrafast` / `medium` / `slow`
+> in both 8-bit and 10-bit. No threading or SIMD yet — ~5× slower than
+> single-threaded FFmpeg on 8-bit content, ~2.5× on 10-bit; see
+> [`BENCHMARK.md`](BENCHMARK.md).
 
 While working on `rust_media` it became clear that there isn't a sufficiently good open source software HEVC decoder that ships as a standalone library. FFmpeg has one, but it isn't split out. Most devices have hardware HEVC decoders, but a portable software fallback is still useful when you want one binary that runs anywhere.
 
@@ -19,7 +21,8 @@ A pure Rust H.264 decoder ([`rust_h264`](https://github.com/roticv/rust_h264)) a
 
 - **Input:** Annex B bytestream (start code delimited `00 00 00 01` / `00 00 01`). HVCC (length-prefixed, used in MP4) is **not** supported — callers must convert to Annex B before feeding data to the decoder.
 - **Streaming:** `Decoder::decode_nal(&[u8]) -> Result<Option<Frame>, DecodeError>` plus `flush()`. NAL units are fed incrementally and decoded frames are emitted as they become available, in **decode order** (callers re-sort by POC for display).
-- **Performance:** The decoder aims to be fast, with FFmpeg's software HEVC decoder as the target benchmark. Current gap vs single-threaded FFmpeg is ~4.7× on real 1080p content; no NEON / SSE kernels yet.
+- **Performance:** The decoder aims to be fast, with FFmpeg's software HEVC decoder as the target benchmark. Current gap vs single-threaded FFmpeg: ~5× on 8-bit, ~2.5× on 10-bit real 1080p content. No NEON / SSE kernels yet.
+- **Multi-bit-depth:** 8-bit and 10-bit (Main / Main 10 profile) via a generic `Pixel` trait. 12-bit infrastructure is in place but untested. Pixel planes are `PixelData::U8(Vec<u8>)` or `PixelData::U16(Vec<u16>)` — check `frame.bit_depth` to determine which.
 - **Pure Rust, no `unsafe`** in the current codebase. `unsafe` will be reserved for SIMD paths once they land.
 
 ## Usage
@@ -37,9 +40,14 @@ for nal in &nals {
     match decoder.decode_nal(nal) {
         Ok(Some(frame)) => {
             // `frame` is a decoded YUV420 picture:
-            //   frame.y, frame.u, frame.v  — pixel planes
+            //   frame.y, frame.u, frame.v  — PixelData (U8 or U16)
             //   frame.width, frame.height  — dimensions
+            //   frame.bit_depth            — 8 or 10
             //   frame.pic_order_cnt        — display order index
+            //
+            // Access pixels:
+            //   frame.y.as_u8()  -> Option<&[u8]>   (8-bit)
+            //   frame.y.as_u16() -> Option<&[u16]>  (10-bit)
         }
         Ok(None) => {} // NAL consumed, no frame ready yet (e.g. VPS/SPS/PPS)
         Err(e) => eprintln!("decode error: {:?}", e),
@@ -130,20 +138,20 @@ These do not change how you call the decoder; they change what the decoder has t
 ## Tools
 
 ```sh
-# Decode to raw YUV420p in display order (sorted by POC):
+# Play an H.265 file in a window (press Escape to quit):
+cargo run --release --example play -- input.h265 [--fps 30] [--loop]
+
+# Decode to raw YUV in display order (8-bit: yuv420p, 10-bit: yuv420p10le):
 cargo run --release --example dump_frames -- input.h265 out.yuv
 
 # Throughput measurement on a single file:
 cargo run --release --example bench_decode -- input.h265 --warmup 2 --repeat 10
 
 # Real-world benchmark matrix (downloads Big Buck Bunny, transcodes with
-# x265 at several presets, runs both rust_h265 and FFmpeg on each):
+# x265 at several presets in 8-bit and 10-bit, runs both rust_h265 and
+# FFmpeg on each):
 cargo run --release --example bench_realworld
 ```
-
-Planned but not yet implemented:
-
-- `examples/play.rs` — decode and display an H.265 bitstream in a window (`cargo run --example play -- input.h265 [--fps 30] [--loop]`).
 
 ## Testing
 
@@ -151,11 +159,13 @@ Planned but not yet implemented:
 cargo test --release
 ```
 
-In-tree fixtures under `testdata/` cover the feature matrix (all fixtures
-byte-exact against FFmpeg); tests that need >1 MB of reference output
-(e.g. 1080p) use a SHA-256 hash of the decoded planes. The
-`bench_realworld` example covers real 1080p / 720p Big Buck Bunny content
-end-to-end and requires a working `ffmpeg` and `x265` in `$PATH`.
+127 tests covering the full feature matrix — 8-bit and 10-bit, CTU 16/32/64,
+I/P/B slices, WPP, tiles, dependent slices, SAO, deblocking, transform skip,
+transquant bypass, constrained intra, PCM, multi-slice, and more. All
+in-tree fixtures are byte-exact against FFmpeg; tests that need >1 MB of
+reference output (e.g. 1080p) use a SHA-256 hash of the decoded planes. The
+`bench_realworld` example covers real 1080p Big Buck Bunny in both 8-bit
+and 10-bit and requires `ffmpeg` and `x265` on `$PATH`.
 
 ## License
 
