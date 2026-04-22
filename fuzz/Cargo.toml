@@ -1,0 +1,33 @@
+[package]
+name = "rust_h265-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rust_h265]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "decode_annex_b"
+path = "fuzz_targets/decode_annex_b.rs"
+doc = false
+
+[[bin]]
+name = "parse_nal_headers"
+path = "fuzz_targets/parse_nal_headers.rs"
+doc = false
+
+[[bin]]
+name = "decode_single_nal"
+path = "fuzz_targets/decode_single_nal.rs"
+doc = false

@@ -1,0 +1,63 @@
+name: Fuzz
+
+on:
+  # Run on a schedule (nightly) to find regressions over time.
+  schedule:
+    - cron: '0 4 * * *'  # 4 AM UTC daily
+  # Allow manual trigger from the Actions tab.
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: 'Seconds to fuzz each target'
+        required: false
+        default: '300'
+      target:
+        description: 'Fuzz target (blank = all)'
+        required: false
+        default: ''
+
+env:
+  CARGO_TERM_COLOR: always
+  # Default fuzz duration per target (5 minutes).
+  FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '300' }}
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [decode_annex_b, parse_nal_headers, decode_single_nal]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Cache fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Run fuzzer
+        if: ${{ github.event.inputs.target == '' || github.event.inputs.target == matrix.target }}
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=${{ env.FUZZ_SECONDS }} \
+            -max_len=65536
+        # max_len=64KB keeps inputs reasonably sized for a video decoder.
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          retention-days: 30

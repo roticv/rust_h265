@@ -167,6 +167,22 @@ reference output (e.g. 1080p) use a SHA-256 hash of the decoded planes. The
 `bench_realworld` example covers real 1080p Big Buck Bunny in both 8-bit
 and 10-bit and requires `ffmpeg` and `x265` on `$PATH`.
 
+### Fuzzing
+
+Three fuzz targets using [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz)
+(requires nightly Rust):
+
+```sh
+# Full Annex B decode pipeline (seeded with testdata/ fixtures):
+cargo +nightly fuzz run decode_annex_b
+
+# NAL header parsing only (lightweight, fast):
+cargo +nightly fuzz run parse_nal_headers
+
+# Single synthetic NAL with controlled type/payload:
+cargo +nightly fuzz run decode_single_nal
+```
+
 ## License
 
 Licensed under either of
