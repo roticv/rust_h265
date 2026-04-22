@@ -1422,6 +1422,7 @@ fn amvp_scaled_ref_mv<P: Pixel>(
 ///
 /// `positions` is the list of (x, y) neighbor positions to check (e.g.
 /// [A0, A1] for the left group, [B0, B1, B2] for the above group).
+#[allow(clippy::too_many_arguments)]
 fn amvp_spatial_candidate<P: Pixel>(
     state: &PictureState<P>,
     slice_params: &SliceParams,
@@ -3878,14 +3879,12 @@ fn compute_luma_avail_inner<P: Pixel>(
         // Helper: check if sample at (sx, sy) is intra (pred_flag == 0).
         let is_intra_at = |sx: u32, sy: u32| -> bool {
             let idx = (sy >> log2_min_pu) as usize * min_pu_w + (sx >> log2_min_pu) as usize;
-            tab_mvf.get(idx).map_or(false, |m| m.pred_flag == 0)
+            tab_mvf.get(idx).is_some_and(|m| m.pred_flag == 0)
         };
 
         // Up-left corner: single sample at (x0-1, y0-1).
-        if avail.up_left {
-            if !is_intra_at(x0 - 1, y0 - 1) {
-                avail.up_left = false;
-            }
+        if avail.up_left && !is_intra_at(x0 - 1, y0 - 1) {
+            avail.up_left = false;
         }
 
         // Up: samples at (x0..x0+size-1, y0-1).

@@ -532,6 +532,7 @@ pub fn mc_chroma<P: Pixel>(
 /// For uni-prediction (L0 or L1 only), the prediction is written directly.
 /// For bi-prediction (both L0 and L1), the two predictions are averaged:
 /// `dst = (predL0 + predL1 + 1) >> 1`.
+#[allow(clippy::too_many_arguments)]
 pub fn motion_compensation_pu<P: Pixel>(
     state: &mut PictureState<P>,
     ref_frames_l0: &[Rc<DecodedPicture>],
@@ -1033,6 +1034,7 @@ fn mc_chroma_from_ref_uv<P: Pixel>(
 
 /// Perform motion compensation for an entire inter CU, dispatching to each PU
 /// based on the partition mode. This replaces `write_placeholder_prediction`.
+#[allow(clippy::too_many_arguments)]
 pub fn motion_compensation_cu<P: Pixel>(
     state: &mut PictureState<P>,
     ref_frames_l0: &[Rc<DecodedPicture>],

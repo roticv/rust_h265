@@ -272,6 +272,7 @@ pub fn predict_dc<P: Pixel>(
 ///
 /// `c_idx` is 0 for luma (needed for the boundary smoothing of pure
 /// horizontal/vertical modes).
+#[allow(clippy::too_many_arguments)]
 pub fn predict_angular<P: Pixel>(
     dst: &mut [P],
     dst_stride: usize,

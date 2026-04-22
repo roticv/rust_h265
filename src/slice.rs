@@ -783,7 +783,7 @@ fn parse_pred_weight_table(
         if chroma_format_idc != 0 && i < chroma_weight_l0_flag.len() && chroma_weight_l0_flag[i] {
             for j in 0..2 {
                 let delta_w = r.read_se()? as i16;
-                let delta_o = r.read_se()? as i32;
+                let delta_o = r.read_se()?;
                 wt.chroma_weight_l0[i][j] = chroma_denom + delta_w;
                 // Spec equation 7-59: effective offset includes the shift-back
                 wt.chroma_offset_l0[i][j] = (delta_o
@@ -821,7 +821,7 @@ fn parse_pred_weight_table(
             {
                 for j in 0..2 {
                     let delta_w = r.read_se()? as i16;
-                    let delta_o = r.read_se()? as i32;
+                    let delta_o = r.read_se()?;
                     wt.chroma_weight_l1[i][j] = chroma_denom + delta_w;
                     wt.chroma_offset_l1[i][j] = (delta_o
                         - ((128i32 * wt.chroma_weight_l1[i][j] as i32)

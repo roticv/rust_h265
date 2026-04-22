@@ -587,7 +587,7 @@ impl Decoder {
         let nal_slice_data_start = {
             let mut nss = cabac_byte_offset as u32;
             for &p in &nal.epb_positions {
-                if (p as u32) < nss {
+                if p < nss {
                     nss += 1;
                 } else {
                     break;
@@ -786,14 +786,15 @@ impl Decoder {
         // The CTB loop, deblock, SAO, and DPB insertion all operate on a
         // generic PictureState<P>. Dispatch once via the enum variant and
         // execute the entire inner body monomorphized for the right P.
-        let ctb_loop_result: Result<
+        type CtbLoopResult = Result<
             (
                 u32,
                 Option<[u8; crate::cabac_tables::HEVC_CONTEXTS]>,
                 [u8; crate::cabac_tables::HEVC_CONTEXTS],
             ),
             DecodeError,
-        > = with_picture_state!(&mut pic.state, |state| {
+        >;
+        let ctb_loop_result: CtbLoopResult = with_picture_state!(&mut pic.state, |state| {
             let mut more_data = true;
             let mut ctb_addr_ts: u32 = slice_start_ts;
             let mut substream_idx: u32 = 0;
@@ -833,10 +834,7 @@ impl Decoder {
                     let byte_offset = cabac_byte_offset + rbsp_offset_from_start as usize;
                     cabac.reinit_at(byte_offset);
 
-                    if is_tile_start {
-                        contexts =
-                            CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag);
-                    } else if pic_width_in_ctbs == 1 {
+                    if is_tile_start || pic_width_in_ctbs == 1 {
                         contexts =
                             CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag);
                     } else if let Some(saved) = saved_state.as_ref() {
