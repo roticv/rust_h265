@@ -558,9 +558,15 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
                 "pcm_sample_bit_depth exceeds bit depth",
             ));
         }
-        let log2_min_pcm_cb_size = (r.read_ue()? + 3) as u8;
-        let log2_diff_max_min_pcm = r.read_ue()? as u8;
-        let log2_max_pcm_cb_size = log2_min_pcm_cb_size + log2_diff_max_min_pcm;
+        let log2_min_pcm_cb_size_minus3 = r.read_ue()?;
+        let log2_diff_max_min_pcm = r.read_ue()?;
+        if log2_min_pcm_cb_size_minus3 > 2 || log2_diff_max_min_pcm > 2 {
+            return Err(DecodeError::InvalidSyntax(
+                "pcm log2 coding block size params out of range",
+            ));
+        }
+        let log2_min_pcm_cb_size = (log2_min_pcm_cb_size_minus3 + 3) as u8;
+        let log2_max_pcm_cb_size = log2_min_pcm_cb_size + log2_diff_max_min_pcm as u8;
         let pcm_loop_filter_disabled = r.read_bit()? == 1;
         (
             pcm_bd_luma,
