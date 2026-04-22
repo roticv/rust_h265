@@ -512,8 +512,17 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
 
     let log2_min_luma_transform_block_size_minus2 = r.read_ue()?;
     let log2_diff_max_min_luma_transform_block_size = r.read_ue()?;
+    // Spec: MinTbLog2SizeY ranges 2..5, diff ranges 0..3.
+    if log2_min_luma_transform_block_size_minus2 > 3
+        || log2_diff_max_min_luma_transform_block_size > 3
+    {
+        return Err(DecodeError::InvalidSyntax(
+            "log2 transform block size params out of range",
+        ));
+    }
     let min_tb_log2_size_y = (log2_min_luma_transform_block_size_minus2 + 2) as u8;
-    let max_tb_log2_size_y = min_tb_log2_size_y + log2_diff_max_min_luma_transform_block_size as u8;
+    let max_tb_log2_size_y =
+        min_tb_log2_size_y + log2_diff_max_min_luma_transform_block_size as u8;
 
     let max_transform_hierarchy_depth_inter = r.read_ue()?;
     let max_transform_hierarchy_depth_intra = r.read_ue()?;
