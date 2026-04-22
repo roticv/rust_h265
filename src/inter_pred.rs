@@ -585,7 +585,11 @@ pub fn motion_compensation_pu<P: Pixel>(
         let mut pred_l1_v = [0i32; MAX_PB_CHROMA];
 
         // L0
-        let ref_pic_l0 = &ref_frames_l0[mvf.ref_idx[0] as usize];
+        let l0_idx = mvf.ref_idx[0] as usize;
+        if l0_idx >= ref_frames_l0.len() {
+            return;
+        }
+        let ref_pic_l0 = &ref_frames_l0[l0_idx];
         {
             let rw = ref_pic_l0.width as i32;
             let rh = ref_pic_l0.height as i32;
@@ -643,7 +647,11 @@ pub fn motion_compensation_pu<P: Pixel>(
         }
 
         // L1
-        let ref_pic_l1 = &ref_frames_l1[mvf.ref_idx[1] as usize];
+        let l1_idx = mvf.ref_idx[1] as usize;
+        if l1_idx >= ref_frames_l1.len() {
+            return;
+        }
+        let ref_pic_l1 = &ref_frames_l1[l1_idx];
         {
             let rw = ref_pic_l1.width as i32;
             let rh = ref_pic_l1.height as i32;
@@ -732,16 +740,17 @@ pub fn motion_compensation_pu<P: Pixel>(
     } else {
         // Uni-prediction: write directly into the picture planes.
         let (ref_list, mv, ref_idx, use_l0) = if is_l0 {
-            (
-                &ref_frames_l0[mvf.ref_idx[0] as usize],
-                mvf.mv[0],
-                mvf.ref_idx[0] as usize,
-                true,
-            )
+            let idx = mvf.ref_idx[0] as usize;
+            if idx >= ref_frames_l0.len() {
+                return; // malformed stream — ref index out of bounds
+            }
+            (&ref_frames_l0[idx], mvf.mv[0], idx, true)
         } else {
-            (
-                &ref_frames_l1[mvf.ref_idx[1] as usize],
-                mvf.mv[1],
+            let idx = mvf.ref_idx[1] as usize;
+            if idx >= ref_frames_l1.len() {
+                return;
+            }
+            (&ref_frames_l1[idx], mvf.mv[1],
                 mvf.ref_idx[1] as usize,
                 false,
             )
