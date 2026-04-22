@@ -54,20 +54,26 @@ impl<'a> CabacReader<'a> {
     /// two bytes into `low`, plant a fixed bias of `1 << 9` in place of the
     /// "third" byte, and let the first renormalization refill consume the
     /// next two bytes naturally.
-    pub fn new(data: &'a [u8], byte_offset: usize) -> Self {
-        assert!(
-            byte_offset + 2 <= data.len(),
-            "CABAC init needs at least 2 bytes"
-        );
+    /// Returns `Err` if `byte_offset` is too close to the end of the data
+    /// to read the 2 seed bytes (malformed bitstream).
+    pub fn new(
+        data: &'a [u8],
+        byte_offset: usize,
+    ) -> Result<Self, crate::error::DecodeError> {
+        if byte_offset + 2 > data.len() {
+            return Err(crate::error::DecodeError::InvalidSyntax(
+                "CABAC init byte offset past end of RBSP",
+            ));
+        }
         let mut low: u32 = (data[byte_offset] as u32) << 18;
         low = low.wrapping_add((data[byte_offset + 1] as u32) << 10);
         low = low.wrapping_add(1 << 9);
-        CabacReader {
+        Ok(CabacReader {
             low,
             range: 0x1FE,
             data,
             pos: byte_offset + 2,
-        }
+        })
     }
 
     /// Refill the buffered region of `low` after a renormalization that
@@ -227,17 +233,25 @@ impl<'a> CabacReader<'a> {
     /// Re-initialize the CABAC engine at a new byte offset. Used after the
     /// PCM block's raw bytes have been consumed, to resume CABAC decoding at
     /// the next byte boundary (HEVC spec 7.3.8.5 / FFmpeg `ff_init_cabac_decoder`).
-    pub fn reinit_at(&mut self, byte_offset: usize) {
-        assert!(
-            byte_offset + 2 <= self.data.len(),
-            "CABAC reinit needs at least 2 bytes"
-        );
+    ///
+    /// Returns `Err` if `byte_offset` is too close to the end of the RBSP
+    /// to read the 2 seed bytes (malformed bitstream).
+    pub fn reinit_at(
+        &mut self,
+        byte_offset: usize,
+    ) -> Result<(), crate::error::DecodeError> {
+        if byte_offset + 2 > self.data.len() {
+            return Err(crate::error::DecodeError::InvalidSyntax(
+                "CABAC reinit byte offset past end of RBSP",
+            ));
+        }
         let mut low: u32 = (self.data[byte_offset] as u32) << 18;
         low = low.wrapping_add((self.data[byte_offset + 1] as u32) << 10);
         low = low.wrapping_add(1 << 9);
         self.low = low;
         self.range = 0x1FE;
         self.pos = byte_offset + 2;
+        Ok(())
     }
 }
 
@@ -341,7 +355,7 @@ mod tests {
         // 16 bytes is well above CABAC's 2-byte init footprint and avoids any
         // padding edge cases.
         let data = [0xB4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let mut cabac = CabacReader::new(&data, 0);
+        let mut cabac = CabacReader::new(&data, 0).unwrap();
         // After reading 0xB4 = 0b1011_0100 we should observe these bits in order.
         let expected = [1, 0, 1, 1, 0, 1, 0, 0];
         for &b in &expected {
@@ -353,8 +367,8 @@ mod tests {
     #[test]
     fn test_decode_bypass_bits_matches_loop() {
         let data = [0xCA, 0xFE, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
-        let mut a = CabacReader::new(&data, 0);
-        let mut b = CabacReader::new(&data, 0);
+        let mut a = CabacReader::new(&data, 0).unwrap();
+        let mut b = CabacReader::new(&data, 0).unwrap();
         let n = 12;
         let v1 = a.decode_bypass_bits(n);
         let mut v2 = 0u32;
@@ -456,11 +470,11 @@ mod tests {
     #[test]
     fn test_reinit_at_matches_fresh_new() {
         let data = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67];
-        let mut a = CabacReader::new(&data, 0);
+        let mut a = CabacReader::new(&data, 0).unwrap();
         // Consume a few bypass bins to advance state.
         let _ = a.decode_bypass_bits(4);
-        a.reinit_at(4);
-        let b = CabacReader::new(&data, 4);
+        a.reinit_at(4).unwrap();
+        let b = CabacReader::new(&data, 4).unwrap();
         assert_eq!(a.low, b.low);
         assert_eq!(a.range, b.range);
         assert_eq!(a.pos, b.pos);

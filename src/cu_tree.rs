@@ -2774,7 +2774,7 @@ fn decode_pcm_block<P: Pixel>(
     state.last_chroma_pred_mode = INTRA_DC;
 
     // Reinit CABAC at the byte boundary immediately after the PCM payload.
-    cabac.reinit_at(pcm_start + length_bytes);
+    cabac.reinit_at(pcm_start + length_bytes)?;
 
     Ok(())
 }
@@ -4349,7 +4349,7 @@ mod tests {
             cabac_byte_offset, 2,
             "fixture slice header is exactly 2 bytes"
         );
-        let mut cabac = CabacReader::new(&slice_nal.rbsp, cabac_byte_offset);
+        let mut cabac = CabacReader::new(&slice_nal.rbsp, cabac_byte_offset).unwrap();
 
         let mut state = PictureState::<u8>::new(&sps);
         let slice_params = SliceParams {

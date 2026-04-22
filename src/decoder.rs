@@ -575,7 +575,7 @@ impl Decoder {
             CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag)
         };
         let cabac_byte_offset = sh.header_size_bits / 8;
-        let mut cabac = CabacReader::new(&nal.rbsp, cabac_byte_offset);
+        let mut cabac = CabacReader::new(&nal.rbsp, cabac_byte_offset)?;
 
         // Spec 7.4.7.1: `entry_point_offset_minus1[i]` values are in NAL-unit
         // byte-space (they count the emulation-prevention bytes 0x03 present
@@ -832,7 +832,7 @@ impl Decoder {
                         .count() as u32;
                     let rbsp_offset_from_start = nal_offset_from_start - epbs_in_data_prefix;
                     let byte_offset = cabac_byte_offset + rbsp_offset_from_start as usize;
-                    cabac.reinit_at(byte_offset);
+                    cabac.reinit_at(byte_offset)?;
 
                     if is_tile_start || pic_width_in_ctbs == 1 {
                         contexts =
@@ -3379,5 +3379,27 @@ mod tests {
             hash, expected,
             "10bit hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
+    }
+
+    /// Regression test for fuzz crash: CABAC reinit with byte offset past
+    /// end of RBSP. Before the fix, `CabacReader::reinit_at` used `assert!`
+    /// which panicked on malformed input. Now returns `DecodeError`.
+    /// Found by: `cargo fuzz run decode_annex_b` (crash-aeb0d7c8).
+    #[test]
+    fn test_fuzz_cabac_reinit_oob() {
+        let data: &[u8] = &[
+            0, 0, 0, 1, 64, 1, 12, 2, 255, 255, 1, 96, 0, 0, 3, 0, 128, 0,
+            0, 3, 0, 0, 3, 0, 186, 0, 0, 4, 2, 16, 36, 0, 0, 0, 1, 66, 1, 2,
+            1, 96, 0, 0, 3, 0, 128, 0, 0, 3, 0, 0, 3, 0, 186, 0, 0, 160, 8,
+            8, 4, 5, 176, 64, 33, 146, 76, 42, 1, 0, 0, 3, 3, 232, 0, 0,
+            117, 48, 8, 0, 0, 0, 1, 68, 1, 224, 113, 130, 153, 32, 0, 0, 1,
+            38, 1, 172, 228, 25, 11, 39, 192, 105, 240, 16,
+        ];
+        let nals = parse_annex_b(data);
+        let mut decoder = Decoder::new();
+        for nal in &nals {
+            // Must not panic — should return Ok or Err.
+            let _ = decoder.decode_nal(nal);
+        }
     }
 }
