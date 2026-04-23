@@ -199,8 +199,8 @@ macro_rules! impl_idct {
                 }
                 let mut row_out = [0i32; $size];
                 $tr_fn(&mut row_out, &row_in);
-                let shift = 20 - bit_depth;
-                let add = 1i32 << (shift - 1);
+                let shift = 20u32.saturating_sub(bit_depth);
+                let add = 1i32 << (shift.max(1) - 1);
                 for col in 0..$size {
                     coeffs[row * $size + col] = clip_i16((row_out[col] + add) >> shift);
                 }
@@ -219,8 +219,8 @@ impl_idct!(idct_32x32, 32, tr_32);
 /// Inverse DCT for blocks where only the DC coefficient is non-zero
 /// (FFmpeg `idct_NxN_dc`). The fast path skips the matrix multiply entirely.
 fn idct_dc(coeffs: &mut [i16], log2_size: u8, bit_depth: u32) {
-    let shift = 14 - bit_depth;
-    let add = 1i32 << (shift - 1);
+    let shift = 14u32.saturating_sub(bit_depth);
+    let add = 1i32 << (shift.max(1) - 1);
     let dc = (((coeffs[0] as i32 + 1) >> 1) + add) >> shift;
     let dc = clip_i16(dc);
     let n = 1usize << log2_size;
@@ -271,8 +271,8 @@ pub fn transform_4x4_luma(coeffs: &mut [i16], bit_depth: u32) {
         ];
         let mut row_out = [0i32; 4];
         tr_4x4_luma(&mut row_out, &row_in);
-        let shift = 20 - bit_depth;
-        let add = 1i32 << (shift - 1);
+        let shift = 20u32.saturating_sub(bit_depth);
+        let add = 1i32 << (shift.max(1) - 1);
         for col in 0..4 {
             coeffs[row * 4 + col] = clip_i16((row_out[col] + add) >> shift);
         }
