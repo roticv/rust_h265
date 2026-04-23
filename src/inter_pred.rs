@@ -69,7 +69,11 @@ const MAX_PB_CHROMA: usize = (MAX_PB_SIZE / 2) * (MAX_PB_SIZE / 2);
 fn ref_sample<P: Pixel>(plane: &[P], stride: usize, x: i32, y: i32, w: i32, h: i32) -> i32 {
     let cx = x.clamp(0, w - 1) as usize;
     let cy = y.clamp(0, h - 1) as usize;
-    plane[cy * stride + cx].to_i32()
+    let idx = cy * stride + cx;
+    if idx >= plane.len() {
+        return 0;
+    }
+    plane[idx].to_i32()
 }
 
 /// Uni-directional luma motion compensation (8-tap filter).
