@@ -3929,4 +3929,12 @@ mod tests {
             "/testdata/fuzz_bit_depth_change.h265"
         )));
     }
+
+    #[test]
+    fn test_fuzz_qpy_pred_underflow() {
+        fuzz_hvcc(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/fuzz_qpy_pred_underflow.bin"
+        )));
+    }
 }

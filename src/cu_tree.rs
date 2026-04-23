@@ -3418,8 +3418,8 @@ fn get_qpy_pred<P: Pixel>(
     let y_qg = y_base & !min_qp_mask;
     let x_cb = (x_qg >> state.log2_min_cb_size) as usize;
     let y_cb = (y_qg >> state.log2_min_cb_size) as usize;
-    let available_a = (x_base & ctb_mask) != 0 && (x_qg & ctb_mask) != 0;
-    let available_b = (y_base & ctb_mask) != 0 && (y_qg & ctb_mask) != 0;
+    let available_a = x_cb > 0 && (x_base & ctb_mask) != 0 && (x_qg & ctb_mask) != 0;
+    let available_b = y_cb > 0 && (y_base & ctb_mask) != 0 && (y_qg & ctb_mask) != 0;
 
     let qpy_pred_fallback = if state.first_qp_group || (x_qg == 0 && y_qg == 0) {
         state.first_qp_group = !state.is_cu_qp_delta_coded;
