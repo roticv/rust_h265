@@ -362,7 +362,7 @@ impl<P: Pixel> PictureState<P> {
             min_tb_addr_zs: {
                 // Build Z-scan order table (HEVC spec 6.5.1, FFmpeg min_tb_addr_zs).
                 // tb_mask = number of min-TBs per CTB side - 1
-                let log2_diff = (log2_ctb_size - sps.min_tb_log2_size_y) as u32;
+                let log2_diff = log2_ctb_size.saturating_sub(sps.min_tb_log2_size_y) as u32;
                 let tb_per_ctb = 1u32 << log2_diff; // min-TBs per CTB side
                 let tb_mask = tb_per_ctb - 1;
                 let ctb_size = 1u32 << log2_ctb_size;
@@ -405,14 +405,14 @@ impl<P: Pixel> PictureState<P> {
                 tab
             },
             min_tb_addr_zs_stride: {
-                let log2_diff = (log2_ctb_size - sps.min_tb_log2_size_y) as u32;
+                let log2_diff = log2_ctb_size.saturating_sub(sps.min_tb_log2_size_y) as u32;
                 let tb_per_ctb = 1u32 << log2_diff;
                 let ctb_size = 1u32 << log2_ctb_size;
                 let pic_w_in_ctbs = w.div_ceil(ctb_size);
                 (pic_w_in_ctbs * tb_per_ctb + 1) as usize
             },
             min_tb_width: {
-                let log2_diff = (log2_ctb_size - sps.min_tb_log2_size_y) as u32;
+                let log2_diff = log2_ctb_size.saturating_sub(sps.min_tb_log2_size_y) as u32;
                 let tb_per_ctb = 1u32 << log2_diff;
                 let ctb_size = 1u32 << log2_ctb_size;
                 let pic_w_in_ctbs = w.div_ceil(ctb_size);

@@ -3937,4 +3937,12 @@ mod tests {
             "/testdata/fuzz_qpy_pred_underflow.bin"
         )));
     }
+
+    #[test]
+    fn test_fuzz_min_tb_log2_overflow() {
+        fuzz_hvcc(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/fuzz_min_tb_log2_overflow.bin"
+        )));
+    }
 }
