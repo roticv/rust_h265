@@ -56,10 +56,7 @@ impl<'a> CabacReader<'a> {
     /// next two bytes naturally.
     /// Returns `Err` if `byte_offset` is too close to the end of the data
     /// to read the 2 seed bytes (malformed bitstream).
-    pub fn new(
-        data: &'a [u8],
-        byte_offset: usize,
-    ) -> Result<Self, crate::error::DecodeError> {
+    pub fn new(data: &'a [u8], byte_offset: usize) -> Result<Self, crate::error::DecodeError> {
         if byte_offset + 2 > data.len() {
             return Err(crate::error::DecodeError::InvalidSyntax(
                 "CABAC init byte offset past end of RBSP",
@@ -236,10 +233,7 @@ impl<'a> CabacReader<'a> {
     ///
     /// Returns `Err` if `byte_offset` is too close to the end of the RBSP
     /// to read the 2 seed bytes (malformed bitstream).
-    pub fn reinit_at(
-        &mut self,
-        byte_offset: usize,
-    ) -> Result<(), crate::error::DecodeError> {
+    pub fn reinit_at(&mut self, byte_offset: usize) -> Result<(), crate::error::DecodeError> {
         if byte_offset + 2 > self.data.len() {
             return Err(crate::error::DecodeError::InvalidSyntax(
                 "CABAC reinit byte offset past end of RBSP",

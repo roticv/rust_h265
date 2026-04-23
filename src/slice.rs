@@ -797,9 +797,8 @@ fn parse_pred_weight_table(
                 // Spec equation 7-59: effective offset includes the shift-back.
                 // Use i64 to avoid overflow from malformed read_se() values.
                 let w64 = wt.chroma_weight_l0[i][j] as i64;
-                let off =
-                    (delta_o as i64 - ((128i64 * w64) >> wt.chroma_log2_weight_denom) + 128)
-                        .clamp(-128, 127);
+                let off = (delta_o as i64 - ((128i64 * w64) >> wt.chroma_log2_weight_denom) + 128)
+                    .clamp(-128, 127);
                 wt.chroma_offset_l0[i][j] = off as i16;
             }
         } else {
@@ -836,9 +835,9 @@ fn parse_pred_weight_table(
                     wt.chroma_weight_l1[i][j] = chroma_denom.saturating_add(delta_w);
                     // Use i64 to avoid overflow from malformed read_se() values.
                     let w64 = wt.chroma_weight_l1[i][j] as i64;
-                    let off =
-                        (delta_o as i64 - ((128i64 * w64) >> wt.chroma_log2_weight_denom) + 128)
-                            .clamp(-128, 127);
+                    let off = (delta_o as i64 - ((128i64 * w64) >> wt.chroma_log2_weight_denom)
+                        + 128)
+                        .clamp(-128, 127);
                     wt.chroma_offset_l1[i][j] = off as i16;
                 }
             } else {

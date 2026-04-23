@@ -528,8 +528,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         ));
     }
     let min_tb_log2_size_y = (log2_min_luma_transform_block_size_minus2 + 2) as u8;
-    let max_tb_log2_size_y =
-        min_tb_log2_size_y + log2_diff_max_min_luma_transform_block_size as u8;
+    let max_tb_log2_size_y = min_tb_log2_size_y + log2_diff_max_min_luma_transform_block_size as u8;
 
     let max_transform_hierarchy_depth_inter = r.read_ue()?;
     let max_transform_hierarchy_depth_intra = r.read_ue()?;

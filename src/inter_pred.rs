@@ -754,7 +754,9 @@ pub fn motion_compensation_pu<P: Pixel>(
             if idx >= ref_frames_l1.len() {
                 return;
             }
-            (&ref_frames_l1[idx], mvf.mv[1],
+            (
+                &ref_frames_l1[idx],
+                mvf.mv[1],
                 mvf.ref_idx[1] as usize,
                 false,
             )

@@ -496,7 +496,10 @@ pub fn decode_coding_quadtree<P: Pixel>(
     // sentinel so the first TU with non-zero CBF in this group will
     // signal a fresh cu_qp_delta.
     if pps.cu_qp_delta_enabled_flag
-        && log2_cb_size >= sps.ctb_log2_size_y.saturating_sub(pps.diff_cu_qp_delta_depth as u8)
+        && log2_cb_size
+            >= sps
+                .ctb_log2_size_y
+                .saturating_sub(pps.diff_cu_qp_delta_depth as u8)
     {
         state.is_cu_qp_delta_coded = false;
         state.last_cu_qp_delta = 0;
@@ -3407,7 +3410,9 @@ fn get_qpy_pred<P: Pixel>(
     y_base: u32,
 ) -> i32 {
     let ctb_mask: u32 = (1u32 << sps.ctb_log2_size_y) - 1;
-    let min_qp_log2 = sps.ctb_log2_size_y.saturating_sub(pps.diff_cu_qp_delta_depth as u8);
+    let min_qp_log2 = sps
+        .ctb_log2_size_y
+        .saturating_sub(pps.diff_cu_qp_delta_depth as u8);
     let min_qp_mask: u32 = (1u32 << min_qp_log2) - 1;
     let x_qg = x_base & !min_qp_mask;
     let y_qg = y_base & !min_qp_mask;
@@ -3472,7 +3477,9 @@ fn maybe_save_qpy_pred<P: Pixel>(
     y0: u32,
     log2_cb_size: u8,
 ) {
-    let min_qp_log2 = sps.ctb_log2_size_y.saturating_sub(pps.diff_cu_qp_delta_depth as u8);
+    let min_qp_log2 = sps
+        .ctb_log2_size_y
+        .saturating_sub(pps.diff_cu_qp_delta_depth as u8);
     let mask: u32 = (1u32 << min_qp_log2) - 1;
     let cb_size = 1u32 << log2_cb_size;
     if ((x0 + cb_size) & mask) == 0 && ((y0 + cb_size) & mask) == 0 {
