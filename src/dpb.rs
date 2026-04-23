@@ -177,6 +177,11 @@ impl DecodedPictureBuffer {
         Self::default()
     }
 
+    /// Discard all pictures (e.g. on a bit-depth change between sequences).
+    pub fn clear(&mut self) {
+        self.pictures.clear();
+    }
+
     /// Populate sizing fields from the active SPS. Should be called once
     /// per activated SPS (idempotent — calling twice is harmless).
     pub fn configure_from_sps(&mut self, sps: &Sps) {

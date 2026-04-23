@@ -361,7 +361,13 @@ impl Decoder {
                 Ok(None)
             }
             NalUnitType::Sps => {
-                self.sps = Some(parse_sps(&nal.rbsp)?);
+                let new_sps = parse_sps(&nal.rbsp)?;
+                let old_bd = self.sps.as_ref().map(|s| s.bit_depth_luma);
+                if old_bd.is_some() && old_bd != Some(new_sps.bit_depth_luma) {
+                    self.dpb.clear();
+                    self.current_picture = None;
+                }
+                self.sps = Some(new_sps);
                 self.tile_tables = None;
                 Ok(None)
             }
@@ -4009,5 +4015,13 @@ mod tests {
             46, 8, 8, 3, 146, 73, 36, 146, 73, 36, 73, 44, 146, 200, 111, 110,
             108, 121, 23, 32, 200, 255,
         ]);
+    }
+
+    #[test]
+    fn test_fuzz_pixel_u8_as_u16() {
+        fuzz_annex_b(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/fuzz_bit_depth_change.h265"
+        )));
     }
 }
