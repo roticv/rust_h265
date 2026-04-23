@@ -184,7 +184,7 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
     let num_ref_idx_l0_default_active_minus1 = r.read_ue()?;
     let num_ref_idx_l1_default_active_minus1 = r.read_ue()?;
     let init_qp_minus26 = r.read_se()?;
-    let init_qp = init_qp_minus26 + 26;
+    let init_qp = init_qp_minus26.saturating_add(26);
     let constrained_intra_pred_flag = r.read_bit()? == 1;
     let transform_skip_enabled_flag = r.read_bit()? == 1;
 
