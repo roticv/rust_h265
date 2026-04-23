@@ -179,9 +179,12 @@ pub fn parse_scaling_list_data(
                     };
 
                     let scaling_list_delta_coef = r.read_se()?;
+                    // Spec range: -128..127. Clamp on malformed input to
+                    // avoid overflow in the mod-256 arithmetic.
+                    let delta = scaling_list_delta_coef.clamp(-128, 127);
                     // Wrapping mod-256 arithmetic matching FFmpeg's
                     // `(next_coef + 256U + scaling_list_delta_coef) % 256`.
-                    next_coef = (next_coef + scaling_list_delta_coef + 256).rem_euclid(256);
+                    next_coef = (next_coef + delta + 256).rem_euclid(256);
                     sl.sl[size_id as usize][matrix_id][pos] = next_coef as u8;
                 }
             }
