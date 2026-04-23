@@ -1931,13 +1931,13 @@ fn decode_mvd_abs(cabac: &mut CabacReader) -> i32 {
     let mut k: u32 = 1;
     const CABAC_MAX_BIN: u32 = 31;
     while k < CABAC_MAX_BIN && cabac.decode_bypass() != 0 {
-        ret += 1 << k;
+        ret = ret.saturating_add(1 << k);
         k += 1;
     }
     let mut kk = k;
     while kk > 0 {
         kk -= 1;
-        ret += (cabac.decode_bypass() as i32) << kk;
+        ret = ret.saturating_add((cabac.decode_bypass() as i32) << kk);
     }
     // Sign bit.
     if cabac.decode_bypass() != 0 {

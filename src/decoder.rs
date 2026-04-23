@@ -3974,4 +3974,12 @@ mod tests {
             238, 251, 8, 255, 238, 8, 106, 36,
         ]);
     }
+
+    #[test]
+    fn test_fuzz_mvd_abs_overflow() {
+        fuzz_annex_b(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/fuzz_mvd_overflow.h265"
+        )));
+    }
 }
