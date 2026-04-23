@@ -293,7 +293,7 @@ fn sao_edge_filter<P: Pixel>(
     };
     let end_x = if a_dx == 1 || b_dx == 1 {
         if x0 + width >= pic_w || no_cross_right {
-            width - 1
+            width.saturating_sub(1)
         } else {
             width
         }
@@ -307,7 +307,7 @@ fn sao_edge_filter<P: Pixel>(
     };
     let end_y = if a_dy == 1 || b_dy == 1 {
         if y0 + height >= pic_h || no_cross_bottom {
-            height - 1
+            height.saturating_sub(1)
         } else {
             height
         }
