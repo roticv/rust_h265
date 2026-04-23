@@ -599,8 +599,9 @@ pub fn parse_slice_segment_header(
                 // (entry_point_offset_minus1[0] + 1), substream 2 starts at
                 // (entry_point_offset_minus1[0] + 1) +
                 // (entry_point_offset_minus1[1] + 1), etc.
-                cumulative = cumulative
-                    .checked_add(v + 1)
+                cumulative = v
+                    .checked_add(1)
+                    .and_then(|d| cumulative.checked_add(d))
                     .ok_or(DecodeError::InvalidSyntax("entry_point_offset overflow"))?;
                 entry_point_offsets.push(cumulative);
             }
