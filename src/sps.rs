@@ -392,19 +392,26 @@ impl Sps {
     }
 
     /// Cropped output width in luma samples (after conformance window).
-    /// For 4:2:0, `SubWidthC = 2`.
+    /// For 4:2:0, `SubWidthC = 2`. Saturates to 0 on malformed input where
+    /// the conformance window exceeds the picture dimensions.
     pub fn cropped_width(&self) -> u32 {
-        let sub_width_c = if self.chroma_format_idc == 1 { 2 } else { 1 };
-        self.pic_width_in_luma_samples
-            - sub_width_c * (self.conf_win_left_offset + self.conf_win_right_offset)
+        let sub_width_c: u32 = if self.chroma_format_idc == 1 { 2 } else { 1 };
+        let crop = sub_width_c.saturating_mul(
+            self.conf_win_left_offset
+                .saturating_add(self.conf_win_right_offset),
+        );
+        self.pic_width_in_luma_samples.saturating_sub(crop)
     }
 
     /// Cropped output height in luma samples (after conformance window).
-    /// For 4:2:0, `SubHeightC = 2`.
+    /// For 4:2:0, `SubHeightC = 2`. Saturates to 0 on malformed input.
     pub fn cropped_height(&self) -> u32 {
-        let sub_height_c = if self.chroma_format_idc == 1 { 2 } else { 1 };
-        self.pic_height_in_luma_samples
-            - sub_height_c * (self.conf_win_top_offset + self.conf_win_bottom_offset)
+        let sub_height_c: u32 = if self.chroma_format_idc == 1 { 2 } else { 1 };
+        let crop = sub_height_c.saturating_mul(
+            self.conf_win_top_offset
+                .saturating_add(self.conf_win_bottom_offset),
+        );
+        self.pic_height_in_luma_samples.saturating_sub(crop)
     }
 }
 
