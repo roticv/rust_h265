@@ -3945,4 +3945,12 @@ mod tests {
             "/testdata/fuzz_min_tb_log2_overflow.bin"
         )));
     }
+
+    #[test]
+    fn test_fuzz_parallel_merge_level_overflow() {
+        fuzz_hvcc(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/fuzz_parallel_merge_level_overflow.bin"
+        )));
+    }
 }

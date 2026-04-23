@@ -67,6 +67,9 @@ const MAX_PB_CHROMA: usize = (MAX_PB_SIZE / 2) * (MAX_PB_SIZE / 2);
 /// Generic over `P: Pixel` for multi-bit-depth support.
 #[inline]
 fn ref_sample<P: Pixel>(plane: &[P], stride: usize, x: i32, y: i32, w: i32, h: i32) -> i32 {
+    if w <= 0 || h <= 0 {
+        return 0;
+    }
     let cx = x.clamp(0, w - 1) as usize;
     let cy = y.clamp(0, h - 1) as usize;
     let idx = cy * stride + cx;

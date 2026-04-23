@@ -798,6 +798,9 @@ fn decode_part_mode(
 /// 8.5.3.2.2, `is_diff_mer` in FFmpeg).
 fn is_diff_mer(log2_parallel_merge_level: u8, x_n: i32, y_n: i32, x_p: i32, y_p: i32) -> bool {
     let pl = log2_parallel_merge_level;
+    if pl >= 32 {
+        return false; // merge region covers the entire picture
+    }
     (x_n >> pl) == (x_p >> pl) && (y_n >> pl) == (y_p >> pl)
 }
 
