@@ -3953,4 +3953,12 @@ mod tests {
             "/testdata/fuzz_parallel_merge_level_overflow.bin"
         )));
     }
+
+    #[test]
+    fn test_fuzz_dequant_qp_overflow() {
+        fuzz_annex_b(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/fuzz_dequant_qp_overflow.h265"
+        )));
+    }
 }

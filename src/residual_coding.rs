@@ -411,10 +411,10 @@ pub struct ResidualBlock {
 /// 16 (no scaling lists) or looked up from the active scaling matrix (when
 /// `scaling_list_enabled_flag = 1`).
 fn compute_dequant_scale(qp: i32, log2_trafo_size: u8, bit_depth: u8) -> (u32, u32, u32) {
-    let shift = (bit_depth as u32 + log2_trafo_size as u32) - 5;
-    let add = 1u32 << (shift - 1);
-    let qp = qp as usize;
-    let scale = LEVEL_SCALE[qp % 6] << (qp / 6);
+    let shift = (bit_depth as u32 + log2_trafo_size as u32).saturating_sub(5);
+    let add = if shift > 0 { 1u32 << (shift - 1) } else { 0 };
+    let qp = qp.max(0) as usize;
+    let scale = LEVEL_SCALE[qp % 6] << (qp / 6).min(31);
     (shift, add, scale)
 }
 
