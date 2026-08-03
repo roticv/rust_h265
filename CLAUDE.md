@@ -5,8 +5,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Status
 
 **Feature-complete for Main and Main 10 profile (8-bit and 10-bit 4:2:0).**
-127 tests pass. Byte-exact against FFmpeg on all in-tree fixtures plus 6
-real-world Big Buck Bunny 1080p transcodes (8-bit and 10-bit). No SIMD yet.
+Intra-only **4:4:4** (8-bit and 10-bit, ChromaArrayType 3) is also supported
+for still-image use (HEIF/HEIC); 4:4:4 inter (P/B) slices are rejected with
+`Unsupported`, and 4:2:2 is not supported. 169 tests pass. Byte-exact against
+FFmpeg on all in-tree fixtures plus 6 real-world Big Buck Bunny 1080p
+transcodes (8-bit and 10-bit). No SIMD yet.
 
 ## Build Commands
 

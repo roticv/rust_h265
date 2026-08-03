@@ -172,11 +172,24 @@ pub struct PictureState<P: Pixel> {
     pub min_pu_width: usize,
     pub tab_ct_depth: Vec<u8>,
     pub tab_ipm: Vec<u8>,
+    /// Per-min-PU chroma intra mode (luma-mode space). For 4:2:0/4:2:2 the
+    /// whole CU shares one chroma mode; for 4:4:4 with PART_NxN each of the
+    /// four PUs has its own, so the transform unit looks the mode up by
+    /// position here rather than from `last_chroma_pred_mode`.
+    pub tab_chroma_ipm: Vec<u8>,
     pub y_plane: Vec<P>,
     pub u_plane: Vec<P>,
     pub v_plane: Vec<P>,
     pub y_stride: usize,
     pub uv_stride: usize,
+    /// `ChromaArrayType` (1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4). Selects the chroma
+    /// geometry used across prediction, residual, and loop filters.
+    pub chroma_array_type: u32,
+    /// `log2(SubWidthC)` / `log2(SubHeightC)`: 1 for a subsampled chroma
+    /// dimension (4:2:0 both; 4:2:2 width only), 0 for a full-resolution one
+    /// (4:4:4 both; 4:2:2 height). Used to map luma coordinates to chroma.
+    pub chroma_shift_w: u32,
+    pub chroma_shift_h: u32,
 
     /// Phase 2c-1 sentinel: most recently decoded luma intra mode of the
     /// most recently decoded CU. Will go away once full CU decode is wired up.
@@ -292,8 +305,15 @@ impl<P: Pixel> PictureState<P> {
         let min_tb_height = (h_aligned >> log2_min_tb_size) as usize;
         // Pixel planes use CTU-aligned dimensions so that CUs at the picture
         // edge (which extend into the padding area) can read/write without OOB.
+        // Chroma geometry (spec table 6-1). `chroma_shift_*` is `log2` of the
+        // subsampling factor, so `luma >> shift` yields the chroma coordinate
+        // and `w_aligned >> shift` the chroma plane extent. For 4:2:0 both are
+        // 1, reproducing the previous `>> 1` / `/ 2` behaviour exactly.
+        let chroma_array_type = sps.chroma_array_type();
+        let chroma_shift_w = if sps.sub_width_c() == 2 { 1 } else { 0 };
+        let chroma_shift_h = if sps.sub_height_c() == 2 { 1 } else { 0 };
         let y_stride = w_aligned as usize;
-        let uv_stride = (w_aligned / 2) as usize;
+        let uv_stride = (w_aligned >> chroma_shift_w) as usize;
         Self {
             width: w,
             height: h,
@@ -307,11 +327,21 @@ impl<P: Pixel> PictureState<P> {
             // Default IPM is INTRA_DC (matches FFmpeg
             // `intra_prediction_unit_default_value`).
             tab_ipm: vec![INTRA_DC; min_pu_width * min_pu_height],
+            tab_chroma_ipm: vec![INTRA_DC; min_pu_width * min_pu_height],
             y_plane: vec![P::zero(); (w_aligned * h_aligned) as usize],
-            u_plane: vec![P::zero(); ((w_aligned / 2) * (h_aligned / 2)) as usize],
-            v_plane: vec![P::zero(); ((w_aligned / 2) * (h_aligned / 2)) as usize],
+            u_plane: vec![
+                P::zero();
+                ((w_aligned >> chroma_shift_w) * (h_aligned >> chroma_shift_h)) as usize
+            ],
+            v_plane: vec![
+                P::zero();
+                ((w_aligned >> chroma_shift_w) * (h_aligned >> chroma_shift_h)) as usize
+            ],
             y_stride,
             uv_stride,
+            chroma_array_type,
+            chroma_shift_w,
+            chroma_shift_h,
             last_luma_pred_mode: 0,
             last_chroma_pred_mode: 0,
             cu_count: 0,
@@ -2864,13 +2894,16 @@ fn decode_transform_tree<P: Pixel>(
 
     state.last_split_transform_flag = split_transform_flag;
 
-    // 2) Chroma cbf decode. For 4:2:0 (chroma_format_idc==1) we only do this
-    //    when log2_trafo_size > 2 (chroma TUs would otherwise be 2×2, which is
-    //    illegal). The flag is decoded when either (a) we're at the root of
-    //    the transform tree, or (b) the parent already had a non-zero cbf.
+    // 2) Chroma cbf decode (spec 7.3.8.8). Signalled when the chroma TB would
+    //    be at least 4×4: `log2_trafo_size > 2`, or always for 4:4:4
+    //    (`ChromaArrayType == 3`), where the chroma TB matches the luma TB and
+    //    can be 4×4. (4:2:0's 2×2 chroma TB is illegal, hence the size gate.)
+    //    The flag is decoded when either (a) we're at the transform-tree root,
+    //    or (b) the parent already had a non-zero cbf.
     let mut cbf_cb = parent_cbf.cbf_cb;
     let mut cbf_cr = parent_cbf.cbf_cr;
-    if sps.chroma_format_idc == 1 && log2_trafo_size > 2 {
+    let cat = sps.chroma_array_type();
+    if cat != 0 && (log2_trafo_size > 2 || cat == 3) {
         if trafo_depth == 0 || parent_cbf.cbf_cb {
             cbf_cb = decode_cbf_cb_cr(cabac, contexts, trafo_depth) != 0;
         }
@@ -3142,6 +3175,10 @@ fn decode_transform_unit<P: Pixel>(
     let new_cbf = inherited;
     let do_chroma_inline = sps.chroma_format_idc == 1 && log2_trafo_size > 2;
     let do_chroma_deferred = sps.chroma_format_idc == 1 && log2_trafo_size == 2 && blk_idx == 3;
+    // 4:4:4: the chroma TB matches the luma TB one-for-one — processed at every
+    // leaf, at the luma position and size, with no half-size scaling and no
+    // 4×4 deferral.
+    let do_chroma_444 = sps.chroma_array_type() == 3;
 
     if cbf_luma || inherited.cbf_cb || inherited.cbf_cr {
         if pps.cu_qp_delta_enabled_flag && !state.is_cu_qp_delta_coded {
@@ -3230,18 +3267,53 @@ fn decode_transform_unit<P: Pixel>(
         // ---- Step 4: chroma prediction + (optional) residual.
         // For 4:2:0, chroma TU is at log2_trafo_size - 1 (half the luma TU).
         // The chroma QP is derived from the luma QP via spec table 8-9.
-        let log2_trafo_size_c = if do_chroma_inline || do_chroma_deferred {
-            if do_chroma_inline {
-                log2_trafo_size - 1
-            } else {
-                log2_trafo_size // deferred uses parent's log2 size
-            }
+        let log2_trafo_size_c = if do_chroma_444 {
+            log2_trafo_size
+        } else if do_chroma_inline {
+            log2_trafo_size - 1
+        } else if do_chroma_deferred {
+            log2_trafo_size // deferred uses parent's log2 size
         } else {
             0 // unused
         };
 
         if is_intra {
-            if do_chroma_inline {
+            if do_chroma_444 {
+                // 4:4:4 chroma modes are per-PU; look the leaf's up by
+                // position and stage it so the residual scan order (which
+                // reads `last_chroma_pred_mode`) matches.
+                let x_pu = (x0 >> state.log2_min_pu_size) as usize;
+                let y_pu = (y0 >> state.log2_min_pu_size) as usize;
+                let chroma_mode = state.tab_chroma_ipm[y_pu * state.min_pu_width + x_pu];
+                state.last_chroma_pred_mode = chroma_mode;
+                predict_intra_chroma(
+                    state,
+                    sps,
+                    x0,
+                    y0,
+                    log2_trafo_size,
+                    chroma_mode,
+                    pps.constrained_intra_pred_flag,
+                )?;
+                decode_chroma_residuals(
+                    cabac,
+                    contexts,
+                    state,
+                    sps,
+                    pps,
+                    x0,
+                    y0,
+                    log2_trafo_size_c,
+                    log2_trafo_size,
+                    qp_y,
+                    inherited.cbf_cb,
+                    inherited.cbf_cr,
+                    true,
+                    cu_transquant_bypass,
+                    slice_params.slice_cb_qp_offset,
+                    slice_params.slice_cr_qp_offset,
+                )?;
+            } else if do_chroma_inline {
                 let chroma_mode = state.last_chroma_pred_mode;
                 predict_intra_chroma(
                     state,
@@ -3301,16 +3373,18 @@ fn decode_transform_unit<P: Pixel>(
                 )?;
             }
         } else {
-            // Inter chroma residual. Two paths per spec 7.3.8.11:
-            //  * `do_chroma_inline` — standard case, chroma TU is half the
-            //    luma TU size.
+            // Inter chroma residual. Paths per spec 7.3.8.11:
+            //  * `do_chroma_inline` (4:2:0) / `do_chroma_444` — chroma TU at
+            //    the luma position; the size difference (half for 4:2:0, equal
+            //    for 4:4:4) is already carried by `log2_trafo_size_c`, so the
+            //    residual_coding() call is identical.
             //  * `do_chroma_deferred` — luma has split to 4×4 at blk_idx 3,
             //    so chroma residual lives at the parent's position and size.
             //    FFmpeg `hls_transform_unit` handles this unconditionally
             //    (whether intra or inter); our previous code only handled
             //    the intra side, so inter CUs with 4×4 luma TUs were
             //    silently skipping the chroma residual_coding() calls.
-            if do_chroma_inline && (inherited.cbf_cb || inherited.cbf_cr) {
+            if (do_chroma_inline || do_chroma_444) && (inherited.cbf_cb || inherited.cbf_cr) {
                 decode_chroma_residuals(
                     cabac,
                     contexts,
@@ -3351,7 +3425,20 @@ fn decode_transform_unit<P: Pixel>(
             }
         }
     } else if is_intra {
-        if do_chroma_inline {
+        if do_chroma_444 {
+            let x_pu = (x0 >> state.log2_min_pu_size) as usize;
+            let y_pu = (y0 >> state.log2_min_pu_size) as usize;
+            let chroma_mode = state.tab_chroma_ipm[y_pu * state.min_pu_width + x_pu];
+            predict_intra_chroma(
+                state,
+                sps,
+                x0,
+                y0,
+                log2_trafo_size,
+                chroma_mode,
+                pps.constrained_intra_pred_flag,
+            )?;
+        } else if do_chroma_inline {
             let chroma_mode = state.last_chroma_pred_mode;
             predict_intra_chroma(
                 state,
@@ -3534,15 +3621,15 @@ fn decode_chroma_residuals<P: Pixel>(
     slice_cb_qp_offset: i32,
     slice_cr_qp_offset: i32,
 ) -> Result<(), DecodeError> {
-    let x_c = (x0 >> 1) as usize;
-    let y_c = (y0 >> 1) as usize;
+    let x_c = (x0 >> state.chroma_shift_w) as usize;
+    let y_c = (y0 >> state.chroma_shift_h) as usize;
 
     for c_idx in 1..=2u8 {
         let cbf = if c_idx == 1 { cbf_cb } else { cbf_cr };
         if !cbf {
             continue;
         }
-        // Derive chroma QP per spec 8.6.1 / table 8-9.
+        // Derive chroma QP per spec 8.6.1.
         // Sum PPS-level, slice-level, and CU-level chroma QP offsets.
         let qp_offset = if c_idx == 1 {
             pps.pps_cb_qp_offset + slice_cb_qp_offset + state.cu_qp_offset_cb
@@ -3550,13 +3637,19 @@ fn decode_chroma_residuals<P: Pixel>(
             pps.pps_cr_qp_offset + slice_cr_qp_offset + state.cu_qp_offset_cr
         };
         let qp_i = (qp_y + qp_offset).clamp(0, 57);
-        let qp_c = if qp_i < 30 {
-            qp_i
-        } else if qp_i > 43 {
-            qp_i - 6
+        // ChromaArrayType 1 (4:2:0) maps qPi → QpC via table 8-10; 4:2:2 and
+        // 4:4:4 use `Min(qPi, 51)` directly.
+        let qp_c = if state.chroma_array_type == 1 {
+            if qp_i < 30 {
+                qp_i
+            } else if qp_i > 43 {
+                qp_i - 6
+            } else {
+                const QP_C: [i32; 14] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37];
+                QP_C[(qp_i - 30) as usize]
+            }
         } else {
-            const QP_C: [i32; 14] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37];
-            QP_C[(qp_i - 30) as usize]
+            qp_i.min(51)
         };
 
         let plane = if c_idx == 1 {
@@ -3957,15 +4050,18 @@ fn predict_intra_chroma<P: Pixel>(
     constrained_intra_pred_flag: bool,
 ) -> Result<(), DecodeError> {
     let size = 1usize << log2_size;
-    let pic_w_c = (state.width / 2) as usize;
-    let pic_h_c = (state.height / 2) as usize;
-    let x_c = (x0_luma >> 1) as usize;
-    let y_c = (y0_luma >> 1) as usize;
+    let pic_w_c = (state.width >> state.chroma_shift_w) as usize;
+    let pic_h_c = (state.height >> state.chroma_shift_h) as usize;
+    let x_c = (x0_luma >> state.chroma_shift_w) as usize;
+    let y_c = (y0_luma >> state.chroma_shift_h) as usize;
     let avail = compute_chroma_avail(
         state,
         x0_luma,
         y0_luma,
-        (size as u32) * 2,
+        // Availability is computed in luma coordinates; a `size`-wide chroma
+        // block spans `size << SubWidthC-shift` luma samples (equal in both
+        // dimensions for 4:2:0 and 4:4:4).
+        (size as u32) << state.chroma_shift_w,
         constrained_intra_pred_flag,
     );
     let dst_stride = state.uv_stride;
@@ -3991,8 +4087,12 @@ fn predict_intra_chroma<P: Pixel>(
             )
         };
 
-        // Reference sample filtering for angular chroma modes.
-        if (2..=34).contains(&mode) {
+        // Reference sample filtering. For 4:4:4 (ChromaArrayType == 3) chroma
+        // is smoothed exactly like luma: PLANAR and angular modes are filtered,
+        // DC (mode 1) is not. `filter_reference_samples` no-ops for other chroma
+        // formats and for the size-4 case. (Mirrors the luma path; using the
+        // narrower `2..=34` here would skip PLANAR, a subtle reconstruction bug.)
+        if mode != 1 {
             filter_reference_samples(
                 &mut top,
                 &mut left,
@@ -4172,25 +4272,68 @@ fn decode_intra_mode_signaling<P: Pixel>(
         write_intra_pred_mode(state, pu_x, pu_y, pb_size, intra_pred_mode[k]);
     }
 
-    // 3) intra_chroma_pred_mode (single value for the whole CU at 4:2:0).
-    let chroma_mode_idx = decode_intra_chroma_pred_mode(cabac, contexts);
-    let chroma_pred_mode = if chroma_mode_idx == 4 {
-        // DM mode: chroma uses luma mode.
-        intra_pred_mode[0]
+    // 3) intra_chroma_pred_mode. Signalled once for the whole CU, except for
+    //    4:4:4 (ChromaArrayType==3) with PART_NxN, where each of the four PUs
+    //    carries its own value (spec 7.3.8.5). Each value resolves to a
+    //    luma-space mode via the DM rule against its co-located luma PU.
+    let n_chroma = if state.chroma_array_type == 3 && split {
+        n_pus
     } else {
-        // Spec table 8-3: chroma_mode_idx → luma-mode space.
-        const TABLE: [u8; 4] = [INTRA_PLANAR, INTRA_ANGULAR_26, INTRA_ANGULAR_10, INTRA_DC];
-        let mapped = TABLE[chroma_mode_idx as usize];
-        if intra_pred_mode[0] == mapped {
-            INTRA_ANGULAR_34
-        } else {
-            mapped
-        }
+        1
     };
+    let mut chroma_modes = [INTRA_DC; 4];
+    for (k, slot) in chroma_modes.iter_mut().enumerate().take(n_chroma) {
+        let chroma_mode_idx = decode_intra_chroma_pred_mode(cabac, contexts);
+        let luma = intra_pred_mode[k];
+        *slot = if chroma_mode_idx == 4 {
+            // DM mode: chroma uses the co-located luma PU's mode.
+            luma
+        } else {
+            // Spec table 8-3: chroma_mode_idx → luma-mode space.
+            const TABLE: [u8; 4] = [INTRA_PLANAR, INTRA_ANGULAR_26, INTRA_ANGULAR_10, INTRA_DC];
+            let mapped = TABLE[chroma_mode_idx as usize];
+            if luma == mapped {
+                INTRA_ANGULAR_34
+            } else {
+                mapped
+            }
+        };
+    }
+
+    // Publish the chroma mode(s) per position so the transform unit can look
+    // them up. With a single mode it covers the whole CU; the 4:4:4 NxN case
+    // writes each PU's mode into its quadrant.
+    if n_chroma == 1 {
+        write_chroma_pred_mode(state, x0, y0, cb_size, chroma_modes[0]);
+    } else {
+        for (k, &mode) in chroma_modes.iter().enumerate().take(n_pus) {
+            let pj = (k % side) as u32;
+            let pi = (k / side) as u32;
+            write_chroma_pred_mode(state, x0 + pb_size * pj, y0 + pb_size * pi, pb_size, mode);
+        }
+    }
 
     state.last_luma_pred_mode = intra_pred_mode[0];
-    state.last_chroma_pred_mode = chroma_pred_mode;
+    state.last_chroma_pred_mode = chroma_modes[0];
     Ok(())
+}
+
+fn write_chroma_pred_mode<P: Pixel>(
+    state: &mut PictureState<P>,
+    x0: u32,
+    y0: u32,
+    pu_size: u32,
+    mode: u8,
+) {
+    let size_in_pus = (pu_size >> state.log2_min_pu_size).max(1) as usize;
+    let x_pu = (x0 >> state.log2_min_pu_size) as usize;
+    let y_pu = (y0 >> state.log2_min_pu_size) as usize;
+    for j in 0..size_in_pus {
+        let row = (y_pu + j) * state.min_pu_width;
+        for i in 0..size_in_pus {
+            state.tab_chroma_ipm[row + x_pu + i] = mode;
+        }
+    }
 }
 
 fn write_intra_pred_mode<P: Pixel>(
