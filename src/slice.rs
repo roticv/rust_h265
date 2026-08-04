@@ -936,6 +936,7 @@ mod tests {
             },
             sps_seq_parameter_set_id: 0,
             chroma_format_idc: 1,
+            separate_colour_plane_flag: false,
             pic_width_in_luma_samples: 16,
             pic_height_in_luma_samples: 16,
             conf_win_left_offset: 0,

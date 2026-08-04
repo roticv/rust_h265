@@ -315,6 +315,9 @@ pub struct Sps {
     pub profile_tier_level: ProfileTierLevel,
     pub sps_seq_parameter_set_id: u32,
     pub chroma_format_idc: u32,
+    /// When `chroma_format_idc == 3` and this is set, the three colour planes
+    /// are coded as separate monochrome pictures (`ChromaArrayType = 0`).
+    pub separate_colour_plane_flag: bool,
     pub pic_width_in_luma_samples: u32,
     pub pic_height_in_luma_samples: u32,
     /// Conformance window crop offsets (in chroma sample units for 4:2:0).
@@ -381,6 +384,34 @@ pub struct Sps {
 }
 
 impl Sps {
+    /// `ChromaArrayType` (spec 7.4.3.2.1): equals `chroma_format_idc` unless
+    /// the 4:4:4 planes are coded separately, in which case it is 0.
+    pub fn chroma_array_type(&self) -> u32 {
+        if self.separate_colour_plane_flag {
+            0
+        } else {
+            self.chroma_format_idc
+        }
+    }
+
+    /// `SubWidthC` (spec table 6-1): horizontal chroma subsampling factor.
+    /// 4:2:0 and 4:2:2 → 2; 4:4:4 and monochrome → 1.
+    pub fn sub_width_c(&self) -> u32 {
+        match self.chroma_array_type() {
+            1 | 2 => 2,
+            _ => 1,
+        }
+    }
+
+    /// `SubHeightC` (spec table 6-1): vertical chroma subsampling factor.
+    /// 4:2:0 → 2; 4:2:2, 4:4:4, monochrome → 1.
+    pub fn sub_height_c(&self) -> u32 {
+        match self.chroma_array_type() {
+            1 => 2,
+            _ => 1,
+        }
+    }
+
     /// `PicWidthInCtbsY` (spec eq. 7-15).
     pub fn pic_width_in_ctbs_y(&self) -> u32 {
         self.pic_width_in_luma_samples.div_ceil(self.ctb_size_y)
@@ -430,12 +461,27 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
 
     let sps_seq_parameter_set_id = r.read_ue()?;
     let chroma_format_idc = r.read_ue()?;
-    if chroma_format_idc != 1 {
+    if chroma_format_idc > 3 {
+        return Err(DecodeError::InvalidSyntax("chroma_format_idc out of range"));
+    }
+    let mut separate_colour_plane_flag = false;
+    if chroma_format_idc == 3 {
+        separate_colour_plane_flag = r.read_bit()? == 1;
+    }
+    // Supported ChromaArrayTypes: 4:2:0 (1) and 4:4:4 (3). 4:2:2 (2) and
+    // monochrome (0, including 4:4:4 with separate colour planes) are not yet
+    // wired through the reconstruction pipeline. The SPS parse stays in sync
+    // regardless. See the chroma-geometry helpers on `Sps`.
+    let chroma_array_type = if separate_colour_plane_flag {
+        0
+    } else {
+        chroma_format_idc
+    };
+    if chroma_array_type != 1 && chroma_array_type != 3 {
         return Err(DecodeError::Unsupported(
-            "only 4:2:0 (chroma_format_idc=1) supported",
+            "only 4:2:0 and 4:4:4 chroma formats supported",
         ));
     }
-    // chroma_format_idc == 3 would have a separate_colour_plane_flag here.
 
     let pic_width_in_luma_samples = r.read_ue()?;
     let pic_height_in_luma_samples = r.read_ue()?;
@@ -641,6 +687,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         profile_tier_level: ptl,
         sps_seq_parameter_set_id,
         chroma_format_idc,
+        separate_colour_plane_flag,
         pic_width_in_luma_samples,
         pic_height_in_luma_samples,
         conf_win_left_offset,
