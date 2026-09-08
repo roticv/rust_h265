@@ -79,7 +79,7 @@ pub mod error;
 pub mod nal;
 
 // --- Top-level re-exports for convenience ---
-pub use decoder::{Decoder, Frame};
+pub use decoder::{DecodeLimits, Decoder, Frame};
 pub use error::DecodeError;
 pub use nal::{NalUnit, NalUnitType, parse_annex_b, parse_hvcc, parse_nal};
 pub use pixel::{Pixel, PixelData};

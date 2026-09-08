@@ -19,7 +19,7 @@
 use std::rc::Rc;
 
 use crate::cabac::{CabacContexts, CabacReader};
-use crate::cu_tree::{PictureState, decode_coding_quadtree};
+use crate::cu_tree::{MvField, PictureState, decode_coding_quadtree};
 use crate::dpb::{
     DecodedPicture, DecodedPictureBuffer, PictureReferenceStatus, ReferencePictureSets,
     apply_ref_pic_list_modification, build_ref_pic_list_temp0, build_ref_pic_list_temp1,
@@ -243,8 +243,27 @@ impl TileScanTables {
     }
 }
 
+/// Resource limits applied before allocating storage for a decoded picture.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeLimits {
+    /// Maximum coded luma samples in one picture.
+    pub max_picture_pixels: u64,
+    /// Maximum estimated bytes needed for picture state and frame emission.
+    pub max_picture_memory_bytes: u64,
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_picture_pixels: 35_651_584,
+            max_picture_memory_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Decoder {
+    limits: DecodeLimits,
     vps: Option<Vps>,
     sps: Option<Sps>,
     pps: Option<Pps>,
@@ -287,20 +306,38 @@ pub struct Decoder {
 #[allow(clippy::too_many_arguments)]
 fn crop_frame<P: Pixel>(
     state: &crate::cu_tree::PictureState<P>,
-    _coded_w: u32,
-    _coded_h: u32,
+    coded_w: u32,
+    coded_h: u32,
     cropped_w: u32,
     cropped_h: u32,
     left_offset: u32, // in chroma sample units
     top_offset: u32,  // in chroma sample units
     poc: i32,
     bit_depth: u8,
-) -> Frame {
-    // For 4:2:0, SubWidthC = SubHeightC = 2.
-    let luma_left = (left_offset * 2) as usize;
-    let luma_top = (top_offset * 2) as usize;
-    let cw = cropped_w as usize;
-    let ch = cropped_h as usize;
+) -> Result<Frame, DecodeError> {
+    let luma_left = left_offset
+        .checked_mul(2)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(DecodeError::InvalidSyntax("invalid luma crop offset"))?;
+    let luma_top = top_offset
+        .checked_mul(2)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(DecodeError::InvalidSyntax("invalid luma crop offset"))?;
+    let cw = usize::try_from(cropped_w)
+        .map_err(|_| DecodeError::InvalidSyntax("invalid cropped width"))?;
+    let ch = usize::try_from(cropped_h)
+        .map_err(|_| DecodeError::InvalidSyntax("invalid cropped height"))?;
+    let coded_w =
+        usize::try_from(coded_w).map_err(|_| DecodeError::InvalidSyntax("invalid coded width"))?;
+    let coded_h =
+        usize::try_from(coded_h).map_err(|_| DecodeError::InvalidSyntax("invalid coded height"))?;
+    if luma_left.checked_add(cw).is_none_or(|end| end > coded_w)
+        || luma_top.checked_add(ch).is_none_or(|end| end > coded_h)
+    {
+        return Err(DecodeError::InvalidSyntax(
+            "conformance window exceeds picture dimensions",
+        ));
+    }
     let stride_y = state.y_stride;
     let stride_uv = state.uv_stride;
 
@@ -309,7 +346,7 @@ fn crop_frame<P: Pixel>(
     let no_crop =
         luma_left == 0 && luma_top == 0 && cw == stride_y && ch == state.y_plane.len() / stride_y;
     if no_crop {
-        return Frame {
+        return Ok(Frame {
             y: P::wrap_vec(state.y_plane.clone()),
             u: P::wrap_vec(state.u_plane.clone()),
             v: P::wrap_vec(state.v_plane.clone()),
@@ -317,26 +354,57 @@ fn crop_frame<P: Pixel>(
             height: cropped_h,
             pic_order_cnt: poc,
             bit_depth,
-        };
+        });
     }
 
     let mut y = Vec::with_capacity(cw * ch);
     for row in 0..ch {
         let src_row = luma_top + row;
-        let start = src_row * stride_y + luma_left;
-        y.extend_from_slice(&state.y_plane[start..start + cw]);
+        let start = src_row
+            .checked_mul(stride_y)
+            .and_then(|value| value.checked_add(luma_left))
+            .ok_or(DecodeError::InvalidSyntax("invalid luma crop range"))?;
+        let end = start
+            .checked_add(cw)
+            .ok_or(DecodeError::InvalidSyntax("invalid luma crop range"))?;
+        y.extend_from_slice(
+            state
+                .y_plane
+                .get(start..end)
+                .ok_or(DecodeError::InvalidSyntax("invalid luma crop range"))?,
+        );
     }
     let cw_c = cw / 2;
     let ch_c = ch / 2;
+    let chroma_left = usize::try_from(left_offset)
+        .map_err(|_| DecodeError::InvalidSyntax("invalid chroma crop offset"))?;
+    let chroma_top = usize::try_from(top_offset)
+        .map_err(|_| DecodeError::InvalidSyntax("invalid chroma crop offset"))?;
     let mut u = Vec::with_capacity(cw_c * ch_c);
     let mut v = Vec::with_capacity(cw_c * ch_c);
     for row in 0..ch_c {
-        let src_row = top_offset as usize + row;
-        let start = src_row * stride_uv + left_offset as usize;
-        u.extend_from_slice(&state.u_plane[start..start + cw_c]);
-        v.extend_from_slice(&state.v_plane[start..start + cw_c]);
+        let src_row = chroma_top + row;
+        let start = src_row
+            .checked_mul(stride_uv)
+            .and_then(|value| value.checked_add(chroma_left))
+            .ok_or(DecodeError::InvalidSyntax("invalid chroma crop range"))?;
+        let end = start
+            .checked_add(cw_c)
+            .ok_or(DecodeError::InvalidSyntax("invalid chroma crop range"))?;
+        u.extend_from_slice(
+            state
+                .u_plane
+                .get(start..end)
+                .ok_or(DecodeError::InvalidSyntax("invalid chroma crop range"))?,
+        );
+        v.extend_from_slice(
+            state
+                .v_plane
+                .get(start..end)
+                .ok_or(DecodeError::InvalidSyntax("invalid chroma crop range"))?,
+        );
     }
-    Frame {
+    Ok(Frame {
         y: P::wrap_vec(y),
         u: P::wrap_vec(u),
         v: P::wrap_vec(v),
@@ -344,12 +412,69 @@ fn crop_frame<P: Pixel>(
         height: cropped_h,
         pic_order_cnt: poc,
         bit_depth,
-    }
+    })
 }
 
 impl Decoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_limits(limits: DecodeLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
+    fn validate_picture_limits(&self, sps: &Sps) -> Result<(), DecodeError> {
+        let pixels = u64::from(sps.pic_width_in_luma_samples)
+            .checked_mul(u64::from(sps.pic_height_in_luma_samples))
+            .ok_or(DecodeError::ResourceLimit("picture pixel count overflow"))?;
+        if pixels > self.limits.max_picture_pixels {
+            return Err(DecodeError::ResourceLimit("picture pixel count"));
+        }
+
+        let ctb_size = 1u64 << sps.ctb_log2_size_y;
+        let width = u64::from(sps.pic_width_in_luma_samples).div_ceil(ctb_size) * ctb_size;
+        let height = u64::from(sps.pic_height_in_luma_samples).div_ceil(ctb_size) * ctb_size;
+        let aligned_pixels = width.checked_mul(height).ok_or(DecodeError::ResourceLimit(
+            "picture memory estimate overflow",
+        ))?;
+        let pixel_bytes = if sps.bit_depth_luma > 8 { 2 } else { 1 };
+        let plane_bytes =
+            aligned_pixels
+                .checked_mul(3 * pixel_bytes)
+                .ok_or(DecodeError::ResourceLimit(
+                    "picture memory estimate overflow",
+                ))?;
+        let min_pu_count = aligned_pixels >> 4;
+        let min_cb_count = aligned_pixels >> (2 * sps.min_cb_log2_size_y);
+        let min_tb_count = aligned_pixels >> (2 * sps.min_tb_log2_size_y);
+        let ctb_count = (width / ctb_size) * (height / ctb_size);
+        let table_bytes = min_pu_count
+            .checked_mul((std::mem::size_of::<MvField>() + 1) as u64)
+            .and_then(|n| n.checked_add(min_cb_count * 3))
+            .and_then(|n| n.checked_add(aligned_pixels / 8))
+            .and_then(|n| n.checked_add(min_tb_count * 5))
+            .and_then(|n| {
+                n.checked_add(
+                    ctb_count * (std::mem::size_of::<crate::sao::SaoParams>() as u64 + 18),
+                )
+            })
+            .ok_or(DecodeError::ResourceLimit(
+                "picture memory estimate overflow",
+            ))?;
+        let estimated_bytes =
+            plane_bytes
+                .checked_add(table_bytes)
+                .ok_or(DecodeError::ResourceLimit(
+                    "picture memory estimate overflow",
+                ))?;
+        if estimated_bytes > self.limits.max_picture_memory_bytes {
+            return Err(DecodeError::ResourceLimit("estimated picture memory"));
+        }
+        Ok(())
     }
 
     /// Feed one NAL unit. Returns `Ok(Some(frame))` when a picture has just
@@ -362,6 +487,7 @@ impl Decoder {
             }
             NalUnitType::Sps => {
                 let new_sps = parse_sps(&nal.rbsp)?;
+                self.validate_picture_limits(&new_sps)?;
                 let old_bd = self.sps.as_ref().map(|s| s.bit_depth_luma);
                 if old_bd.is_some() && old_bd != Some(new_sps.bit_depth_luma) {
                     self.dpb.clear();
@@ -419,7 +545,7 @@ impl Decoder {
                     bd,
                 )
             });
-            return Some(frame);
+            return frame.ok();
         }
         None
     }
@@ -958,7 +1084,7 @@ impl Decoder {
                 picture_poc,
                 bd,
             )
-        });
+        })?;
 
         // The borrows `sps` / `pps` / `tile_tables` / `last_sh` are no
         // longer used beyond this point — NLL will release them here so
@@ -1292,6 +1418,72 @@ impl Decoder {
 mod tests {
     use super::*;
     use crate::nal::parse_annex_b;
+
+    #[test]
+    fn crop_frame_rejects_invalid_ranges() {
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/tiny_intra.h265"
+        ))
+        .expect("read fixture");
+        let sps_nal = parse_annex_b(&h265)
+            .into_iter()
+            .find(|nal| nal.nal_unit_type == NalUnitType::Sps)
+            .expect("SPS NAL");
+        let sps = parse_sps(&sps_nal.rbsp).expect("parse SPS");
+        let state = PictureState::<u8>::new(&sps);
+
+        assert!(matches!(
+            crop_frame(&state, 16, 16, 0, 16, 1000, 0, 0, 8),
+            Err(DecodeError::InvalidSyntax(
+                "conformance window exceeds picture dimensions"
+            ))
+        ));
+    }
+
+    #[test]
+    fn rejects_sps_over_picture_limit() {
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/tiny_intra.h265"
+        ))
+        .expect("read fixture");
+        let sps = parse_annex_b(&h265)
+            .into_iter()
+            .find(|nal| nal.nal_unit_type == NalUnitType::Sps)
+            .expect("SPS NAL");
+        let mut decoder = Decoder::with_limits(DecodeLimits {
+            max_picture_pixels: 255,
+            ..DecodeLimits::default()
+        });
+
+        assert!(matches!(
+            decoder.decode_nal(&sps),
+            Err(DecodeError::ResourceLimit("picture pixel count"))
+        ));
+    }
+
+    #[test]
+    fn rejects_sps_over_picture_memory_limit() {
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/tiny_intra.h265"
+        ))
+        .expect("read fixture");
+        let sps = parse_annex_b(&h265)
+            .into_iter()
+            .find(|nal| nal.nal_unit_type == NalUnitType::Sps)
+            .expect("SPS NAL");
+        let mut decoder = Decoder::with_limits(DecodeLimits {
+            max_picture_memory_bytes: 1,
+            ..DecodeLimits::default()
+        });
+
+        assert!(matches!(
+            decoder.decode_nal(&sps),
+            Err(DecodeError::ResourceLimit("estimated picture memory"))
+        ));
+    }
 
     /// Phase 3d-1: hand-verify the POC computation against the spec
     /// formula for a grab-bag of representative cases. Matches FFmpeg's
