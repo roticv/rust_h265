@@ -306,20 +306,38 @@ pub struct Decoder {
 #[allow(clippy::too_many_arguments)]
 fn crop_frame<P: Pixel>(
     state: &crate::cu_tree::PictureState<P>,
-    _coded_w: u32,
-    _coded_h: u32,
+    coded_w: u32,
+    coded_h: u32,
     cropped_w: u32,
     cropped_h: u32,
     left_offset: u32, // in chroma sample units
     top_offset: u32,  // in chroma sample units
     poc: i32,
     bit_depth: u8,
-) -> Frame {
-    // For 4:2:0, SubWidthC = SubHeightC = 2.
-    let luma_left = (left_offset * 2) as usize;
-    let luma_top = (top_offset * 2) as usize;
-    let cw = cropped_w as usize;
-    let ch = cropped_h as usize;
+) -> Result<Frame, DecodeError> {
+    let luma_left = left_offset
+        .checked_mul(2)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(DecodeError::InvalidSyntax("invalid luma crop offset"))?;
+    let luma_top = top_offset
+        .checked_mul(2)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(DecodeError::InvalidSyntax("invalid luma crop offset"))?;
+    let cw = usize::try_from(cropped_w)
+        .map_err(|_| DecodeError::InvalidSyntax("invalid cropped width"))?;
+    let ch = usize::try_from(cropped_h)
+        .map_err(|_| DecodeError::InvalidSyntax("invalid cropped height"))?;
+    let coded_w =
+        usize::try_from(coded_w).map_err(|_| DecodeError::InvalidSyntax("invalid coded width"))?;
+    let coded_h =
+        usize::try_from(coded_h).map_err(|_| DecodeError::InvalidSyntax("invalid coded height"))?;
+    if luma_left.checked_add(cw).is_none_or(|end| end > coded_w)
+        || luma_top.checked_add(ch).is_none_or(|end| end > coded_h)
+    {
+        return Err(DecodeError::InvalidSyntax(
+            "conformance window exceeds picture dimensions",
+        ));
+    }
     let stride_y = state.y_stride;
     let stride_uv = state.uv_stride;
 
@@ -328,7 +346,7 @@ fn crop_frame<P: Pixel>(
     let no_crop =
         luma_left == 0 && luma_top == 0 && cw == stride_y && ch == state.y_plane.len() / stride_y;
     if no_crop {
-        return Frame {
+        return Ok(Frame {
             y: P::wrap_vec(state.y_plane.clone()),
             u: P::wrap_vec(state.u_plane.clone()),
             v: P::wrap_vec(state.v_plane.clone()),
@@ -336,26 +354,57 @@ fn crop_frame<P: Pixel>(
             height: cropped_h,
             pic_order_cnt: poc,
             bit_depth,
-        };
+        });
     }
 
     let mut y = Vec::with_capacity(cw * ch);
     for row in 0..ch {
         let src_row = luma_top + row;
-        let start = src_row * stride_y + luma_left;
-        y.extend_from_slice(&state.y_plane[start..start + cw]);
+        let start = src_row
+            .checked_mul(stride_y)
+            .and_then(|value| value.checked_add(luma_left))
+            .ok_or(DecodeError::InvalidSyntax("invalid luma crop range"))?;
+        let end = start
+            .checked_add(cw)
+            .ok_or(DecodeError::InvalidSyntax("invalid luma crop range"))?;
+        y.extend_from_slice(
+            state
+                .y_plane
+                .get(start..end)
+                .ok_or(DecodeError::InvalidSyntax("invalid luma crop range"))?,
+        );
     }
     let cw_c = cw / 2;
     let ch_c = ch / 2;
+    let chroma_left = usize::try_from(left_offset)
+        .map_err(|_| DecodeError::InvalidSyntax("invalid chroma crop offset"))?;
+    let chroma_top = usize::try_from(top_offset)
+        .map_err(|_| DecodeError::InvalidSyntax("invalid chroma crop offset"))?;
     let mut u = Vec::with_capacity(cw_c * ch_c);
     let mut v = Vec::with_capacity(cw_c * ch_c);
     for row in 0..ch_c {
-        let src_row = top_offset as usize + row;
-        let start = src_row * stride_uv + left_offset as usize;
-        u.extend_from_slice(&state.u_plane[start..start + cw_c]);
-        v.extend_from_slice(&state.v_plane[start..start + cw_c]);
+        let src_row = chroma_top + row;
+        let start = src_row
+            .checked_mul(stride_uv)
+            .and_then(|value| value.checked_add(chroma_left))
+            .ok_or(DecodeError::InvalidSyntax("invalid chroma crop range"))?;
+        let end = start
+            .checked_add(cw_c)
+            .ok_or(DecodeError::InvalidSyntax("invalid chroma crop range"))?;
+        u.extend_from_slice(
+            state
+                .u_plane
+                .get(start..end)
+                .ok_or(DecodeError::InvalidSyntax("invalid chroma crop range"))?,
+        );
+        v.extend_from_slice(
+            state
+                .v_plane
+                .get(start..end)
+                .ok_or(DecodeError::InvalidSyntax("invalid chroma crop range"))?,
+        );
     }
-    Frame {
+    Ok(Frame {
         y: P::wrap_vec(y),
         u: P::wrap_vec(u),
         v: P::wrap_vec(v),
@@ -363,7 +412,7 @@ fn crop_frame<P: Pixel>(
         height: cropped_h,
         pic_order_cnt: poc,
         bit_depth,
-    }
+    })
 }
 
 impl Decoder {
@@ -496,7 +545,7 @@ impl Decoder {
                     bd,
                 )
             });
-            return Some(frame);
+            return frame.ok();
         }
         None
     }
@@ -1035,7 +1084,7 @@ impl Decoder {
                 picture_poc,
                 bd,
             )
-        });
+        })?;
 
         // The borrows `sps` / `pps` / `tile_tables` / `last_sh` are no
         // longer used beyond this point — NLL will release them here so
@@ -1369,6 +1418,28 @@ impl Decoder {
 mod tests {
     use super::*;
     use crate::nal::parse_annex_b;
+
+    #[test]
+    fn crop_frame_rejects_invalid_ranges() {
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/tiny_intra.h265"
+        ))
+        .expect("read fixture");
+        let sps_nal = parse_annex_b(&h265)
+            .into_iter()
+            .find(|nal| nal.nal_unit_type == NalUnitType::Sps)
+            .expect("SPS NAL");
+        let sps = parse_sps(&sps_nal.rbsp).expect("parse SPS");
+        let state = PictureState::<u8>::new(&sps);
+
+        assert!(matches!(
+            crop_frame(&state, 16, 16, 0, 16, 1000, 0, 0, 8),
+            Err(DecodeError::InvalidSyntax(
+                "conformance window exceeds picture dimensions"
+            ))
+        ));
+    }
 
     #[test]
     fn rejects_sps_over_picture_limit() {
