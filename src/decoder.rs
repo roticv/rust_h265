@@ -19,7 +19,7 @@
 use std::rc::Rc;
 
 use crate::cabac::{CabacContexts, CabacReader};
-use crate::cu_tree::{PictureState, decode_coding_quadtree};
+use crate::cu_tree::{MvField, PictureState, decode_coding_quadtree};
 use crate::dpb::{
     DecodedPicture, DecodedPictureBuffer, PictureReferenceStatus, ReferencePictureSets,
     apply_ref_pic_list_modification, build_ref_pic_list_temp0, build_ref_pic_list_temp1,
@@ -243,8 +243,27 @@ impl TileScanTables {
     }
 }
 
+/// Resource limits applied before allocating storage for a decoded picture.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeLimits {
+    /// Maximum coded luma samples in one picture.
+    pub max_picture_pixels: u64,
+    /// Maximum estimated bytes needed for picture state and frame emission.
+    pub max_picture_memory_bytes: u64,
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_picture_pixels: 35_651_584,
+            max_picture_memory_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Decoder {
+    limits: DecodeLimits,
     vps: Option<Vps>,
     sps: Option<Sps>,
     pps: Option<Pps>,
@@ -352,6 +371,63 @@ impl Decoder {
         Self::default()
     }
 
+    pub fn with_limits(limits: DecodeLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
+    fn validate_picture_limits(&self, sps: &Sps) -> Result<(), DecodeError> {
+        let pixels = u64::from(sps.pic_width_in_luma_samples)
+            .checked_mul(u64::from(sps.pic_height_in_luma_samples))
+            .ok_or(DecodeError::ResourceLimit("picture pixel count overflow"))?;
+        if pixels > self.limits.max_picture_pixels {
+            return Err(DecodeError::ResourceLimit("picture pixel count"));
+        }
+
+        let ctb_size = 1u64 << sps.ctb_log2_size_y;
+        let width = u64::from(sps.pic_width_in_luma_samples).div_ceil(ctb_size) * ctb_size;
+        let height = u64::from(sps.pic_height_in_luma_samples).div_ceil(ctb_size) * ctb_size;
+        let aligned_pixels = width.checked_mul(height).ok_or(DecodeError::ResourceLimit(
+            "picture memory estimate overflow",
+        ))?;
+        let pixel_bytes = if sps.bit_depth_luma > 8 { 2 } else { 1 };
+        let plane_bytes =
+            aligned_pixels
+                .checked_mul(3 * pixel_bytes)
+                .ok_or(DecodeError::ResourceLimit(
+                    "picture memory estimate overflow",
+                ))?;
+        let min_pu_count = aligned_pixels >> 4;
+        let min_cb_count = aligned_pixels >> (2 * sps.min_cb_log2_size_y);
+        let min_tb_count = aligned_pixels >> (2 * sps.min_tb_log2_size_y);
+        let ctb_count = (width / ctb_size) * (height / ctb_size);
+        let table_bytes = min_pu_count
+            .checked_mul((std::mem::size_of::<MvField>() + 1) as u64)
+            .and_then(|n| n.checked_add(min_cb_count * 3))
+            .and_then(|n| n.checked_add(aligned_pixels / 8))
+            .and_then(|n| n.checked_add(min_tb_count * 5))
+            .and_then(|n| {
+                n.checked_add(
+                    ctb_count * (std::mem::size_of::<crate::sao::SaoParams>() as u64 + 18),
+                )
+            })
+            .ok_or(DecodeError::ResourceLimit(
+                "picture memory estimate overflow",
+            ))?;
+        let estimated_bytes =
+            plane_bytes
+                .checked_add(table_bytes)
+                .ok_or(DecodeError::ResourceLimit(
+                    "picture memory estimate overflow",
+                ))?;
+        if estimated_bytes > self.limits.max_picture_memory_bytes {
+            return Err(DecodeError::ResourceLimit("estimated picture memory"));
+        }
+        Ok(())
+    }
+
     /// Feed one NAL unit. Returns `Ok(Some(frame))` when a picture has just
     /// finished decoding, `Ok(None)` otherwise (e.g. parameter sets, SEI).
     pub fn decode_nal(&mut self, nal: &NalUnit<'_>) -> Result<Option<Frame>, DecodeError> {
@@ -362,6 +438,7 @@ impl Decoder {
             }
             NalUnitType::Sps => {
                 let new_sps = parse_sps(&nal.rbsp)?;
+                self.validate_picture_limits(&new_sps)?;
                 let old_bd = self.sps.as_ref().map(|s| s.bit_depth_luma);
                 if old_bd.is_some() && old_bd != Some(new_sps.bit_depth_luma) {
                     self.dpb.clear();
@@ -1292,6 +1369,50 @@ impl Decoder {
 mod tests {
     use super::*;
     use crate::nal::parse_annex_b;
+
+    #[test]
+    fn rejects_sps_over_picture_limit() {
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/tiny_intra.h265"
+        ))
+        .expect("read fixture");
+        let sps = parse_annex_b(&h265)
+            .into_iter()
+            .find(|nal| nal.nal_unit_type == NalUnitType::Sps)
+            .expect("SPS NAL");
+        let mut decoder = Decoder::with_limits(DecodeLimits {
+            max_picture_pixels: 255,
+            ..DecodeLimits::default()
+        });
+
+        assert!(matches!(
+            decoder.decode_nal(&sps),
+            Err(DecodeError::ResourceLimit("picture pixel count"))
+        ));
+    }
+
+    #[test]
+    fn rejects_sps_over_picture_memory_limit() {
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/tiny_intra.h265"
+        ))
+        .expect("read fixture");
+        let sps = parse_annex_b(&h265)
+            .into_iter()
+            .find(|nal| nal.nal_unit_type == NalUnitType::Sps)
+            .expect("SPS NAL");
+        let mut decoder = Decoder::with_limits(DecodeLimits {
+            max_picture_memory_bytes: 1,
+            ..DecodeLimits::default()
+        });
+
+        assert!(matches!(
+            decoder.decode_nal(&sps),
+            Err(DecodeError::ResourceLimit("estimated picture memory"))
+        ));
+    }
 
     /// Phase 3d-1: hand-verify the POC computation against the spec
     /// formula for a grab-bag of representative cases. Matches FFmpeg's

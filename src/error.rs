@@ -9,6 +9,8 @@ pub enum DecodeError {
     InvalidSyntax(&'static str),
     /// The stream uses a feature this decoder doesn't support yet.
     Unsupported(&'static str),
+    /// Decoding the stream would exceed a configured resource limit.
+    ResourceLimit(&'static str),
 }
 
 impl fmt::Display for DecodeError {
@@ -17,6 +19,7 @@ impl fmt::Display for DecodeError {
             DecodeError::UnexpectedEof => write!(f, "unexpected end of bitstream"),
             DecodeError::InvalidSyntax(msg) => write!(f, "invalid syntax: {}", msg),
             DecodeError::Unsupported(msg) => write!(f, "unsupported: {}", msg),
+            DecodeError::ResourceLimit(msg) => write!(f, "resource limit exceeded: {}", msg),
         }
     }
 }
