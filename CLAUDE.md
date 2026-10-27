@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Status
 
 **Feature-complete for Main and Main 10 profile (8-bit and 10-bit 4:2:0).**
-127 tests pass. Byte-exact against FFmpeg on all in-tree fixtures plus 6
+172 tests pass. Byte-exact against FFmpeg on all in-tree fixtures plus 6
 real-world Big Buck Bunny 1080p transcodes (8-bit and 10-bit). No SIMD yet.
 
 ## Build Commands
@@ -66,13 +66,14 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 
 ## Testing Strategy
 
-- 127 tests, all byte-exact against FFmpeg
+- 172 tests, all byte-exact against FFmpeg
 - Fixtures in `testdata/` (committed in-tree, < 1 MB each)
 - Large outputs (1080p, 10-bit) use SHA-256 hashes
 - `decode_and_hash()` helper handles both `PixelData::U8` and `PixelData::U16` (10-bit hashes as LE u16 bytes)
 - `bench_realworld` downloads Big Buck Bunny and transcodes 6 fixtures (4 × 8-bit, 2 × 10-bit)
 - HM reference encoder used for PCM fixture (x265/kvazaar don't emit PCM blocks)
 - kvazaar used for `pps_loop_filter_across_slices_enabled_flag = 0` fixture
+- `open_gop_cra.h265` / `seek_to_cra.h265`: x265 `--open-gop` with a mid-stream CRA (POC 150, past the LSB half-range) and the same stream cut to start at the CRA
 
 ## Important Pitfalls
 
@@ -81,4 +82,5 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 - **SAO merge flags at slice boundaries:** `sao_merge_left_flag` / `sao_merge_up_flag` must NOT be decoded when the neighbor CTB is in a different slice. Missing this desyncs CABAC for the rest of that slice.
 - **`split_cu_flag` neighbor availability:** Must check `tab_slice_addr_rs` for cross-slice neighbors (not just picture boundaries). Missing this causes wrong CABAC context in multi-slice pictures.
 - **Inter 4×4 luma TU:** The 4×4 DST is only for intra; inter 4×4 uses regular DCT. Also, `do_chroma_deferred` (blk_idx == 3) must be handled for both intra AND inter paths.
+- **prevTid0Pic and CRA:** Per spec 8.3.1 an IRAP is an ordinary prevTid0Pic candidate: store its real POC, never reset to 0 (only an IDR has POC 0). A CRA that starts decoding (first picture or after EOS) has NoRaslOutputFlag = 1: force POC MSB = 0 and skip its RASL pictures, as FFmpeg does.
 - **EPB compensation for WPP entry points:** `entry_point_offset` is in NAL-byte space (includes EPBs). Must convert to RBSP-byte offset by subtracting EPB count.

@@ -81,6 +81,11 @@ impl NalUnitType {
         matches!(self, NalUnitType::IdrWRadl | NalUnitType::IdrNLp)
     }
 
+    /// True for CRA (Clean Random Access) pictures.
+    pub fn is_cra(self) -> bool {
+        matches!(self, NalUnitType::Cra)
+    }
+
     /// True for IRAP (Intra Random Access Point) pictures: BLA, IDR, CRA.
     /// These are the only NAL types where decoding can start cleanly.
     pub fn is_irap(self) -> bool {

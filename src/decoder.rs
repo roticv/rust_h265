@@ -264,10 +264,24 @@ pub struct Decoder {
     /// Phase 3d-1: POC of the most recent decoded picture with
     /// `temporal_id == 0` (and not a sub-layer non-reference or
     /// RASL/RADL picture). Per spec 8.3.1 this is the "prevTid0Pic"
-    /// seed for computing a non-IDR picture's POC from its LSB. We
-    /// reset it to 0 at every IDR and update it after every picture
-    /// whose NAL type + temporal_id satisfy the "tid0" condition.
+    /// seed for computing a non-IDR picture's POC from its LSB. Updated
+    /// after every picture whose NAL type + temporal_id satisfy the
+    /// "tid0" condition, IRAP pictures included (an IDR stores 0, a
+    /// mid-stream CRA stores its real POC).
     prev_tid0_poc: i32,
+    /// True once any picture has been decoded. Together with `after_eos`
+    /// this decides whether an IRAP picture starts a new coded video
+    /// sequence and so has NoRaslOutputFlag = 1 (spec 8.1.3): the first
+    /// picture in the bitstream, or the first picture after an EOS NAL.
+    /// IDR and BLA pictures always have NoRaslOutputFlag = 1 regardless.
+    seen_picture: bool,
+    /// True after an end-of-sequence NAL until the next picture starts.
+    after_eos: bool,
+    /// True while the RASL pictures associated with the most recent CRA
+    /// must be skipped because that CRA had NoRaslOutputFlag = 1 (spec
+    /// 8.1.3 / 8.3.2): their references precede the CRA and were never
+    /// decoded. Cleared at the next IRAP picture.
+    skip_rasl: bool,
     /// Phase 3d-1: most recently derived reference picture sets for the
     /// current picture. Populated by `derive_rps_from_slice_header`; no
     /// consumer yet other than the decoder's own bookkeeping.
@@ -374,6 +388,12 @@ impl Decoder {
             NalUnitType::Pps => {
                 self.pps = Some(parse_pps(&nal.rbsp)?);
                 self.tile_tables = None;
+                Ok(None)
+            }
+            NalUnitType::Eos => {
+                // End of sequence: the next picture must be an IRAP and
+                // starts a new coded video sequence (NoRaslOutputFlag = 1).
+                self.after_eos = true;
                 Ok(None)
             }
             t if t.is_vcl() => self.decode_slice(nal, t),
@@ -513,6 +533,21 @@ impl Decoder {
         // (populated above) — we only compute it once per picture (on the
         // first, independent slice).
         if sh.first_slice_segment_in_pic_flag {
+            // Spec 8.1.3: an IRAP picture has NoRaslOutputFlag = 1 when it
+            // is IDR, BLA, the first picture in the bitstream, or the first
+            // picture after an EOS NAL. Such a picture starts a new coded
+            // video sequence: its POC MSB is 0 (8.3.1) and, for a CRA, the
+            // associated RASL pictures are not decoded (8.1.3).
+            let no_rasl_output_flag =
+                nut.is_irap() && (!nut.is_cra() || !self.seen_picture || self.after_eos);
+            if nut.is_irap() {
+                self.skip_rasl = nut.is_cra() && no_rasl_output_flag;
+            }
+            self.seen_picture = true;
+            self.after_eos = false;
+            if matches!(nut, NalUnitType::RaslN | NalUnitType::RaslR) && self.skip_rasl {
+                return Ok(None);
+            }
             if nut.is_idr() {
                 sh.poc = 0;
             } else {
@@ -520,9 +555,12 @@ impl Decoder {
                     self.prev_tid0_poc,
                     sh.slice_pic_order_cnt_lsb,
                     sps.log2_max_pic_order_cnt_lsb,
-                    nut,
+                    no_rasl_output_flag,
                 );
             }
+        } else if matches!(nut, NalUnitType::RaslN | NalUnitType::RaslR) && self.skip_rasl {
+            // Remaining slice segments of a skipped RASL picture.
+            return Ok(None);
         } else if !sh.dependent_slice_segment_flag {
             // A non-first independent slice segment must have the same POC
             // as the rest of the picture; just take it from the current
@@ -998,9 +1036,11 @@ impl Decoder {
                     | NalUnitType::RaslN
                     | NalUnitType::RaslR
             );
-        if nut_for_tid0.is_irap() {
-            self.prev_tid0_poc = 0;
-        } else if is_tid0 {
+        // Spec 8.3.1: prevTid0Pic is simply the previous TemporalId-0
+        // picture that is not RASL/RADL/sub-layer non-reference. IRAP
+        // pictures qualify like any other, so store their actual POC (a
+        // mid-stream CRA keeps a non-zero POC; a BLA's POC is its LSB).
+        if is_tid0 {
             self.prev_tid0_poc = last_sh_cloned.poc;
         }
 
@@ -1044,7 +1084,7 @@ impl Decoder {
         prev_tid0_poc: i32,
         slice_pic_order_cnt_lsb: u32,
         log2_max_pic_order_cnt_lsb: u8,
-        nal_unit_type: NalUnitType,
+        irap_no_rasl_output: bool,
     ) -> i32 {
         let max_poc_lsb = 1i32 << log2_max_pic_order_cnt_lsb;
         let prev_poc_lsb = prev_tid0_poc.rem_euclid(max_poc_lsb);
@@ -1057,11 +1097,9 @@ impl Decoder {
         } else {
             prev_poc_msb
         };
-        // BLA pictures: POC MSB forced to 0 per spec 8.3.1.
-        if matches!(
-            nal_unit_type,
-            NalUnitType::BlaWLp | NalUnitType::BlaWRadl | NalUnitType::BlaNLp
-        ) {
+        // Spec 8.3.1: an IRAP picture with NoRaslOutputFlag = 1 (BLA, or a
+        // CRA that starts a coded video sequence) has POC MSB = 0.
+        if irap_no_rasl_output {
             poc_msb = 0;
         }
         poc_msb + cur_lsb
@@ -1302,7 +1340,7 @@ mod tests {
         // prev_tid0_poc = 4 (MSB=0, LSB=4), cur LSB = 5.
         // prev_lsb = 4, diff = 1 → neither branch fires, poc_msb = 0.
         // poc = 0 + 5 = 5.
-        assert_eq!(Decoder::compute_poc(4, 5, 4, NalUnitType::TrailR), 5);
+        assert_eq!(Decoder::compute_poc(4, 5, 4, false), 5);
     }
 
     #[test]
@@ -1313,7 +1351,7 @@ mod tests {
         //   cur_lsb < prev_lsb (1 < 15) && (prev_lsb - cur_lsb) >= max_poc_lsb/2
         //   (15 - 1) = 14 >= 8 → yes, so poc_msb = prev_poc_msb + max_poc_lsb = 16.
         //   poc = 16 + 1 = 17.
-        assert_eq!(Decoder::compute_poc(15, 1, 4, NalUnitType::TrailR), 17);
+        assert_eq!(Decoder::compute_poc(15, 1, 4, false), 17);
     }
 
     #[test]
@@ -1327,7 +1365,7 @@ mod tests {
         //   15 > 1, 15 - 1 = 14 > 8 → backward wrap branch fires.
         //   poc_msb = 16 - 16 = 0.
         //   poc = 0 + 15 = 15.
-        assert_eq!(Decoder::compute_poc(17, 15, 4, NalUnitType::TrailR), 15);
+        assert_eq!(Decoder::compute_poc(17, 15, 4, false), 15);
     }
 
     #[test]
@@ -1336,15 +1374,41 @@ mod tests {
         // `prev_tid0_poc`. With prev = 20 (MSB=16, LSB=4) and cur LSB=5,
         // a non-BLA picture would give poc = 16 + 5 = 21, but a
         // BLA_W_LP explicitly sets poc_msb to 0 → poc = 5.
-        assert_eq!(Decoder::compute_poc(20, 5, 4, NalUnitType::BlaWLp), 5);
+        assert_eq!(Decoder::compute_poc(20, 5, 4, true), 5);
         // For TrailR the normal path returns 21.
-        assert_eq!(Decoder::compute_poc(20, 5, 4, NalUnitType::TrailR), 21);
+        assert_eq!(Decoder::compute_poc(20, 5, 4, false), 21);
     }
 
     #[test]
     fn poc_compute_equal_lsb_passes_through() {
         // prev_tid0_poc = 32 (MSB=32, LSB=0), cur LSB=0 → poc_msb=32.
-        assert_eq!(Decoder::compute_poc(32, 0, 4, NalUnitType::TrailR), 32);
+        assert_eq!(Decoder::compute_poc(32, 0, 4, false), 32);
+    }
+
+    /// Spec 8.3.1: an IRAP picture with NoRaslOutputFlag = 1 (first picture
+    /// in the bitstream, first after EOS, or any BLA) has POC MSB = 0. A
+    /// CRA that starts decoding with a large LSB must not be wrapped to a
+    /// negative POC just because `prev_tid0_poc` is still at its initial 0.
+    #[test]
+    fn test_compute_poc_cra_starting_sequence_has_zero_msb() {
+        // max_poc_lsb = 16, prev = 0, cur LSB = 13: diff 13 > 8 would wrap
+        // MSB to -16 (POC -3) for an ordinary picture...
+        assert_eq!(Decoder::compute_poc(0, 13, 4, false), -3);
+        // ...but a sequence-starting IRAP keeps MSB = 0 → POC = 13.
+        assert_eq!(Decoder::compute_poc(0, 13, 4, true), 13);
+    }
+
+    /// Spec 8.3.1: after a mid-stream CRA (NoRaslOutputFlag = 0, open GOP),
+    /// prevTid0Pic is the CRA itself with its real POC. The old code reset
+    /// `prev_tid0_poc` to 0 after every IRAP, which wrapped the MSB of the
+    /// pictures that follow. Simulate: CRA at POC 150 (log2_max_lsb = 8),
+    /// next trailing picture has LSB 151.
+    #[test]
+    fn test_compute_poc_after_mid_stream_cra_keeps_msb() {
+        // Correct seed (CRA's own POC) → 151.
+        assert_eq!(Decoder::compute_poc(150, 151, 8, false), 151);
+        // The buggy seed of 0 would have produced 151 - 256 = -105.
+        assert_eq!(Decoder::compute_poc(0, 151, 8, false), -105);
     }
 
     // ----- Phase 3d-2: RefPicList0 / RefPicList1 construction tests -----
@@ -3381,6 +3445,81 @@ mod tests {
     ///   --no-info --no-psnr --no-ssim \
     ///   -o 10bit_128x128.h265
     /// ```
+    /// 64×64, 170 frames, **open GOP** with a mid-stream CRA at POC 150
+    /// (log2_max_poc_lsb = 8, so the CRA's LSB 150 is past the half-range
+    /// wrap point) followed by two RASL pictures and trailing B/P pictures.
+    ///
+    /// Regression test for prevTid0Pic handling (spec 8.3.1): the decoder
+    /// used to reset `prev_tid0_poc` to 0 after every IRAP including CRA,
+    /// so the picture after the CRA derived POC -105 instead of 151 and
+    /// its reference lookup failed. All 170 frames must decode byte-exact
+    /// against FFmpeg.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=64x64:rate=30" -frames:v 170 \
+    ///   -pix_fmt yuv420p src.yuv
+    /// x265 --input src.yuv --input-res 64x64 --fps 30 --preset medium \
+    ///   --open-gop --keyint 150 --min-keyint 150 --bframes 2 --b-adapt 0 \
+    ///   --no-scenecut -o open_gop_cra.h265
+    /// ffmpeg -i open_gop_cra.h265 -f rawvideo -pix_fmt yuv420p ref.yuv
+    /// sha256sum ref.yuv
+    /// ```
+    #[test]
+    fn test_decode_open_gop_mid_stream_cra_hash() {
+        let hash = decode_and_hash("open_gop_cra.h265", 170);
+        let expected = "864f167b0b161b89d6bf855345280ed1b0f5abbdc27d322851b017e2acd3a2d4";
+        assert_eq!(
+            hash, expected,
+            "open_gop_cra hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// Same stream as `open_gop_cra.h265`, but starting at the CRA: the
+    /// VPS/SPS/PPS followed by every NAL from the CRA (POC 150) onward.
+    /// This is the seek-to-keyframe case. The CRA is now the first picture
+    /// in the bitstream, so NoRaslOutputFlag = 1 (spec 8.1.3):
+    ///
+    /// - its POC MSB must be 0 (POC 150, not -106 from LSB wrap against the
+    ///   initial `prev_tid0_poc` of 0), and
+    /// - its two associated RASL pictures (POC 148, 149) must be skipped,
+    ///   since they reference pictures before the CRA that were never
+    ///   decoded. FFmpeg drops them too, hence 20 output frames, not 22.
+    ///
+    /// Fixture: `open_gop_cra.h265` with every NAL before the CRA removed
+    /// except the parameter sets; reference from
+    /// `ffmpeg -i seek_to_cra.h265 -f rawvideo -pix_fmt yuv420p`.
+    #[test]
+    fn test_decode_seek_to_cra_skips_rasl_hash() {
+        let hash = decode_and_hash("seek_to_cra.h265", 20);
+        let expected = "aac9bf6f5be286020b9e73170e0c6cb0f058aa642e03340dd264726017bc3a80";
+        assert_eq!(
+            hash, expected,
+            "seek_to_cra hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+
+        // The pixel hash alone cannot distinguish POC 150 from a uniformly
+        // shifted -106 (display order is unchanged), so also pin the POCs:
+        // the CRA must get MSB = 0 and the RASL pictures must be absent.
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/seek_to_cra.h265"
+        ))
+        .unwrap();
+        let mut decoder = Decoder::new();
+        let mut pocs: Vec<i32> = Vec::new();
+        for nal in parse_annex_b(&h265).iter() {
+            if let Some(f) = decoder.decode_nal(nal).unwrap() {
+                pocs.push(f.pic_order_cnt);
+            }
+        }
+        while let Some(f) = decoder.flush() {
+            pocs.push(f.pic_order_cnt);
+        }
+        pocs.sort_unstable();
+        assert_eq!(pocs, (150..=169).collect::<Vec<i32>>());
+    }
+
     #[test]
     fn test_decode_10bit_hash() {
         let hash = decode_and_hash("10bit_128x128.h265", 3);
