@@ -4144,20 +4144,16 @@ fn decode_intra_mode_signaling<P: Pixel>(
     //    (5 bypass bits) for each PU, then derive the actual luma mode.
     let mut intra_pred_mode = [0u8; 4];
     for k in 0..n_pus {
-        let mpm_idx;
-        let rem;
-        if prev_flag[k] {
+        let (mpm_idx, rem) = if prev_flag[k] {
             // mpm_idx: unary, max value 2 (so up to 2 bypass bits).
             let mut i = 0u8;
             while i < 2 && cabac.decode_bypass() != 0 {
                 i += 1;
             }
-            mpm_idx = i;
-            rem = 0;
+            (i, 0u8)
         } else {
-            mpm_idx = 0;
-            rem = cabac.decode_bypass_bits(5) as u8;
-        }
+            (0u8, cabac.decode_bypass_bits(5) as u8)
+        };
 
         let pj = (k % side) as u32;
         let pi = (k / side) as u32;

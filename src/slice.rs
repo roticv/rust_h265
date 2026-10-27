@@ -105,7 +105,11 @@ impl Default for PredWeightTable {
 #[derive(Debug, Clone)]
 pub struct SliceHeader {
     pub first_slice_segment_in_pic_flag: bool,
+    // Parsed for spec completeness; not consumed by the decoder yet.
+    #[allow(dead_code)]
     pub no_output_of_prior_pics_flag: bool,
+    // Parsed for spec completeness; not consumed by the decoder yet.
+    #[allow(dead_code)]
     pub slice_pic_parameter_set_id: u32,
     pub dependent_slice_segment_flag: bool,
     pub slice_segment_address: u32,
