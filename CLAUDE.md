@@ -4,12 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**Feature-complete for Main and Main 10 profile (8-bit and 10-bit 4:2:0).**
-Intra-only **4:4:4** (8-bit and 10-bit, ChromaArrayType 3) is also supported
-for still-image use (HEIF/HEIC); 4:4:4 inter (P/B) slices are rejected with
-`Unsupported`, and 4:2:2 is not supported. Byte-exact against FFmpeg on all
+**Feature-complete for Main and Main 10 profile (8-bit and 10-bit 4:2:0),
+plus 4:4:4 (ChromaArrayType 3, 8-bit and 10-bit, intra and inter).** 4:2:2
+and monochrome are rejected at SPS parse. Byte-exact against FFmpeg on all
 in-tree fixtures plus 6 real-world Big Buck Bunny 1080p transcodes (8-bit and
-10-bit). 182 tests pass. No SIMD yet.
+10-bit). 186 tests pass. No SIMD yet.
 
 ## Build Commands
 
@@ -47,7 +46,7 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 | `pixel.rs` | `Pixel` trait (`u8`/`u16`), `PixelData` enum, bit-depth helpers (`mc_shift`, `bipred_shift`, etc.) |
 | `decoder.rs` | Top-level `Decoder`, `Frame`, `PictureStateEnum` (u8/u16 dispatch), slice decode orchestration |
 | `cu_tree.rs` | `PictureState<P>`, quad-tree CU/PU/TU decode, all CABAC syntax parsing, `SliceParams` |
-| `inter_pred.rs` | MC luma 7/8-tap, chroma 4-tap (generic `<P: Pixel>`), bi-pred, weighted pred |
+| `inter_pred.rs` | MC luma 7/8-tap, chroma 4-tap (generic `<P: Pixel>`, 4:2:0 and 4:4:4 geometry), bi-pred, weighted pred |
 | `intra_pred.rs` | Planar, DC, 33 angular modes, reference sample filtering (generic `<P: Pixel>`) |
 | `inverse_transform.rs` | 4×4 DST, 4/8/16/32 IDCT, DC fast path |
 | `residual_coding.rs` | CABAC coefficient decode, dequantization (with `qp_bd_offset`), transform_skip |
@@ -69,7 +68,7 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 
 ## Testing Strategy
 
-- 182 tests, all byte-exact against FFmpeg
+- 186 tests, all byte-exact against FFmpeg
 - Fixtures in `testdata/` (committed in-tree, < 1 MB each)
 - Large outputs (1080p, 10-bit) use SHA-256 hashes
 - `decode_and_hash()` helper handles both `PixelData::U8` and `PixelData::U16` (10-bit hashes as LE u16 bytes)
@@ -77,7 +76,9 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 - HM reference encoder used for PCM fixture (x265/kvazaar don't emit PCM blocks)
 - kvazaar used for `pps_loop_filter_across_slices_enabled_flag = 0` fixture
 - `DecodeLimits` (`Decoder::with_limits`) caps per-picture pixels (Level 6.2 MaxLumaPs) and estimated memory; SPS exceeding it returns `DecodeError::ResourceLimit`
-- 4:4:4 fixtures: `intra444_96x96.h265`, `intra444_10bit_96x96.h265` (x265 `--input-csp i444`), `intra444_100x68.h265` (conformance window in luma units), `inter444_96x96.h265` (must be rejected)
+- 4:4:4 fixtures (x265 `--input-csp i444`): `intra444_96x96`, `intra444_10bit_96x96`, `intra444_100x68` (conformance window in luma units), `inter444_96x96` (P), `inter444_b_96x96` (B + weighted pred), `inter444_10bit_96x96`, `inter444_100x68`
+- `inter420_100x68.h265`: non-CTB-aligned width with inter prediction (reference plane stride != width)
+- No 4:4:4 PCM fixture yet: only HM emits PCM, and it was not available when 4:4:4 PCM support was written
 - `open_gop_cra.h265` / `seek_to_cra.h265`: x265 `--open-gop` with a mid-stream CRA (POC 150, past the LSB half-range) and the same stream cut to start at the CRA
 
 ## Important Pitfalls
@@ -88,5 +89,6 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 - **`split_cu_flag` neighbor availability:** Must check `tab_slice_addr_rs` for cross-slice neighbors (not just picture boundaries). Missing this causes wrong CABAC context in multi-slice pictures.
 - **Inter 4×4 luma TU:** The 4×4 DST is only for intra; inter 4×4 uses regular DCT. Also, `do_chroma_deferred` (blk_idx == 3) must be handled for both intra AND inter paths.
 - **prevTid0Pic and CRA:** Per spec 8.3.1 an IRAP is an ordinary prevTid0Pic candidate: store its real POC, never reset to 0 (only an IDR has POC 0). A CRA that starts decoding (first picture or after EOS) has NoRaslOutputFlag = 1: force POC MSB = 0 and skip its RASL pictures, as FFmpeg does.
-- **Chroma geometry is not hard-coded 4:2:0:** `PictureState::chroma_shift_w/h` (log2 SubWidthC/SubHeightC) and `Sps::chroma_array_type()` drive every luma-to-chroma mapping. Conformance-window offsets are in chroma units, so they scale by SubWidthC (2 for 4:2:0, 1 for 4:4:4). 4:4:4 chroma: TBs match luma size (no 4×4 deferral), cbf signalled at every size, per-PU chroma modes for NxN, luma-style reference smoothing, chroma QP = Min(qPi, 51), deblock on the 8-sample grid. Inter 4:4:4 is rejected (chroma MC still 4:2:0-only).
+- **Chroma geometry is not hard-coded 4:2:0:** `PictureState::chroma_shift_w/h` (log2 SubWidthC/SubHeightC) and `Sps::chroma_array_type()` drive every luma-to-chroma mapping. Conformance-window offsets are in chroma units, so they scale by SubWidthC (2 for 4:2:0, 1 for 4:4:4). 4:4:4 chroma: TBs match luma size (no 4×4 deferral), cbf signalled at every size, per-PU chroma modes for NxN, luma-style reference smoothing, chroma QP = Min(qPi, 51), deblock on the 8-sample grid. Inter chroma MC uses `chroma_mv()` = `mv * 2 >> log2(SubWidthC)` in eighth-chroma-sample units, chroma block = PU size >> shift, and the chroma MC scratch buffers are sized 64×64.
+- **Reference planes keep the CTU-aligned stride:** `DecodedPicture::y_stride` / `uv_stride` come from `PictureState`, not from `width`. Motion compensation must read references through those fields; using `width` as the stride silently corrupts every inter picture when the width is not a multiple of the CTB size (e.g. 100×68 with CTU 32).
 - **EPB compensation for WPP entry points:** `entry_point_offset` is in NAL-byte space (includes EPBs). Must convert to RBSP-byte offset by subtracting EPB count.

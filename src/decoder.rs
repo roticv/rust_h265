@@ -662,16 +662,6 @@ impl Decoder {
             sh.poc = parent.poc;
         }
 
-        // 4:4:4 (ChromaArrayType == 3) support covers intra pictures only —
-        // the profile HEIF/HEIC still images use. Inter chroma motion
-        // compensation is still specialised for 4:2:0, so an inter 4:4:4 slice
-        // is rejected cleanly rather than reconstructed with wrong chroma.
-        if sh.slice_type != SliceType::I && sps.chroma_array_type() == 3 {
-            return Err(DecodeError::Unsupported(
-                "4:4:4 inter (P/B) slices are not supported; 4:4:4 decode is intra-only",
-            ));
-        }
-
         // Phase 3d-1: compute POC from the slice header's pic_order_cnt_lsb.
         // IDR pictures always get POC = 0 (and the spec says prev_tid0_poc
         // is reset too). For non-IDR pictures we use the `compute_poc`
@@ -1196,9 +1186,18 @@ impl Decoder {
         let ref_list_l1_pocs: Vec<i32> = self.current_ref_list_l1.iter().map(|p| p.poc).collect();
 
         let decoded_pic = with_picture_state!(&mut pic.state, |state| {
+            // The planes keep the CTU-aligned stride and chroma geometry of
+            // the picture state; motion compensation reads them through
+            // these fields rather than assuming `stride == width`.
+            let (y_stride, uv_stride, chroma_shift_w, chroma_shift_h) = (
+                state.y_stride,
+                state.uv_stride,
+                state.chroma_shift_w,
+                state.chroma_shift_h,
+            );
             let (y, u, v, tab_mvf, log2_min_pu_size, min_pu_width, log2_ctb_size) =
                 state.take_planes_and_mvf();
-            Rc::new(DecodedPicture::new_with_mvf(
+            let mut dp = DecodedPicture::new_with_mvf(
                 y,
                 u,
                 v,
@@ -1210,7 +1209,12 @@ impl Decoder {
                 min_pu_width,
                 log2_ctb_size,
                 [ref_list_l0_pocs, ref_list_l1_pocs],
-            ))
+            );
+            dp.y_stride = y_stride;
+            dp.uv_stride = uv_stride;
+            dp.chroma_shift_w = chroma_shift_w;
+            dp.chroma_shift_h = chroma_shift_h;
+            Rc::new(dp)
         });
         decoded_pic.mark(PictureReferenceStatus::ShortTerm);
         *decoded_pic.output.borrow_mut() = true;
@@ -3834,10 +3838,11 @@ mod tests {
         );
     }
 
-    /// 4:4:4 support is intra-only (the profile HEIF/HEIC still images use);
-    /// inter chroma MC is still 4:2:0-specialised. A 4:4:4 P/B slice must be
-    /// rejected cleanly with `Unsupported` rather than reconstructed with the
-    /// wrong chroma. The fixture is an 8-frame I/P stream (IDR every 4).
+    /// 96×96, 8 frames, 8-bit **4:4:4 inter** (I/P, IDR every 4). Chroma
+    /// motion compensation at full resolution: the chroma block is the PU
+    /// size, chroma MVs are `mv * 2` in eighth-sample units (spec 8.5.3.2.10
+    /// with SubWidthC = 1), reference chroma planes are read at the luma
+    /// stride. Byte-exact against FFmpeg with `yuv444p`.
     ///
     /// Fixture generated with:
     /// ```text
@@ -3848,24 +3853,88 @@ mod tests {
     ///   --no-scenecut --min-cu-size 8 --no-info -o inter444_96x96.h265
     /// ```
     #[test]
-    fn test_decode_444_inter_rejected() {
-        let h265 = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/testdata/inter444_96x96.h265"
-        ))
-        .unwrap();
-        let nals = parse_annex_b(&h265);
-        let mut decoder = Decoder::new();
-        let mut saw_unsupported = false;
-        for nal in &nals {
-            if let Err(DecodeError::Unsupported(_)) = decoder.decode_nal(nal) {
-                saw_unsupported = true;
-                break;
-            }
-        }
-        assert!(
-            saw_unsupported,
-            "expected an Unsupported error on the first 4:4:4 inter slice"
+    fn test_decode_444_inter_p_byte_exact() {
+        let hash = decode_and_hash("inter444_96x96.h265", 8);
+        let expected = "8f9dc649f02205e8df26aab4192f6cc36c4f22edc6009705ad21b2aba98296a2";
+        assert_eq!(
+            hash, expected,
+            "444 inter P hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// 96×96, 12 frames, 8-bit 4:4:4 with **B-frames and weighted
+    /// prediction** (`--weightp --weightb`): exercises 4:4:4 chroma
+    /// bi-prediction and the weighted uni/bi chroma paths with full-size
+    /// intermediate buffers. Byte-exact against FFmpeg.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=96x96:rate=30" -frames:v 12 \
+    ///   -pix_fmt yuv444p -f rawvideo src.yuv
+    /// x265 --input src.yuv --input-res 96x96 --input-csp i444 --fps 30 \
+    ///   --frames 12 --preset medium --ctu 32 --keyint 12 --bframes 2 \
+    ///   --b-adapt 0 --weightp --weightb --no-scenecut --min-cu-size 8 \
+    ///   --no-info -o inter444_b_96x96.h265
+    /// ```
+    #[test]
+    fn test_decode_444_inter_b_weighted_byte_exact() {
+        let hash = decode_and_hash("inter444_b_96x96.h265", 12);
+        let expected = "d0b0bf1e5513db8a92a4ebf02f7ff3b65cc4750b3c2f62ed46a97a93e773c50c";
+        assert_eq!(
+            hash, expected,
+            "444 inter B hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// Same encoder settings as `inter444_b_96x96.h265` but **10-bit**
+    /// 4:4:4 (`--input-depth 10 --output-depth 10`, `yuv444p10le`).
+    #[test]
+    fn test_decode_444_inter_10bit_byte_exact() {
+        let hash = decode_and_hash("inter444_10bit_96x96.h265", 12);
+        let expected = "d020419204a17df1ee813095cc6495f1accbde67d2e36637b787857448e97c48";
+        assert_eq!(
+            hash, expected,
+            "444 inter 10-bit hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// 100×68 8-bit **4:2:0** inter with B-frames, CTU 32. The width is not
+    /// a multiple of the CTB size, so the reference planes in the DPB have a
+    /// stride (128) wider than the picture (100). Regression test: motion
+    /// compensation used to read reference planes with `stride == width`,
+    /// which was only correct for CTB-aligned widths and corrupted every
+    /// inter picture otherwise. Byte-exact against FFmpeg.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=100x68:rate=30" -frames:v 12 \
+    ///   -pix_fmt yuv420p -f rawvideo src.yuv
+    /// x265 --input src.yuv --input-res 100x68 --input-csp i420 --fps 30 \
+    ///   --frames 12 --preset medium --ctu 32 --keyint 12 --bframes 2 \
+    ///   --b-adapt 0 --no-scenecut --min-cu-size 8 --no-info \
+    ///   -o inter420_100x68.h265
+    /// ```
+    #[test]
+    fn test_decode_420_inter_unaligned_width_byte_exact() {
+        let hash = decode_and_hash("inter420_100x68.h265", 12);
+        let expected = "ec32cfc3861ee0271af780ea66b115e580b50aa7ee4501794b05d692e1accaaf";
+        assert_eq!(
+            hash, expected,
+            "420 unaligned-width inter hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// 100×68 8-bit **4:4:4** inter with B-frames: non-CTB-aligned width
+    /// plus full-resolution chroma MC, with the conformance window in luma
+    /// units. Same encoder settings as `inter420_100x68.h265` with
+    /// `--input-csp i444`. Byte-exact against FFmpeg.
+    #[test]
+    fn test_decode_444_inter_unaligned_width_byte_exact() {
+        let hash = decode_and_hash("inter444_100x68.h265", 12);
+        let expected = "e9c237e4ec5c484e858a3b1ab01e30413ad18fdb012e1df61573bbed77160d36";
+        assert_eq!(
+            hash, expected,
+            "444 unaligned-width inter hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
     }
 

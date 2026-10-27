@@ -70,6 +70,17 @@ pub struct DecodedPicture {
     /// Used to compute POC distances for temporal MV scaling.
     /// `ref_pic_list_pocs[0]` = L0 POCs, `ref_pic_list_pocs[1]` = L1 POCs.
     pub ref_pic_list_pocs: [Vec<i32>; 2],
+
+    /// Row stride of `y` in samples. Planes keep the CTU-aligned stride of
+    /// the `PictureState` they came from, which is wider than `width` when
+    /// the picture width is not a multiple of the CTB size.
+    pub y_stride: usize,
+    /// Row stride of `u` / `v` in samples.
+    pub uv_stride: usize,
+    /// log2(SubWidthC): 1 for 4:2:0, 0 for 4:4:4.
+    pub chroma_shift_w: u32,
+    /// log2(SubHeightC): 1 for 4:2:0, 0 for 4:4:4.
+    pub chroma_shift_h: u32,
 }
 
 impl DecodedPicture {
@@ -95,6 +106,10 @@ impl DecodedPicture {
             min_pu_width: 0,
             log2_ctb_size: 0,
             ref_pic_list_pocs: [Vec::new(), Vec::new()],
+            y_stride: width as usize,
+            uv_stride: (width / 2) as usize,
+            chroma_shift_w: 1,
+            chroma_shift_h: 1,
         }
     }
 
@@ -128,6 +143,10 @@ impl DecodedPicture {
             min_pu_width,
             log2_ctb_size,
             ref_pic_list_pocs,
+            y_stride: width as usize,
+            uv_stride: (width / 2) as usize,
+            chroma_shift_w: 1,
+            chroma_shift_h: 1,
         }
     }
 
