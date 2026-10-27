@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 plus 4:4:4 (ChromaArrayType 3, 8-bit and 10-bit, intra and inter).** 4:2:2
 and monochrome are rejected at SPS parse. Byte-exact against FFmpeg on all
 in-tree fixtures plus 6 real-world Big Buck Bunny 1080p transcodes (8-bit and
-10-bit). 186 tests pass. No SIMD yet.
+10-bit). 188 tests pass. No SIMD yet.
 
 ## Build Commands
 
@@ -68,7 +68,7 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 
 ## Testing Strategy
 
-- 186 tests, all byte-exact against FFmpeg
+- 188 tests, all byte-exact against FFmpeg
 - Fixtures in `testdata/` (committed in-tree, < 1 MB each)
 - Large outputs (1080p, 10-bit) use SHA-256 hashes
 - `decode_and_hash()` helper handles both `PixelData::U8` and `PixelData::U16` (10-bit hashes as LE u16 bytes)
@@ -78,7 +78,8 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 - `DecodeLimits` (`Decoder::with_limits`) caps per-picture pixels (Level 6.2 MaxLumaPs) and estimated memory; SPS exceeding it returns `DecodeError::ResourceLimit`
 - 4:4:4 fixtures (x265 `--input-csp i444`): `intra444_96x96`, `intra444_10bit_96x96`, `intra444_100x68` (conformance window in luma units), `inter444_96x96` (P), `inter444_b_96x96` (B + weighted pred), `inter444_10bit_96x96`, `inter444_100x68`
 - `inter420_100x68.h265`: non-CTB-aligned width with inter prediction (reference plane stride != width)
-- No 4:4:4 PCM fixture yet: only HM emits PCM, and it was not available when 4:4:4 PCM support was written
+- `pcm444_hm_64x64.h265` / `pcm444_10bit_hm_64x64.h265`: HM-encoded 4:4:4 PCM (full-size chroma payload), 8-bit and 10-bit
+- Building HM on macOS with AppleClang 17 / Homebrew OpenSSL 3: drop `-Werror` from `cmake/CMakeBuild/cmake/modules/BBuildEnv.cmake` and stub the `EVP_PKEY_size` call in `SEIDigitallySignedContent.cpp`
 - `open_gop_cra.h265` / `seek_to_cra.h265`: x265 `--open-gop` with a mid-stream CRA (POC 150, past the LSB half-range) and the same stream cut to start at the CRA
 
 ## Important Pitfalls

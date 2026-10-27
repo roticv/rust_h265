@@ -3737,6 +3737,45 @@ mod tests {
         assert_eq!(pocs, (150..=169).collect::<Vec<i32>>());
     }
 
+    /// 64×64, 1 I-frame, 8-bit **4:4:4 with PCM blocks** (HM reference
+    /// encoder, QP 4 on random noise so PCM wins everywhere). In 4:4:4 the
+    /// PCM chroma payload is `cb_size × cb_size` per plane, not
+    /// `(cb_size/2)²`; reading it as 4:2:0 would misplace every chroma
+    /// sample and desync the CABAC restart after each PCM block. FFmpeg's
+    /// output is a lossless roundtrip of the noise input. Byte-exact.
+    ///
+    /// Fixture generated with (HM `TAppEncoder -c pcm444.cfg`):
+    /// ```text
+    /// python3 -c "import random; random.seed(42); open('n.yuv','wb').write(
+    ///   bytes(random.randrange(256) for _ in range(64*64*3)))"
+    /// # pcm444.cfg: Profile main-RExt, InputChromaFormat/ChromaFormatIDC 444,
+    /// #   64×64, MaxCUWidth 16, QP 4, IntraPeriod 1, PCMEnabledFlag 1,
+    /// #   PCMLog2MaxSize 4, PCMLog2MinSize 3, LoopFilterDisable 1, SAO 0
+    /// ```
+    #[test]
+    fn test_decode_444_pcm_hm_hash() {
+        let hash = decode_and_hash("pcm444_hm_64x64.h265", 1);
+        let expected = "a084bc71fd39d6cff8bc6d6e9bf11c26b890e972c97a9d67d789f9f8b1f18a59";
+        assert_eq!(
+            hash, expected,
+            "444 PCM hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// Same as `pcm444_hm_64x64.h265` but **10-bit** 4:4:4 (InputBitDepth
+    /// and InternalBitDepth 10, 10-bit noise, seed 43). Covers PCM sample
+    /// bit depth 10 with full-size chroma. Byte-exact against FFmpeg
+    /// (`yuv444p10le`).
+    #[test]
+    fn test_decode_444_pcm_10bit_hm_hash() {
+        let hash = decode_and_hash("pcm444_10bit_hm_64x64.h265", 1);
+        let expected = "a82e4946d42bb50dbe1741aa8ad21a01ff4c3d9c7df99e04a57cfabdc5d45e03";
+        assert_eq!(
+            hash, expected,
+            "444 PCM 10-bit hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
     #[test]
     fn test_decode_10bit_hash() {
         let hash = decode_and_hash("10bit_128x128.h265", 3);
