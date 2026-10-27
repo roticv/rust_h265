@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Status
 
 **Feature-complete for Main and Main 10 profile (8-bit and 10-bit 4:2:0).**
-172 tests pass. Byte-exact against FFmpeg on all in-tree fixtures plus 6
+177 tests pass. Byte-exact against FFmpeg on all in-tree fixtures plus 6
 real-world Big Buck Bunny 1080p transcodes (8-bit and 10-bit). No SIMD yet.
 
 ## Build Commands
@@ -66,13 +66,14 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 
 ## Testing Strategy
 
-- 172 tests, all byte-exact against FFmpeg
+- 177 tests, all byte-exact against FFmpeg
 - Fixtures in `testdata/` (committed in-tree, < 1 MB each)
 - Large outputs (1080p, 10-bit) use SHA-256 hashes
 - `decode_and_hash()` helper handles both `PixelData::U8` and `PixelData::U16` (10-bit hashes as LE u16 bytes)
 - `bench_realworld` downloads Big Buck Bunny and transcodes 6 fixtures (4 × 8-bit, 2 × 10-bit)
 - HM reference encoder used for PCM fixture (x265/kvazaar don't emit PCM blocks)
 - kvazaar used for `pps_loop_filter_across_slices_enabled_flag = 0` fixture
+- `DecodeLimits` (`Decoder::with_limits`) caps per-picture pixels (Level 6.2 MaxLumaPs) and estimated memory; SPS exceeding it returns `DecodeError::ResourceLimit`
 - `open_gop_cra.h265` / `seek_to_cra.h265`: x265 `--open-gop` with a mid-stream CRA (POC 150, past the LSB half-range) and the same stream cut to start at the CRA
 
 ## Important Pitfalls

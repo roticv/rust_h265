@@ -415,6 +415,34 @@ impl Sps {
     }
 }
 
+fn validate_conformance_window(
+    width: u32,
+    height: u32,
+    left: u32,
+    right: u32,
+    top: u32,
+    bottom: u32,
+) -> Result<(), DecodeError> {
+    let cropped_x = left
+        .checked_add(right)
+        .and_then(|value| value.checked_mul(2))
+        .ok_or(DecodeError::InvalidSyntax(
+            "conformance window width overflow",
+        ))?;
+    let cropped_y = top
+        .checked_add(bottom)
+        .and_then(|value| value.checked_mul(2))
+        .ok_or(DecodeError::InvalidSyntax(
+            "conformance window height overflow",
+        ))?;
+    if cropped_x > width || cropped_y > height {
+        return Err(DecodeError::InvalidSyntax(
+            "conformance window exceeds picture dimensions",
+        ));
+    }
+    Ok(())
+}
+
 pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     let mut r = BitstreamReader::new(rbsp);
 
@@ -463,6 +491,14 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         conf_win_right_offset = r.read_ue()?;
         conf_win_top_offset = r.read_ue()?;
         conf_win_bottom_offset = r.read_ue()?;
+        validate_conformance_window(
+            pic_width_in_luma_samples,
+            pic_height_in_luma_samples,
+            conf_win_left_offset,
+            conf_win_right_offset,
+            conf_win_top_offset,
+            conf_win_bottom_offset,
+        )?;
     }
 
     let bit_depth_luma_minus8 = r.read_ue()?;
@@ -684,6 +720,26 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_conformance_window_beyond_picture() {
+        assert!(matches!(
+            validate_conformance_window(16, 16, 1000, 0, 0, 0),
+            Err(DecodeError::InvalidSyntax(
+                "conformance window exceeds picture dimensions"
+            ))
+        ));
+    }
+
+    #[test]
+    fn rejects_conformance_window_overflow() {
+        assert!(matches!(
+            validate_conformance_window(16, 16, u32::MAX, 1, 0, 0),
+            Err(DecodeError::InvalidSyntax(
+                "conformance window width overflow"
+            ))
+        ));
+    }
 
     /// Phase 3d-1: parse a hand-built `st_ref_pic_set(0, ...)` describing a
     /// "single previous reference" set.
