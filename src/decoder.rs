@@ -53,6 +53,10 @@ pub struct Frame {
     pub pic_order_cnt: i32,
     /// Bit depth of the luma (and chroma) samples: 8, 10, or 12.
     pub bit_depth: u8,
+    /// `chroma_format_idc`: 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4. Determines the
+    /// dimensions of the `u`/`v` planes relative to `width`/`height`
+    /// (`SubWidthC`/`SubHeightC`, spec table 6-1).
+    pub chroma_format_idc: u32,
 }
 
 /// Streaming HEVC decoder.
@@ -329,12 +333,16 @@ fn crop_frame<P: Pixel>(
     poc: i32,
     bit_depth: u8,
 ) -> Result<Frame, DecodeError> {
+    // Conformance-window offsets are in chroma sample units; scale by
+    // SubWidthC/SubHeightC (`chroma_shift_*`) to reach luma coordinates.
     let luma_left = left_offset
-        .checked_mul(2)
+        .checked_shl(state.chroma_shift_w)
+        .filter(|v| v >> state.chroma_shift_w == left_offset)
         .and_then(|value| usize::try_from(value).ok())
         .ok_or(DecodeError::InvalidSyntax("invalid luma crop offset"))?;
     let luma_top = top_offset
-        .checked_mul(2)
+        .checked_shl(state.chroma_shift_h)
+        .filter(|v| v >> state.chroma_shift_h == top_offset)
         .and_then(|value| usize::try_from(value).ok())
         .ok_or(DecodeError::InvalidSyntax("invalid luma crop offset"))?;
     let cw = usize::try_from(cropped_w)
@@ -354,6 +362,7 @@ fn crop_frame<P: Pixel>(
     }
     let stride_y = state.y_stride;
     let stride_uv = state.uv_stride;
+    let chroma_format_idc = state.chroma_array_type;
 
     // Fast path: if the output dimensions match the stride (no padding, no
     // conformance crop), we can do a simple row-copy or even clone.
@@ -368,6 +377,7 @@ fn crop_frame<P: Pixel>(
             height: cropped_h,
             pic_order_cnt: poc,
             bit_depth,
+            chroma_format_idc,
         });
     }
 
@@ -388,8 +398,8 @@ fn crop_frame<P: Pixel>(
                 .ok_or(DecodeError::InvalidSyntax("invalid luma crop range"))?,
         );
     }
-    let cw_c = cw / 2;
-    let ch_c = ch / 2;
+    let cw_c = cw >> state.chroma_shift_w;
+    let ch_c = ch >> state.chroma_shift_h;
     let chroma_left = usize::try_from(left_offset)
         .map_err(|_| DecodeError::InvalidSyntax("invalid chroma crop offset"))?;
     let chroma_top = usize::try_from(top_offset)
@@ -426,6 +436,7 @@ fn crop_frame<P: Pixel>(
         height: cropped_h,
         pic_order_cnt: poc,
         bit_depth,
+        chroma_format_idc,
     })
 }
 
@@ -649,6 +660,16 @@ impl Decoder {
             sh.slice_loop_filter_across_slices_enabled_flag =
                 parent.slice_loop_filter_across_slices_enabled_flag;
             sh.poc = parent.poc;
+        }
+
+        // 4:4:4 (ChromaArrayType == 3) support covers intra pictures only —
+        // the profile HEIF/HEIC still images use. Inter chroma motion
+        // compensation is still specialised for 4:2:0, so an inter 4:4:4 slice
+        // is rejected cleanly rather than reconstructed with wrong chroma.
+        if sh.slice_type != SliceType::I && sps.chroma_array_type() == 3 {
+            return Err(DecodeError::Unsupported(
+                "4:4:4 inter (P/B) slices are not supported; 4:4:4 decode is intra-only",
+            ));
         }
 
         // Phase 3d-1: compute POC from the slice header's pic_order_cnt_lsb.
@@ -3719,6 +3740,132 @@ mod tests {
         assert_eq!(
             hash, expected,
             "10bit hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// 96×96, 1 intra frame, **4:4:4** (ChromaArrayType == 3). Exercises the
+    /// full-resolution chroma path: chroma TBs the same size as luma (no
+    /// half-sizing, no 4×4 deferral), reference-sample smoothing on chroma
+    /// (PLANAR/angular filtered like luma), per-PU `intra_chroma_pred_mode`
+    /// for PART_NxN CUs, `Min(qPi, 51)` chroma QP, chroma SAO and deblocking
+    /// on the 8×8 luma grid, plus the conformance-window crop (96 is not
+    /// CTB-aligned at CTU 64). Byte-exact against FFmpeg with `yuv444p`.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=96x96:rate=30:duration=0.034" \
+    ///   -frames:v 1 -pix_fmt yuv444p -f rawvideo /tmp/in444.yuv
+    /// x265 --input /tmp/in444.yuv --input-res 96x96 --fps 30 --frames 1 \
+    ///   --input-csp i444 --preset medium --keyint 1 --min-cu-size 8 \
+    ///   --no-info -o intra444_96x96.h265
+    /// ```
+    #[test]
+    fn test_decode_444_intra_byte_exact() {
+        let hash = decode_and_hash("intra444_96x96.h265", 1);
+        let expected = "fb8b7f1874713da3ca1e8bd131593336218e85fa1bd19caffcca684effe395a6";
+        assert_eq!(
+            hash, expected,
+            "444 intra hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// 96×96, 1 intra frame, **10-bit 4:4:4** — the exact format Apple HEIC
+    /// "edited" photos use (`yuv444p10le`). Combines the full-resolution
+    /// chroma path above with the 10-bit reconstruction path (`PictureState
+    /// <u16>`, `qp_bd_offset = 12`, 10-bit inverse transform and clipping).
+    /// Byte-exact against FFmpeg with `yuv444p10le`.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=96x96:rate=30:duration=0.034" \
+    ///   -frames:v 1 -pix_fmt yuv444p10le -f rawvideo /tmp/in444_10.yuv
+    /// x265 --input /tmp/in444_10.yuv --input-res 96x96 --fps 30 --frames 1 \
+    ///   --input-csp i444 --input-depth 10 --output-depth 10 \
+    ///   --preset medium --keyint 1 --min-cu-size 8 \
+    ///   --no-info -o intra444_10bit_96x96.h265
+    /// ```
+    #[test]
+    fn test_decode_444_intra_10bit_byte_exact() {
+        let hash = decode_and_hash("intra444_10bit_96x96.h265", 1);
+        let expected = "0bf1f7ee3492b98b8cd7a622f2f1afe4e390438e3bece26641b771a3c9eadfb5";
+        assert_eq!(
+            hash, expected,
+            "444 10-bit intra hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// 100×68 8-bit 4:4:4 intra, coded as 104×72 with a conformance window
+    /// of 4 luma samples right and bottom. In 4:4:4 the window offsets are in
+    /// luma units (SubWidthC = SubHeightC = 1); reading them as 4:2:0 units
+    /// would crop 8 and emit a 96×64 frame. Byte-exact against FFmpeg.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=100x68:rate=30" -frames:v 1 \
+    ///   -pix_fmt yuv444p -f rawvideo src444.yuv
+    /// x265 --input src444.yuv --input-res 100x68 --input-csp i444 --fps 30 \
+    ///   --frames 1 --preset medium --ctu 32 --keyint 1 --min-cu-size 8 \
+    ///   --no-info -o intra444_100x68.h265
+    /// ```
+    #[test]
+    fn test_decode_444_conformance_window_byte_exact() {
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/intra444_100x68.h265"
+        ))
+        .unwrap();
+        let mut decoder = Decoder::new();
+        let mut frames = Vec::new();
+        for nal in parse_annex_b(&h265).iter() {
+            if let Some(f) = decoder.decode_nal(nal).unwrap() {
+                frames.push(f);
+            }
+        }
+        assert_eq!(frames.len(), 1);
+        assert_eq!((frames[0].width, frames[0].height), (100, 68));
+        assert_eq!(frames[0].chroma_format_idc, 3);
+        assert_eq!(frames[0].u.len(), 100 * 68);
+
+        let hash = decode_and_hash("intra444_100x68.h265", 1);
+        let expected = "b6c9c0b9021641a6db7596196005212a81a73f217856d386ead29eb66c183038";
+        assert_eq!(
+            hash, expected,
+            "444 conformance window hash mismatch:\n  got: {hash}\n  exp: {expected}"
+        );
+    }
+
+    /// 4:4:4 support is intra-only (the profile HEIF/HEIC still images use);
+    /// inter chroma MC is still 4:2:0-specialised. A 4:4:4 P/B slice must be
+    /// rejected cleanly with `Unsupported` rather than reconstructed with the
+    /// wrong chroma. The fixture is an 8-frame I/P stream (IDR every 4).
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=96x96:rate=30:duration=0.27" \
+    ///   -frames:v 8 -pix_fmt yuv444p -f rawvideo /tmp/in444p.yuv
+    /// x265 --input /tmp/in444p.yuv --input-res 96x96 --fps 30 --frames 8 \
+    ///   --input-csp i444 --preset medium --keyint 4 --bframes 0 \
+    ///   --no-scenecut --min-cu-size 8 --no-info -o inter444_96x96.h265
+    /// ```
+    #[test]
+    fn test_decode_444_inter_rejected() {
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/inter444_96x96.h265"
+        ))
+        .unwrap();
+        let nals = parse_annex_b(&h265);
+        let mut decoder = Decoder::new();
+        let mut saw_unsupported = false;
+        for nal in &nals {
+            if let Err(DecodeError::Unsupported(_)) = decoder.decode_nal(nal) {
+                saw_unsupported = true;
+                break;
+            }
+        }
+        assert!(
+            saw_unsupported,
+            "expected an Unsupported error on the first 4:4:4 inter slice"
         );
     }
 

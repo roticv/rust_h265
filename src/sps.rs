@@ -315,6 +315,9 @@ pub struct Sps {
     pub profile_tier_level: ProfileTierLevel,
     pub sps_seq_parameter_set_id: u32,
     pub chroma_format_idc: u32,
+    /// When `chroma_format_idc == 3` and this is set, the three colour planes
+    /// are coded as separate monochrome pictures (`ChromaArrayType = 0`).
+    pub separate_colour_plane_flag: bool,
     pub pic_width_in_luma_samples: u32,
     pub pic_height_in_luma_samples: u32,
     /// Conformance window crop offsets (in chroma sample units for 4:2:0).
@@ -381,6 +384,34 @@ pub struct Sps {
 }
 
 impl Sps {
+    /// `ChromaArrayType` (spec 7.4.3.2.1): equals `chroma_format_idc` unless
+    /// the 4:4:4 planes are coded separately, in which case it is 0.
+    pub fn chroma_array_type(&self) -> u32 {
+        if self.separate_colour_plane_flag {
+            0
+        } else {
+            self.chroma_format_idc
+        }
+    }
+
+    /// `SubWidthC` (spec table 6-1): horizontal chroma subsampling factor.
+    /// 4:2:0 and 4:2:2 → 2; 4:4:4 and monochrome → 1.
+    pub fn sub_width_c(&self) -> u32 {
+        match self.chroma_array_type() {
+            1 | 2 => 2,
+            _ => 1,
+        }
+    }
+
+    /// `SubHeightC` (spec table 6-1): vertical chroma subsampling factor.
+    /// 4:2:0 → 2; 4:2:2, 4:4:4, monochrome → 1.
+    pub fn sub_height_c(&self) -> u32 {
+        match self.chroma_array_type() {
+            1 => 2,
+            _ => 1,
+        }
+    }
+
     /// `PicWidthInCtbsY` (spec eq. 7-15).
     pub fn pic_width_in_ctbs_y(&self) -> u32 {
         self.pic_width_in_luma_samples.div_ceil(self.ctb_size_y)
@@ -415,9 +446,15 @@ impl Sps {
     }
 }
 
+/// Reject a conformance window that does not fit inside the coded picture.
+/// Offsets are in chroma sample units, so they scale by `SubWidthC` /
+/// `SubHeightC` (2 for 4:2:0, 1 for 4:4:4) to reach luma samples.
+#[allow(clippy::too_many_arguments)]
 fn validate_conformance_window(
     width: u32,
     height: u32,
+    sub_width_c: u32,
+    sub_height_c: u32,
     left: u32,
     right: u32,
     top: u32,
@@ -425,13 +462,13 @@ fn validate_conformance_window(
 ) -> Result<(), DecodeError> {
     let cropped_x = left
         .checked_add(right)
-        .and_then(|value| value.checked_mul(2))
+        .and_then(|value| value.checked_mul(sub_width_c))
         .ok_or(DecodeError::InvalidSyntax(
             "conformance window width overflow",
         ))?;
     let cropped_y = top
         .checked_add(bottom)
-        .and_then(|value| value.checked_mul(2))
+        .and_then(|value| value.checked_mul(sub_height_c))
         .ok_or(DecodeError::InvalidSyntax(
             "conformance window height overflow",
         ))?;
@@ -458,12 +495,27 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
 
     let sps_seq_parameter_set_id = r.read_ue()?;
     let chroma_format_idc = r.read_ue()?;
-    if chroma_format_idc != 1 {
+    if chroma_format_idc > 3 {
+        return Err(DecodeError::InvalidSyntax("chroma_format_idc out of range"));
+    }
+    let mut separate_colour_plane_flag = false;
+    if chroma_format_idc == 3 {
+        separate_colour_plane_flag = r.read_bit()? == 1;
+    }
+    // Supported ChromaArrayTypes: 4:2:0 (1) and 4:4:4 (3). 4:2:2 (2) and
+    // monochrome (0, including 4:4:4 with separate colour planes) are not yet
+    // wired through the reconstruction pipeline. The SPS parse stays in sync
+    // regardless. See the chroma-geometry helpers on `Sps`.
+    let chroma_array_type = if separate_colour_plane_flag {
+        0
+    } else {
+        chroma_format_idc
+    };
+    if chroma_array_type != 1 && chroma_array_type != 3 {
         return Err(DecodeError::Unsupported(
-            "only 4:2:0 (chroma_format_idc=1) supported",
+            "only 4:2:0 and 4:4:4 chroma formats supported",
         ));
     }
-    // chroma_format_idc == 3 would have a separate_colour_plane_flag here.
 
     let pic_width_in_luma_samples = r.read_ue()?;
     let pic_height_in_luma_samples = r.read_ue()?;
@@ -491,9 +543,18 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         conf_win_right_offset = r.read_ue()?;
         conf_win_top_offset = r.read_ue()?;
         conf_win_bottom_offset = r.read_ue()?;
+        // Supported ChromaArrayTypes are 1 (4:2:0, SubWidthC = SubHeightC = 2)
+        // and 3 (4:4:4, both 1).
+        let (sub_w, sub_h) = if chroma_array_type == 1 {
+            (2, 2)
+        } else {
+            (1, 1)
+        };
         validate_conformance_window(
             pic_width_in_luma_samples,
             pic_height_in_luma_samples,
+            sub_w,
+            sub_h,
             conf_win_left_offset,
             conf_win_right_offset,
             conf_win_top_offset,
@@ -677,6 +738,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         profile_tier_level: ptl,
         sps_seq_parameter_set_id,
         chroma_format_idc,
+        separate_colour_plane_flag,
         pic_width_in_luma_samples,
         pic_height_in_luma_samples,
         conf_win_left_offset,
@@ -724,17 +786,25 @@ mod tests {
     #[test]
     fn rejects_conformance_window_beyond_picture() {
         assert!(matches!(
-            validate_conformance_window(16, 16, 1000, 0, 0, 0),
+            validate_conformance_window(16, 16, 2, 2, 1000, 0, 0, 0),
             Err(DecodeError::InvalidSyntax(
                 "conformance window exceeds picture dimensions"
             ))
         ));
     }
 
+    /// 4:4:4 offsets are in luma units (SubWidthC = 1): a 10-sample window on
+    /// a 16-wide picture fits for 4:4:4 but would be 20 > 16 under 4:2:0.
+    #[test]
+    fn conformance_window_scales_by_chroma_subsampling() {
+        assert!(validate_conformance_window(16, 16, 1, 1, 5, 5, 0, 0).is_ok());
+        assert!(validate_conformance_window(16, 16, 2, 2, 5, 5, 0, 0).is_err());
+    }
+
     #[test]
     fn rejects_conformance_window_overflow() {
         assert!(matches!(
-            validate_conformance_window(16, 16, u32::MAX, 1, 0, 0),
+            validate_conformance_window(16, 16, 2, 2, u32::MAX, 1, 0, 0),
             Err(DecodeError::InvalidSyntax(
                 "conformance window width overflow"
             ))

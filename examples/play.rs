@@ -11,15 +11,24 @@ use rust_h265::decoder::{Decoder, Frame};
 use rust_h265::nal::{NalUnitType, parse_annex_b};
 use std::time::{Duration, Instant};
 
-/// Convert YUV420 frame to ARGB pixel buffer for display.
-fn yuv_to_argb(y: &[u8], u: &[u8], v: &[u8], width: usize, height: usize) -> Vec<u32> {
-    let cw = width / 2;
+/// Convert a YUV frame (4:2:0 or 4:4:4) to an ARGB pixel buffer for display.
+fn yuv_to_argb(
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    width: usize,
+    height: usize,
+    chroma_format_idc: u32,
+) -> Vec<u32> {
+    // Chroma subsampling shift: 1 for 4:2:0, 0 for 4:4:4.
+    let cs = if chroma_format_idc == 3 { 0 } else { 1 };
+    let cw = width >> cs;
     let mut argb = vec![0u32; width * height];
     for row in 0..height {
         for col in 0..width {
             let y_val = y[row * width + col] as i32;
-            let u_val = u[(row / 2) * cw + col / 2] as i32 - 128;
-            let v_val = v[(row / 2) * cw + col / 2] as i32 - 128;
+            let u_val = u[(row >> cs) * cw + (col >> cs)] as i32 - 128;
+            let v_val = v[(row >> cs) * cw + (col >> cs)] as i32 - 128;
 
             let r = (y_val + ((v_val * 359 + 128) >> 8)).clamp(0, 255) as u32;
             let g = (y_val - ((u_val * 88 + v_val * 183 + 128) >> 8)).clamp(0, 255) as u32;
@@ -147,6 +156,7 @@ fn main() {
                 display_frame.v.as_u8().expect("8-bit"),
                 width,
                 height,
+                display_frame.chroma_format_idc,
             ));
             nal_idx += 1;
             break;
@@ -166,6 +176,7 @@ fn main() {
                 f.v.as_u8().expect("8-bit"),
                 width,
                 height,
+                f.chroma_format_idc,
             ));
         }
     }
@@ -309,6 +320,7 @@ fn main() {
             f.v.as_u8().expect("8-bit"),
             width,
             height,
+            f.chroma_format_idc,
         );
         frame_count += 1;
 

@@ -354,8 +354,8 @@ pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &
     }
     let pic_w = state.width as usize;
     let pic_h = state.height as usize;
-    let pic_w_c = (state.width / 2) as usize;
-    let pic_h_c = (state.height / 2) as usize;
+    let pic_w_c = (state.width >> state.chroma_shift_w) as usize;
+    let pic_h_c = (state.height >> state.chroma_shift_h) as usize;
     let ctb_size = 1usize << sps.ctb_log2_size_y;
     let pic_w_in_ctbs = pic_w.div_ceil(ctb_size);
     let pic_h_in_ctbs = pic_h.div_ceil(ctb_size);
@@ -423,12 +423,15 @@ pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &
                 }
             }
 
-            // Chroma (4:2:0): operates on the 8x8 chroma CTU grid.
-            if sh.slice_sao_chroma_flag && sps.chroma_format_idc == 1 {
-                let x0_c = rx * (ctb_size / 2);
-                let y0_c = ry * (ctb_size / 2);
-                let w_c = (x0_c + (ctb_size / 2)).min(pic_w_c) - x0_c;
-                let h_c = (y0_c + (ctb_size / 2)).min(pic_h_c) - y0_c;
+            // Chroma: operates on the chroma CTU grid, sized by the chroma
+            // subsampling (equal to the luma grid for 4:4:4).
+            if sh.slice_sao_chroma_flag && state.chroma_array_type != 0 {
+                let ctb_c_w = ctb_size >> state.chroma_shift_w;
+                let ctb_c_h = ctb_size >> state.chroma_shift_h;
+                let x0_c = rx * ctb_c_w;
+                let y0_c = ry * ctb_c_h;
+                let w_c = (x0_c + ctb_c_w).min(pic_w_c) - x0_c;
+                let h_c = (y0_c + ctb_c_h).min(pic_h_c) - y0_c;
                 for c_idx in 1..=2 {
                     if sao.type_idx[c_idx] == SaoType::NotApplied {
                         continue;

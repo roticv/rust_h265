@@ -70,9 +70,21 @@ fn chroma_qp_table(qp_i: i32) -> i32 {
 }
 
 /// Compute chroma tc for an intra edge (bS == 2), scaled for bit depth.
-fn chroma_tc(qp_y: i32, qp_offset: i32, tc_offset: i32, bit_depth: u8) -> i32 {
+/// ChromaArrayType 1 (4:2:0) maps qPi via table 8-9; 4:2:2/4:4:4 use
+/// `Min(qPi, 51)` (spec 8.6.1 / 8.7.2.5.5).
+fn chroma_tc(
+    qp_y: i32,
+    qp_offset: i32,
+    tc_offset: i32,
+    bit_depth: u8,
+    chroma_array_type: u32,
+) -> i32 {
     let qp_i = (qp_y + qp_offset).clamp(0, 57);
-    let qp = chroma_qp_table(qp_i);
+    let qp = if chroma_array_type == 1 {
+        chroma_qp_table(qp_i)
+    } else {
+        qp_i.min(51)
+    };
     // Intra deblocking: bS - 1 = 1, so tc table index gets +2.
     let idx = (qp + 2 + tc_offset).clamp(0, 53) as usize;
     (TC_TABLE[idx] as i32) << (bit_depth - 8)
@@ -318,15 +330,16 @@ fn filter_chroma_edge<P: Pixel>(
     bs0: i32,
     bs1: i32,
     bit_depth: u8,
+    chroma_array_type: u32,
 ) {
     let tcs = [
         if bs0 == 2 {
-            chroma_tc(qp0_avg, qp_offset, tc_offset, bit_depth)
+            chroma_tc(qp0_avg, qp_offset, tc_offset, bit_depth, chroma_array_type)
         } else {
             0
         },
         if bs1 == 2 {
-            chroma_tc(qp1_avg, qp_offset, tc_offset, bit_depth)
+            chroma_tc(qp1_avg, qp_offset, tc_offset, bit_depth, chroma_array_type)
         } else {
             0
         },
@@ -486,11 +499,24 @@ pub fn deblock_picture<P: Pixel>(
         y += 8;
     }
 
-    // ---- Chroma (4:2:0): on the 16x16 luma grid ----
+    // ---- Chroma deblocking ----
     //
-    // To keep the borrow checker happy we collect (pix_base, qp0, qp1, bs0, bs1)
-    // for every chroma edge before grabbing &mut state.u_plane / v_plane.
-    if sps.chroma_format_idc == 1 {
+    // Chroma edges lie on the 8×8 chroma-sample grid; in luma coordinates that
+    // is every `8 << SubWidthC-shift` columns / `8 << SubHeightC-shift` rows,
+    // and the two boundary-strength probes along an edge sit `4 << shift` luma
+    // samples apart. Chroma pixel coordinates are the luma coordinates shifted
+    // right by the subsampling (4:2:0 → the 16-luma grid; 4:4:4 → the 8-luma
+    // grid). To keep the borrow checker happy we collect every chroma edge
+    // before grabbing &mut state.u_plane / v_plane.
+    let chroma_array_type = sps.chroma_array_type();
+    if chroma_array_type != 0 {
+        let cshift_w = state.chroma_shift_w as usize;
+        let cshift_h = state.chroma_shift_h as usize;
+        let step_x = 8usize << cshift_w; // vertical-edge column spacing (luma)
+        let step_y = 8usize << cshift_h; // horizontal-edge row spacing (luma)
+        let bs_dx = 4usize << cshift_w; // 2nd bS probe offset along a horiz edge
+        let bs_dy = 4usize << cshift_h; // 2nd bS probe offset along a vert edge
+
         struct ChromaEdge {
             pix_base: usize,
             xstride: isize,
@@ -502,28 +528,28 @@ pub fn deblock_picture<P: Pixel>(
         }
         let mut edges: Vec<ChromaEdge> = Vec::new();
 
-        // Vertical edges, every 16 luma cols.
+        // Vertical edges.
         let mut y_l = 0usize;
         while y_l < pic_h {
-            let mut x_l = 16usize;
+            let mut x_l = step_x;
             while x_l < pic_w {
                 if skip_vertical_slice_boundary(state, x_l, y_l) {
-                    x_l += 16;
+                    x_l += step_x;
                     continue;
                 }
                 let bs0 = read_bs(&state.bs_vertical, pic_w, x_l, y_l);
-                let bs1 = read_bs(&state.bs_vertical, pic_w, x_l, y_l + 8);
+                let bs1 = read_bs(&state.bs_vertical, pic_w, x_l, y_l + bs_dy);
                 if bs0 == 2 || bs1 == 2 {
                     let qp0_avg = (get_qp_y(state, x_l as i32 - 1, y_l as i32)
                         + get_qp_y(state, x_l as i32, y_l as i32)
                         + 1)
                         >> 1;
-                    let qp1_avg = (get_qp_y(state, x_l as i32 - 1, y_l as i32 + 8)
-                        + get_qp_y(state, x_l as i32, y_l as i32 + 8)
+                    let qp1_avg = (get_qp_y(state, x_l as i32 - 1, (y_l + bs_dy) as i32)
+                        + get_qp_y(state, x_l as i32, (y_l + bs_dy) as i32)
                         + 1)
                         >> 1;
-                    let xc = x_l >> 1;
-                    let yc = y_l >> 1;
+                    let xc = x_l >> cshift_w;
+                    let yc = y_l >> cshift_h;
                     edges.push(ChromaEdge {
                         pix_base: yc * stride_uv + xc,
                         xstride: 1,
@@ -534,32 +560,32 @@ pub fn deblock_picture<P: Pixel>(
                         bs1,
                     });
                 }
-                x_l += 16;
+                x_l += step_x;
             }
-            y_l += 16;
+            y_l += step_y;
         }
         // Horizontal edges.
-        let mut y_l = 16usize;
+        let mut y_l = step_y;
         while y_l < pic_h {
             let mut x_l = 0usize;
             while x_l < pic_w {
                 if skip_horizontal_slice_boundary(state, x_l, y_l) {
-                    x_l += 16;
+                    x_l += step_x;
                     continue;
                 }
                 let bs0 = read_bs(&state.bs_horizontal, pic_w, x_l, y_l);
-                let bs1 = read_bs(&state.bs_horizontal, pic_w, x_l + 8, y_l);
+                let bs1 = read_bs(&state.bs_horizontal, pic_w, x_l + bs_dx, y_l);
                 if bs0 == 2 || bs1 == 2 {
                     let qp0_avg = (get_qp_y(state, x_l as i32, y_l as i32 - 1)
                         + get_qp_y(state, x_l as i32, y_l as i32)
                         + 1)
                         >> 1;
-                    let qp1_avg = (get_qp_y(state, x_l as i32 + 8, y_l as i32 - 1)
-                        + get_qp_y(state, x_l as i32 + 8, y_l as i32)
+                    let qp1_avg = (get_qp_y(state, (x_l + bs_dx) as i32, y_l as i32 - 1)
+                        + get_qp_y(state, (x_l + bs_dx) as i32, y_l as i32)
                         + 1)
                         >> 1;
-                    let xc = x_l >> 1;
-                    let yc = y_l >> 1;
+                    let xc = x_l >> cshift_w;
+                    let yc = y_l >> cshift_h;
                     edges.push(ChromaEdge {
                         pix_base: yc * stride_uv + xc,
                         xstride: stride_uv as isize,
@@ -570,9 +596,9 @@ pub fn deblock_picture<P: Pixel>(
                         bs1,
                     });
                 }
-                x_l += 16;
+                x_l += step_x;
             }
-            y_l += 16;
+            y_l += step_y;
         }
 
         // Now apply edges to each chroma plane.
@@ -600,6 +626,7 @@ pub fn deblock_picture<P: Pixel>(
                     e.bs0,
                     e.bs1,
                     bit_depth_chroma,
+                    chroma_array_type,
                 );
             }
         }
