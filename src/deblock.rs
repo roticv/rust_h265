@@ -395,7 +395,7 @@ fn edge_no_filter<P: Pixel>(
 /// luma `(x, y)`: those of the slice containing that sample (spec 8.7.2.5.3).
 fn deblock_offsets<P: Pixel>(state: &PictureState<P>, x: usize, y: usize) -> (i32, i32) {
     let log2_ctb = state.log2_ctb_size as usize;
-    let w_ctbs = (state.width as usize).div_ceil(1 << log2_ctb);
+    let w_ctbs = state.width_in_ctbs;
     let rs = (y >> log2_ctb) * w_ctbs + (x >> log2_ctb);
     let (b, t) = state.tab_deblock_offsets.get(rs).copied().unwrap_or((0, 0));
     (b as i32, t as i32)
@@ -424,7 +424,7 @@ fn skip_vertical_slice_boundary<P: Pixel>(state: &PictureState<P>, x: usize, y: 
     if left_ctb_col == right_ctb_col {
         return false; // not at a CTB column boundary
     }
-    let ctb_width = (state.width as usize).div_ceil(1 << log2_ctb);
+    let ctb_width = state.width_in_ctbs;
     let ctb_row = y >> log2_ctb;
     let left_rs = ctb_row * ctb_width + left_ctb_col;
     let right_rs = ctb_row * ctb_width + right_ctb_col;
@@ -449,7 +449,7 @@ fn skip_horizontal_slice_boundary<P: Pixel>(state: &PictureState<P>, x: usize, y
     if top_ctb_row == bot_ctb_row {
         return false; // not at a CTB row boundary
     }
-    let ctb_width = (state.width as usize).div_ceil(1 << log2_ctb);
+    let ctb_width = state.width_in_ctbs;
     let ctb_col = x >> log2_ctb;
     let top_rs = top_ctb_row * ctb_width + ctb_col;
     let bot_rs = bot_ctb_row * ctb_width + ctb_col;

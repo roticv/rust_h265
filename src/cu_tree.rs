@@ -180,6 +180,8 @@ pub struct PictureState<P: Pixel> {
     pub log2_min_cb_size: u8,
     pub log2_min_pu_size: u8,
     pub log2_ctb_size: u8,
+    /// PicWidthInCtbsY, for raster CTB addresses without a division.
+    pub width_in_ctbs: usize,
     pub min_cb_width: usize,
     pub min_pu_width: usize,
     pub tab_ct_depth: Vec<u8>,
@@ -370,6 +372,7 @@ impl<P: Pixel> PictureState<P> {
             log2_min_cb_size,
             log2_min_pu_size,
             log2_ctb_size,
+            width_in_ctbs: (w as usize).div_ceil(1usize << log2_ctb_size),
             min_cb_width,
             min_pu_width,
             tab_ct_depth: vec![0u8; min_cb_width * min_cb_height],
@@ -831,7 +834,7 @@ fn neighbour_available<P: Pixel>(
     if (cx, cy) == (nx, ny) {
         return true;
     }
-    let ctb_w = state.width.div_ceil(1 << log2_ctb) as usize;
+    let ctb_w = state.width_in_ctbs;
     let (cur, nb) = (cy * ctb_w + cx, ny * ctb_w + nx);
     let slice = |rs: usize| state.tab_slice_addr_rs.get(rs).copied().unwrap_or(-1);
     let tile = |rs: usize| state.tab_tile_id.get(rs).copied();
@@ -955,7 +958,7 @@ fn spatial_cand_available<P: Pixel>(
     }
     // Same slice?
     let log2_ctb = state.log2_ctb_size;
-    let ctb_w = (state.width as usize).div_ceil(1 << log2_ctb);
+    let ctb_w = state.width_in_ctbs;
     let curr_ctb_rs = (y0 as usize >> log2_ctb) * ctb_w + (x0 as usize >> log2_ctb);
     let n_ctb_rs = (y_n as usize >> log2_ctb) * ctb_w + (x_n as usize >> log2_ctb);
     if state.tab_slice_addr_rs[n_ctb_rs] != state.tab_slice_addr_rs[curr_ctb_rs] {
@@ -2299,7 +2302,7 @@ fn compute_deblocking_boundary_strengths<P: Pixel>(
     // 8.7.2.4 compares reference pictures, not indices).
     let curr_ref_pocs = &slice_params.ref_pic_list_pocs;
     let log2_ctb = state.log2_ctb_size;
-    let ctb_w = pic_w.div_ceil(1 << log2_ctb);
+    let ctb_w = state.width_in_ctbs;
     let slice_at = |x: u32, y: u32| -> i32 {
         state.tab_slice_addr_rs[(y as usize >> log2_ctb) * ctb_w + (x as usize >> log2_ctb)]
     };
