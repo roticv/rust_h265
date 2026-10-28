@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **JCT-VC HEVC_v1 conformance: 143 of 147 vectors now decode bit-exact**
+  (95 at the first run). New harness in `tools/conformance/`. Fixes found
+  with it:
+  - SPS and PPS are stored by ID and activated per picture, so streams
+    that switch between several parameter sets decode.
+  - Reference picture lists are built per slice; temporal MV prediction
+    and deblocking read each slice's own lists; long-term references
+    matched by POC LSB resolve; long-term MV prediction rules apply.
+  - RASL pictures after a BLA are skipped; pictures with
+    `pic_output_flag = 0` are not returned; reserved VCL NAL types and
+    slice header extensions are skipped.
+  - Weighted bi-prediction, 10-bit weighted-prediction offsets and the
+    10-bit QP range are correct.
+  - `cu_qp_delta` takes its QP prediction from the CU origin. Inside CUs
+    larger than the quantization group the QP was wrong; this also broke
+    wavefront streams with 64x64 CTBs.
+  - Loop filters: lossless and PCM samples are protected, PCM CU edges are
+    deblocked, per-slice deblocking offsets and disable are honoured, the
+    spec slice-boundary rules apply when slices disagree on filtering
+    across slices, and SAO checks diagonal CTBs at CTB corners.
+  - Raster slice addresses with tiles, context and QP resets at tile
+    starts in dependent slice segments.
+  - Constrained intra prediction marks individual reference samples
+    unavailable, not whole sides.
+  - With a parallel merge level above 2, 8x8 CUs share one merge list
+    derived at the CU origin.
+  - The motion vector sum wraps modulo 2^16 instead of saturating.
+  - Luma and chroma may have different bit depths.
 - **Crash on malformed SPS transform sizes** (found by fuzzing; present in
   0.1.0 and 0.2.0). An SPS whose minimum transform block was not smaller
   than its minimum coding block, as in 32-sample transforms inside 16-sample
