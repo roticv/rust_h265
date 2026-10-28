@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One bad slice no longer stops decoding.** A picture whose slices
+  failed or were lost stayed "in progress", and every later picture was
+  rejected with "new first slice segment arrived while previous picture
+  was incomplete". Such a picture is now finished when the next one starts:
+  CTBs no slice decoded are filled mid-grey, the loop filters run, and it
+  is output and kept as a reference. A reference picture missing from the
+  DPB is replaced by a generated mid-grey picture (spec 8.3.3) instead of
+  failing with "reference picture POC not present in DPB". `flush()`
+  finishes a picture left incomplete at the end of the stream. Damaging
+  any single slice of the B-frame test streams now costs at most that
+  picture.
 - **JCT-VC HEVC_v1 conformance: all 147 vectors now decode bit-exact**
   (95 at the first run; the 4 output-order vectors need display-order mode). New harness in `tools/conformance/`. Fixes found
   with it:

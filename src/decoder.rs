@@ -94,16 +94,6 @@ macro_rules! with_picture_state {
     };
 }
 
-/// Immutable variant of the dispatch macro.
-macro_rules! with_picture_state_ref {
-    ($pic:expr, |$state:ident| $body:expr) => {
-        match $pic {
-            &PictureStateEnum::U8(ref $state) => $body,
-            &PictureStateEnum::U16(ref $state) => $body,
-        }
-    };
-}
-
 /// In-flight picture state: the reconstruction buffers plus the bookkeeping
 /// needed to stitch multi-slice decode back together.
 struct PictureInProgress {
@@ -306,9 +296,16 @@ type ZscanKey = (u32, u32, u8, u8);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 ///
-/// Error recovery is limited: once a slice fails to decode, the decoder
-/// rejects the pictures that follow it. To resume after an error, create a
-/// new `Decoder` and feed it from the next parameter sets and IRAP picture.
+/// # Errors and damaged streams
+///
+/// An error from `decode_nal` concerns that NAL unit only; keep feeding the
+/// stream. A picture that loses slices (failed or missing) is still
+/// finished when the next picture starts, with the CTBs no slice decoded
+/// filled mid-grey, and is output and used as a reference. A reference
+/// picture that is missing altogether is replaced by a mid-grey stand-in
+/// (spec 8.3.3). Pictures predicted from damaged ones show the damage until
+/// the next IRAP picture. A picture whose first slice segment is lost is
+/// dropped, as in FFmpeg.
 #[derive(Default)]
 pub struct Decoder {
     limits: DecodeLimits,
@@ -382,6 +379,103 @@ pub struct Decoder {
     /// of being returned by `decode_nal` in decoding order.
     display_order: bool,
     output_queue: crate::output::OutputQueue,
+    /// Decoding-order mode: frames ready but not yet returned. A call can
+    /// finish two pictures (an incomplete earlier one, then its own), and
+    /// `decode_nal` returns one frame per call.
+    pending_frames: std::collections::VecDeque<Frame>,
+}
+
+/// Fill every CTB that no slice decoded (`tab_slice_addr_rs == -1`) with
+/// mid-grey, the value the spec uses for generated unavailable pictures
+/// (8.3.3.2). Such CTBs come from lost or failed slices; without this they
+/// would hold zeros, which show as saturated green and spread through
+/// motion compensation.
+fn fill_undecoded_ctbs<P: Pixel>(state: &mut crate::cu_tree::PictureState<P>) {
+    let ctb = 1usize << state.log2_ctb_size;
+    let (w, h) = (state.width as usize, state.height as usize);
+    let ctb_w = w.div_ceil(ctb);
+    let mid = |bd: u8| P::from_i32_clamped(1 << (bd - 1), bd);
+    let (mid_y, mid_c) = (mid(state.bit_depth), mid(state.bit_depth_c));
+    let (sw, sh) = (state.chroma_shift_w, state.chroma_shift_h);
+    for rs in 0..state.tab_slice_addr_rs.len() {
+        if state.tab_slice_addr_rs[rs] != -1 {
+            continue;
+        }
+        let (x0, y0) = ((rs % ctb_w) * ctb, (rs / ctb_w) * ctb);
+        let (x1, y1) = ((x0 + ctb).min(w), (y0 + ctb).min(h));
+        let ys = state.y_stride;
+        for y in y0..y1 {
+            state.y_plane[y * ys + x0..y * ys + x1].fill(mid_y);
+        }
+        if state.chroma_array_type != 0 {
+            let cs = state.uv_stride;
+            let (cx0, cx1) = (x0 >> sw, x1.div_ceil(1 << sw));
+            for y in (y0 >> sh)..y1.div_ceil(1 << sh) {
+                state.u_plane[y * cs + cx0..y * cs + cx1].fill(mid_c);
+                state.v_plane[y * cs + cx0..y * cs + cx1].fill(mid_c);
+            }
+        }
+    }
+}
+
+/// Min-TB Z-scan table for `sps`, shared through `cache` while the picture
+/// geometry stays the same.
+fn zscan_table(cache: &mut Option<(ZscanKey, Rc<Vec<i32>>)>, sps: &Sps) -> Rc<Vec<i32>> {
+    let key = (
+        sps.pic_width_in_luma_samples,
+        sps.pic_height_in_luma_samples,
+        sps.ctb_log2_size_y,
+        sps.min_tb_log2_size_y,
+    );
+    match cache {
+        Some((k, tab)) if *k == key => Rc::clone(tab),
+        _ => {
+            let tab = Rc::new(crate::cu_tree::build_min_tb_addr_zs(sps));
+            *cache = Some((key, Rc::clone(&tab)));
+            tab
+        }
+    }
+}
+
+/// A fresh picture state with the sample type the SPS needs.
+fn new_picture_state(sps: &Sps, zscan: Rc<Vec<i32>>) -> PictureStateEnum {
+    if sps.needs_u16_samples() {
+        PictureStateEnum::U16(PictureState::<u16>::new_with_zscan(sps, zscan))
+    } else {
+        PictureStateEnum::U8(PictureState::<u8>::new_with_zscan(sps, zscan))
+    }
+}
+
+/// A mid-grey reference picture with POC `poc` and no motion (spec
+/// 8.3.3.2), standing in for a reference that is missing from the DPB.
+fn generated_reference<P: Pixel>(
+    state: &mut crate::cu_tree::PictureState<P>,
+    poc: i32,
+) -> Rc<DecodedPicture> {
+    fill_undecoded_ctbs(state);
+    let (width, height) = (state.width, state.height);
+    let (y_stride, uv_stride) = (state.y_stride, state.uv_stride);
+    let (chroma_shift_w, chroma_shift_h) = (state.chroma_shift_w, state.chroma_shift_h);
+    let (y, u, v, tab_mvf, log2_min_pu_size, min_pu_width, log2_ctb_size) =
+        state.take_planes_and_mvf();
+    let mut dp = DecodedPicture::new_with_mvf(
+        y,
+        u,
+        v,
+        width,
+        height,
+        poc,
+        tab_mvf,
+        log2_min_pu_size,
+        min_pu_width,
+        log2_ctb_size,
+        [Vec::new(), Vec::new()],
+    );
+    dp.y_stride = y_stride;
+    dp.uv_stride = uv_stride;
+    dp.chroma_shift_w = chroma_shift_w;
+    dp.chroma_shift_h = chroma_shift_h;
+    Rc::new(dp)
 }
 
 /// Crop a decoded picture's planes to the conformance window and build a Frame.
@@ -613,7 +707,28 @@ impl Decoder {
 
     /// Feed one NAL unit. Returns `Ok(Some(frame))` when a picture has just
     /// finished decoding, `Ok(None)` otherwise (e.g. parameter sets, SEI).
+    ///
+    /// At most one frame is returned per call. When a damaged picture is
+    /// finished at the start of the next one and that next picture also
+    /// completes in the same call, the later frame is returned by the next
+    /// call (or by `flush`), so frames stay in decoding order.
     pub fn decode_nal(&mut self, nal: &NalUnit<'_>) -> Result<Option<Frame>, DecodeError> {
+        let result = self.decode_nal_inner(nal);
+        if self.pending_frames.is_empty() {
+            return result;
+        }
+        // Frames finished earlier go out first, keeping decoding order.
+        match result {
+            Ok(Some(frame)) => {
+                self.pending_frames.push_back(frame);
+                Ok(self.pending_frames.pop_front())
+            }
+            Ok(None) => Ok(self.pending_frames.pop_front()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn decode_nal_inner(&mut self, nal: &NalUnit<'_>) -> Result<Option<Frame>, DecodeError> {
         match nal.nal_unit_type {
             NalUnitType::Vps => {
                 self.vps = Some(parse_vps(&nal.rbsp)?);
@@ -670,52 +785,18 @@ impl Decoder {
     /// waiting is released, and each call returns the next one in display
     /// order until `None`.
     pub fn flush(&mut self) -> Option<Frame> {
-        let pending = self.take_completed_picture();
-        if !self.display_order {
-            return pending;
+        // A picture still in progress at the end of the stream (its last
+        // slices lost or failed) is finished with its missing CTBs filled.
+        if let Some(pic) = self.current_picture.take()
+            && let Ok(Some(frame)) = self.finish_picture(pic)
+        {
+            self.pending_frames.push_back(frame);
         }
-        if let Some(sps) = self.sps.as_ref() {
-            let limits = crate::output::OutputLimits::from_sps(sps);
-            self.output_queue.after_picture(&limits, pending);
+        if self.display_order {
+            self.output_queue.output_all();
+            return self.output_queue.pop();
         }
-        self.output_queue.output_all();
-        self.output_queue.pop()
-    }
-
-    /// A fully decoded picture still in `current_picture`, as a frame.
-    fn take_completed_picture(&mut self) -> Option<Frame> {
-        // If there's a completed (all CTBs decoded) picture still sitting
-        // in current_picture, emit it. This is a defensive fallback — in
-        // normal operation the picture is emitted at the end of decode_slice.
-        let is_complete = self
-            .current_picture
-            .as_ref()
-            .is_some_and(|pic| pic.ctbs_decoded >= pic.total_ctbs);
-        if is_complete {
-            let pic = self.current_picture.take().unwrap();
-            let sps = self.sps.as_ref()?;
-            let pic_width = sps.pic_width_in_luma_samples;
-            let pic_height = sps.pic_height_in_luma_samples;
-            let cropped_w = sps.cropped_width();
-            let cropped_h = sps.cropped_height();
-            let poc = pic.last_slice_header.poc;
-            let bd = sps.bit_depth_luma;
-            let frame = with_picture_state_ref!(&pic.state, |state| {
-                crop_frame(
-                    state,
-                    pic_width,
-                    pic_height,
-                    cropped_w,
-                    cropped_h,
-                    sps.conf_win_left_offset,
-                    sps.conf_win_top_offset,
-                    poc,
-                    bd,
-                )
-            });
-            return frame.ok();
-        }
-        None
+        self.pending_frames.pop_front()
     }
 
     fn decode_slice(
@@ -725,6 +806,15 @@ impl Decoder {
     ) -> Result<Option<Frame>, DecodeError> {
         // first_slice_segment_in_pic_flag is the slice header's first bit.
         if nal.rbsp.first().is_some_and(|b| b & 0x80 != 0) {
+            // The previous picture never completed: slices were lost or
+            // failed to decode. Finish it as it is (with the parameter sets
+            // it was decoded with), so it can still be output and used as a
+            // reference, and start the new picture.
+            if let Some(pic) = self.current_picture.take()
+                && let Some(frame) = self.finish_picture(pic)?
+            {
+                self.pending_frames.push_back(frame);
+            }
             self.activate_parameter_sets(nal, nut)?;
         }
 
@@ -962,17 +1052,6 @@ impl Decoder {
         // tile-scan order (`slice_start_ts` above is the tile-scan position
         // of the raster `slice_segment_address`).
         if sh.first_slice_segment_in_pic_flag {
-            if self.current_picture.is_some() {
-                // Starting a new picture while the previous one is still
-                // in flight means we missed CTBs. That's a malformed stream
-                // for the Phase 3c-1 subset (no WPP / tiles, no dependent
-                // slices), so bail loudly rather than silently dropping the
-                // previous picture.
-                return Err(DecodeError::InvalidSyntax(
-                    "new first slice segment arrived while previous picture was incomplete",
-                ));
-            }
-
             // Phase 3d-6: build the reference picture lists at picture start
             // (before the CTB loop) so that motion compensation can access
             // the reference frame pixel data. Previously these were built at
@@ -1013,35 +1092,18 @@ impl Decoder {
                     }
                 }
             }
+            Self::generate_missing_refs(
+                &self.current_rps,
+                &mut self.dpb,
+                &mut self.zscan_cache,
+                sps,
+            );
 
             // Populate `tab_tile_id` on the fresh picture state so intra
-            // availability checks can see it. Create the right pixel type
-            // based on the SPS bit depth.
-            let zscan_key = (
-                sps.pic_width_in_luma_samples,
-                sps.pic_height_in_luma_samples,
-                sps.ctb_log2_size_y,
-                sps.min_tb_log2_size_y,
-            );
-            let zscan = match &self.zscan_cache {
-                Some((key, tab)) if *key == zscan_key => Rc::clone(tab),
-                _ => {
-                    let tab = Rc::new(crate::cu_tree::build_min_tb_addr_zs(sps));
-                    self.zscan_cache = Some((zscan_key, Rc::clone(&tab)));
-                    tab
-                }
-            };
-            let ps_enum = if sps.needs_u16_samples() {
-                let mut ps = PictureState::<u16>::new_with_zscan(sps, zscan);
-                let n = ps.tab_tile_id.len();
-                ps.tab_tile_id.copy_from_slice(&tile_tables.tile_id[..n]);
-                ps.filter_across_tiles = pps.loop_filter_across_tiles_enabled_flag;
-                ps.qpy_pred = sh.slice_qp_y;
-                ps.last_qp_y = sh.slice_qp_y;
-                ps.first_qp_group = !sh.dependent_slice_segment_flag;
-                PictureStateEnum::U16(ps)
-            } else {
-                let mut ps = PictureState::<u8>::new_with_zscan(sps, zscan);
+            // availability checks can see it.
+            let zscan = zscan_table(&mut self.zscan_cache, sps);
+            let mut ps_enum = new_picture_state(sps, zscan);
+            with_picture_state!(&mut ps_enum, |ps| {
                 let n = ps.tab_tile_id.len();
                 ps.tab_tile_id.copy_from_slice(&tile_tables.tile_id[..n]);
                 ps.filter_across_tiles = pps.loop_filter_across_tiles_enabled_flag;
@@ -1055,8 +1117,7 @@ impl Decoder {
                 ps.qpy_pred = sh.slice_qp_y;
                 ps.last_qp_y = sh.slice_qp_y;
                 ps.first_qp_group = !sh.dependent_slice_segment_flag;
-                PictureStateEnum::U8(ps)
-            };
+            });
             self.current_picture = Some(PictureInProgress {
                 state: ps_enum,
                 last_slice_header: sh.clone(),
@@ -1337,10 +1398,27 @@ impl Decoder {
         }
 
         // Picture complete — run in-loop filters and emit the frame.
-        let mut pic = self
+        let pic = self
             .current_picture
             .take()
             .expect("current_picture taken after completion");
+        self.finish_picture(pic)
+    }
+
+    /// Finish a picture: fill CTBs that were never decoded (slices lost or
+    /// failed), run the in-loop filters, store it in the DPB and hand the
+    /// frame to the output (decoding-order return value or display-order
+    /// queue).
+    fn finish_picture(&mut self, mut pic: PictureInProgress) -> Result<Option<Frame>, DecodeError> {
+        let sps = self
+            .sps
+            .as_ref()
+            .ok_or(DecodeError::InvalidSyntax("picture without active SPS"))?;
+        let pps = self
+            .pps
+            .as_ref()
+            .ok_or(DecodeError::InvalidSyntax("picture without active PPS"))?;
+        with_picture_state!(&mut pic.state, |state| fill_undecoded_ctbs(state));
         let last_sh = &pic.last_slice_header;
 
         // Phase 3b-1: in-loop deblocking filter.
@@ -1465,6 +1543,44 @@ impl Decoder {
             Ok(None)
         } else {
             Ok(frame)
+        }
+    }
+
+    /// Spec 8.3.3: generate the reference pictures the current picture uses
+    /// (RefPicSetStCurrBefore, StCurrAfter, LtCurr) that are not in the
+    /// DPB. In a conformant stream this only happens after an error: the
+    /// reference was lost or failed to decode. The stand-in is mid-grey with
+    /// no motion, so the current picture still decodes, with errors where
+    /// it predicts from the missing picture.
+    fn generate_missing_refs(
+        rps: &ReferencePictureSets,
+        dpb: &mut DecodedPictureBuffer,
+        zscan_cache: &mut Option<(ZscanKey, Rc<Vec<i32>>)>,
+        sps: &Sps,
+    ) {
+        let mut missing: Vec<(i32, PictureReferenceStatus)> = Vec::new();
+        for &poc in rps.st_curr_before.iter().chain(&rps.st_curr_after) {
+            if dpb.find_st_ref(poc).is_none() {
+                missing.push((poc, PictureReferenceStatus::ShortTerm));
+            }
+        }
+        for &poc in &rps.lt_curr {
+            let present = dpb
+                .pictures()
+                .iter()
+                .any(|p| p.poc == poc && p.reference_status() == PictureReferenceStatus::LongTerm);
+            if !present {
+                missing.push((poc, PictureReferenceStatus::LongTerm));
+            }
+        }
+        for (poc, status) in missing {
+            let zscan = zscan_table(zscan_cache, sps);
+            let mut state = new_picture_state(sps, zscan);
+            let pic = with_picture_state!(&mut state, |st| generated_reference(st, poc));
+            pic.mark(status);
+            // Never output.
+            *pic.output.borrow_mut() = true;
+            dpb.insert(pic);
         }
     }
 
@@ -4325,6 +4441,109 @@ mod tests {
         let late = std::iter::from_fn(|| dec.flush()).count();
         assert!(early > 0, "nothing released before flush");
         assert!(late > 0, "flush released nothing");
+    }
+
+    fn read_fixture(name: &str) -> Vec<u8> {
+        std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/").to_string() + name).unwrap()
+    }
+
+    /// Decode `nals`, skipping index `skip`; returns the frames and the
+    /// indices of the NAL units that returned an error.
+    fn decode_lossy(
+        nals: &[NalUnit],
+        skip: Option<usize>,
+        display: bool,
+    ) -> (Vec<Frame>, Vec<usize>) {
+        let mut dec = if display {
+            Decoder::new().with_display_order()
+        } else {
+            Decoder::new()
+        };
+        let (mut frames, mut errors) = (Vec::new(), Vec::new());
+        for (i, nal) in nals.iter().enumerate() {
+            if Some(i) == skip {
+                continue;
+            }
+            match dec.decode_nal(nal) {
+                Ok(Some(f)) => frames.push(f),
+                Ok(None) => {}
+                Err(_) => errors.push(i),
+            }
+            frames.extend(std::iter::from_fn(|| dec.next_output()));
+        }
+        frames.extend(std::iter::from_fn(|| dec.flush()));
+        (frames, errors)
+    }
+
+    /// A picture that loses a slice is still finished and output, with the
+    /// lost CTBs mid-grey, and the pictures after it decode without errors.
+    /// The fixture has 16x16 CTBs and two slices per picture, the second
+    /// starting at CTB row 2 (y = 32).
+    #[test]
+    fn test_lost_slice_picture_still_output() {
+        let data = read_fixture("multi_slice_sao_deblock_256x256.h265");
+        let nals = parse_annex_b(&data);
+        let vcl: Vec<usize> = (0..nals.len())
+            .filter(|&i| nals[i].nal_unit_type.is_vcl())
+            .collect();
+        let (clean, _) = decode_lossy(&nals, None, false);
+        for display in [false, true] {
+            let (frames, errors) = decode_lossy(&nals, Some(vcl[1]), display);
+            assert!(errors.is_empty(), "errors at NALs {errors:?}");
+            assert_eq!(frames.len(), clean.len());
+            let damaged = frames.iter().find(|f| f.pic_order_cnt == 0).unwrap();
+            let (y, y_clean) = (damaged.y.as_u8().unwrap(), clean[0].y.as_u8().unwrap());
+            // Rows of the first slice clear of the deblocking / SAO reach of
+            // the lost area are untouched.
+            assert_eq!(&y[..24 * 256], &y_clean[..24 * 256]);
+            // The middle of the lost area is mid-grey.
+            assert_eq!(y[128 * 256 + 128], 128);
+        }
+    }
+
+    /// Damaging any one slice (corrupt header bytes, corrupt slice data, or
+    /// drop it) of a stream with B-frames costs at most that picture: no
+    /// later NAL unit fails ("previous picture incomplete", "reference
+    /// picture not in DPB"), in either output mode. A dropped reference
+    /// picture is replaced by a generated one (spec 8.3.3).
+    #[test]
+    fn test_single_damaged_slice_does_not_stop_decoding() {
+        let data = read_fixture("bframes3_128x128.h265");
+        let clean = parse_annex_b(&data);
+        let vcl: Vec<usize> = (0..clean.len())
+            .filter(|&i| clean[i].nal_unit_type.is_vcl())
+            .collect();
+        for &k in &vcl {
+            for mode in ["head", "data", "drop"] {
+                let mut nals = parse_annex_b(&data);
+                if mode != "drop" {
+                    let mut b = nals[k].rbsp.to_vec();
+                    let n = b.len();
+                    let range = if mode == "head" {
+                        1..12.min(n)
+                    } else {
+                        n / 2..(n / 2 + 24).min(n)
+                    };
+                    for x in &mut b[range] {
+                        *x ^= 0x5a;
+                    }
+                    nals[k].rbsp = std::borrow::Cow::Owned(b);
+                }
+                let skip = (mode == "drop").then_some(k);
+                for display in [false, true] {
+                    let (frames, errors) = decode_lossy(&nals, skip, display);
+                    assert!(
+                        errors.iter().all(|&e| e == k),
+                        "NAL {k} {mode}: later NALs failed: {errors:?}"
+                    );
+                    assert!(
+                        frames.len() + 1 >= vcl.len(),
+                        "NAL {k} {mode}: only {} frames",
+                        frames.len()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
