@@ -300,9 +300,13 @@ impl DecodedPictureBuffer {
     /// Remove every picture that is both "unused for reference" and has
     /// already been output. Mirrors FFmpeg's DPB cleanup step. Safe to
     /// call after every picture insertion.
-    pub fn cleanup_unused(&mut self) {
-        self.pictures
-            .retain(|p| p.is_reference() || !*p.output.borrow());
+    /// Returns the removed pictures, so their buffers can be reused.
+    pub fn cleanup_unused(&mut self) -> Vec<Rc<DecodedPicture>> {
+        let (keep, removed): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pictures)
+            .into_iter()
+            .partition(|p| p.is_reference() || !*p.output.borrow());
+        self.pictures = keep;
+        removed
     }
 
     /// Phase 3d-1 stub: return the next picture in output order if the

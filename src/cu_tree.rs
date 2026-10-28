@@ -326,6 +326,48 @@ pub struct PictureState<P: Pixel> {
     pub mc_scratch: crate::inter_pred::McScratch<P>,
 }
 
+/// Buffers of earlier pictures that `PictureState::new_recycled` reuses.
+pub struct RecycledBuffers<P: Pixel> {
+    /// A finished picture's state: its tables and scratch buffers (planes,
+    /// motion field and slice map were moved into the decoded picture).
+    pub state: Option<PictureState<P>>,
+    /// Luma, Cb and Cr planes of a picture that left the DPB.
+    pub planes: Option<[Vec<P>; 3]>,
+    /// Motion field of a picture that left the DPB.
+    pub mvf: Option<Vec<MvField>>,
+}
+
+impl<P: Pixel> Default for RecycledBuffers<P> {
+    fn default() -> Self {
+        Self {
+            state: None,
+            planes: None,
+            mvf: None,
+        }
+    }
+}
+
+/// `buf` (or a new vector) holding `n` copies of `value`.
+fn refill<T: Clone>(buf: Option<Vec<T>>, n: usize, value: T) -> Vec<T> {
+    match buf {
+        Some(mut v) => {
+            v.clear();
+            v.resize(n, value);
+            v
+        }
+        None => vec![value; n],
+    }
+}
+
+/// A sample plane of `n` samples: `buf` as it is when it has that size,
+/// otherwise zero-filled.
+fn plane_buf<P: Pixel>(buf: Option<Vec<P>>, n: usize) -> Vec<P> {
+    match buf {
+        Some(v) if v.len() == n => v,
+        other => refill(other, n, P::zero()),
+    }
+}
+
 impl<P: Pixel> PictureState<P> {
     pub fn new(sps: &Sps) -> Self {
         Self::new_with_zscan(sps, std::rc::Rc::new(build_min_tb_addr_zs(sps)))
@@ -334,6 +376,31 @@ impl<P: Pixel> PictureState<P> {
     /// Like `new`, reusing a Z-scan table previously built by
     /// `build_min_tb_addr_zs` for an SPS with the same picture geometry.
     pub fn new_with_zscan(sps: &Sps, zscan: std::rc::Rc<Vec<i32>>) -> Self {
+        Self::new_recycled(sps, zscan, RecycledBuffers::default())
+    }
+
+    /// Like `new_with_zscan`, reusing buffers of earlier pictures instead of
+    /// allocating: the tables of a finished picture state (refilled with
+    /// their initial values) and the sample planes / motion field of a
+    /// picture that left the DPB. Planes are reused as they are, without
+    /// clearing: decoding writes every sample inside the picture, and no
+    /// process reads the CTU-alignment padding.
+    pub fn new_recycled(
+        sps: &Sps,
+        zscan: std::rc::Rc<Vec<i32>>,
+        recycled: RecycledBuffers<P>,
+    ) -> Self {
+        let mut old = recycled.state;
+        // Take field `$f` of the recycled state, if any.
+        macro_rules! reuse {
+            ($f:ident) => {
+                old.as_mut().map(|o| std::mem::take(&mut o.$f))
+            };
+        }
+        let [y_old, u_old, v_old] = match recycled.planes {
+            Some([y, u, v]) => [Some(y), Some(u), Some(v)],
+            None => [None, None, None],
+        };
         let log2_min_cb_size = sps.min_cb_log2_size_y;
         // HEVC base profile pins min PU size to 4×4 (spec 7.4.3.2.1).
         let log2_min_pu_size = 2u8;
@@ -375,20 +442,24 @@ impl<P: Pixel> PictureState<P> {
             width_in_ctbs: (w as usize).div_ceil(1usize << log2_ctb_size),
             min_cb_width,
             min_pu_width,
-            tab_ct_depth: vec![0u8; min_cb_width * min_cb_height],
+            tab_ct_depth: refill(reuse!(tab_ct_depth), min_cb_width * min_cb_height, 0u8),
             // Default IPM is INTRA_DC (matches FFmpeg
             // `intra_prediction_unit_default_value`).
-            tab_ipm: vec![INTRA_DC; min_pu_width * min_pu_height],
-            tab_chroma_ipm: vec![INTRA_DC; min_pu_width * min_pu_height],
-            y_plane: vec![P::zero(); (w_aligned * h_aligned) as usize],
-            u_plane: vec![
-                P::zero();
-                ((w_aligned >> chroma_shift_w) * (h_aligned >> chroma_shift_h)) as usize
-            ],
-            v_plane: vec![
-                P::zero();
-                ((w_aligned >> chroma_shift_w) * (h_aligned >> chroma_shift_h)) as usize
-            ],
+            tab_ipm: refill(reuse!(tab_ipm), min_pu_width * min_pu_height, INTRA_DC),
+            tab_chroma_ipm: refill(
+                reuse!(tab_chroma_ipm),
+                min_pu_width * min_pu_height,
+                INTRA_DC,
+            ),
+            y_plane: plane_buf(y_old, (w_aligned * h_aligned) as usize),
+            u_plane: plane_buf(
+                u_old,
+                ((w_aligned >> chroma_shift_w) * (h_aligned >> chroma_shift_h)) as usize,
+            ),
+            v_plane: plane_buf(
+                v_old,
+                ((w_aligned >> chroma_shift_w) * (h_aligned >> chroma_shift_h)) as usize,
+            ),
             y_stride,
             uv_stride,
             chroma_array_type,
@@ -410,50 +481,74 @@ impl<P: Pixel> PictureState<P> {
             qpy_pred: 0,
             first_qp_group: false,
             cu_origin: (0, 0),
-            ccp_luma_residual: Vec::new(),
+            ccp_luma_residual: reuse!(ccp_luma_residual).unwrap_or_default(),
             last_luma_residual: None,
-            tab_qp_y: vec![0i8; min_cb_width * min_cb_height],
-            bs_vertical: vec![0u8; ((w_aligned / 4) * (h_aligned / 4)) as usize],
-            bs_horizontal: vec![0u8; ((w_aligned / 4) * (h_aligned / 4)) as usize],
-            tab_cbf_luma: vec![0u8; min_tb_width * min_tb_height],
+            tab_qp_y: refill(reuse!(tab_qp_y), min_cb_width * min_cb_height, 0i8),
+            bs_vertical: refill(
+                reuse!(bs_vertical),
+                ((w_aligned / 4) * (h_aligned / 4)) as usize,
+                0u8,
+            ),
+            bs_horizontal: refill(
+                reuse!(bs_horizontal),
+                ((w_aligned / 4) * (h_aligned / 4)) as usize,
+                0u8,
+            ),
+            tab_cbf_luma: refill(reuse!(tab_cbf_luma), min_tb_width * min_tb_height, 0u8),
             log2_min_tb_size,
             sao_params: {
                 let ctb_size = 1u32 << log2_ctb_size;
                 let pw = w.div_ceil(ctb_size) as usize;
                 let ph = h.div_ceil(ctb_size) as usize;
-                vec![crate::sao::SaoParams::default(); pw * ph]
+                refill(
+                    reuse!(sao_params),
+                    pw * ph,
+                    crate::sao::SaoParams::default(),
+                )
             },
             tab_slice_addr_rs: {
                 let ctb_size = 1u32 << log2_ctb_size;
                 let pw = w.div_ceil(ctb_size) as usize;
                 let ph = h.div_ceil(ctb_size) as usize;
-                vec![-1i32; pw * ph]
+                refill(reuse!(tab_slice_addr_rs), pw * ph, -1i32)
             },
             filter_slice_edges: {
                 let ctb_size = 1u32 << log2_ctb_size;
                 let pw = w.div_ceil(ctb_size) as usize;
                 let ph = h.div_ceil(ctb_size) as usize;
-                vec![true; pw * ph]
+                refill(reuse!(filter_slice_edges), pw * ph, true)
             },
             tab_tile_id: {
                 let ctb_size = 1u32 << log2_ctb_size;
                 let pw = w.div_ceil(ctb_size) as usize;
                 let ph = h.div_ceil(ctb_size) as usize;
-                vec![0u32; pw * ph]
+                refill(reuse!(tab_tile_id), pw * ph, 0u32)
             },
             filter_across_tiles: true,
             tab_ctb_ts: {
                 let ctb_size = 1u32 << log2_ctb_size;
-                vec![0; (w.div_ceil(ctb_size) * h.div_ceil(ctb_size)) as usize]
+                refill(
+                    reuse!(tab_ctb_ts),
+                    (w.div_ceil(ctb_size) * h.div_ceil(ctb_size)) as usize,
+                    0,
+                )
             },
             tab_deblock_offsets: {
                 let ctb_size = 1u32 << log2_ctb_size;
-                vec![(0, 0); (w.div_ceil(ctb_size) * h.div_ceil(ctb_size)) as usize]
+                refill(
+                    reuse!(tab_deblock_offsets),
+                    (w.div_ceil(ctb_size) * h.div_ceil(ctb_size)) as usize,
+                    (0, 0),
+                )
             },
-            tab_no_filter: vec![0u8; min_pu_width * min_pu_height],
+            tab_no_filter: refill(reuse!(tab_no_filter), min_pu_width * min_pu_height, 0u8),
             any_no_filter: false,
-            tab_mvf: vec![MvField::default(); min_pu_width * min_pu_height],
-            tab_skip_flag: vec![0u8; min_cb_width * min_cb_height],
+            tab_mvf: refill(
+                recycled.mvf.or_else(|| reuse!(tab_mvf)),
+                min_pu_width * min_pu_height,
+                MvField::default(),
+            ),
+            tab_skip_flag: refill(reuse!(tab_skip_flag), min_cb_width * min_cb_height, 0u8),
             min_tb_addr_zs: zscan,
             min_tb_addr_zs_stride: {
                 let log2_diff = log2_ctb_size.saturating_sub(sps.min_tb_log2_size_y) as u32;
@@ -469,7 +564,10 @@ impl<P: Pixel> PictureState<P> {
                 let pic_w_in_ctbs = w.div_ceil(ctb_size);
                 (pic_w_in_ctbs * tb_per_ctb) as usize
             },
-            mc_scratch: crate::inter_pred::McScratch::new(),
+            mc_scratch: match reuse!(mc_scratch) {
+                Some(scratch) => scratch,
+                None => crate::inter_pred::McScratch::new(),
+            },
         }
     }
 

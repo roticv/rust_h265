@@ -120,6 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CPU cycles against 0.2.0 on the Big Buck Bunny 1080p benchmark
   fixtures: `bbb_1080p_5s_safe` unchanged, `bbb_1080p_5s_medium` 2%
   fewer.
+- Per-picture buffers are pooled: a new picture reuses the tables and
+  motion-compensation scratch of the previous one and the sample planes
+  and motion field of a picture that left the DPB, instead of allocating
+  and zero-filling them. About 1-2% fewer cycles; with the changes above,
+  the 1080p fixtures now take 1-3% fewer cycles than 0.2.0.
 
 ## [0.2.0] - 2026-10-28
 

@@ -323,10 +323,7 @@ fn sao_edge_filter<P: Pixel>(
         // Interior samples (x in 1..width-1) have both neighbours in this
         // CTB column, so only the CTB rows above / below matter: one check
         // for the whole run, then a tight loop over row slices.
-        if width > 2
-            && avail[region(yi + a_dy, h)][1]
-            && avail[region(yi + b_dy, h)][1]
-        {
+        if width > 2 && avail[region(yi + a_dy, h)][1] && avail[region(yi + b_dy, h)][1] {
             let n = width - 2;
             let row = (y0 + y) * stride_src + x0 + 1;
             let cur = &src[row..row + n];

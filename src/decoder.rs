@@ -19,7 +19,7 @@
 use std::rc::Rc;
 
 use crate::cabac::{CabacContexts, CabacReader};
-use crate::cu_tree::{MvField, PictureState, decode_coding_quadtree};
+use crate::cu_tree::{MvField, PictureState, RecycledBuffers, decode_coding_quadtree};
 use crate::dpb::{
     DecodedPicture, DecodedPictureBuffer, PictureReferenceStatus, ReferencePictureSets,
     apply_ref_pic_list_modification, build_ref_pic_list_temp0, build_ref_pic_list_temp1,
@@ -386,6 +386,8 @@ pub struct Decoder {
     /// finish two pictures (an incomplete earlier one, then its own), and
     /// `decode_nal` returns one frame per call.
     pending_frames: std::collections::VecDeque<Frame>,
+    /// Buffers reused from earlier pictures.
+    pool: PicturePool,
 }
 
 /// Fill every CTB that no slice decoded (`tab_slice_addr_rs == -1`) with
@@ -436,6 +438,80 @@ fn zscan_table(cache: &mut Option<(ZscanKey, Rc<Vec<i32>>)>, sps: &Sps) -> Rc<Ve
             let tab = Rc::new(crate::cu_tree::build_min_tb_addr_zs(sps));
             *cache = Some((key, Rc::clone(&tab)));
             tab
+        }
+    }
+}
+
+/// Buffers kept from earlier pictures so that a new picture does not
+/// allocate (and fault in, and zero) its planes and tables from scratch.
+#[derive(Default)]
+struct PicturePool {
+    /// State of the last finished picture, per sample type.
+    state_u8: Option<PictureState<u8>>,
+    state_u16: Option<PictureState<u16>>,
+    /// Planes and motion fields of pictures that left the DPB.
+    planes_u8: Vec<([Vec<u8>; 3], Vec<MvField>)>,
+    planes_u16: Vec<([Vec<u16>; 3], Vec<MvField>)>,
+}
+
+/// Plane sets kept per sample type; about one picture leaves the DPB per
+/// picture decoded, so two is enough.
+const POOLED_PLANE_SETS: usize = 2;
+
+impl PicturePool {
+    /// A picture state for `sps`, built from pooled buffers when available.
+    fn new_state(&mut self, sps: &Sps, zscan: Rc<Vec<i32>>) -> PictureStateEnum {
+        if sps.needs_u16_samples() {
+            let (planes, mvf) = self
+                .planes_u16
+                .pop()
+                .map_or((None, None), |(p, m)| (Some(p), Some(m)));
+            let recycled = RecycledBuffers {
+                state: self.state_u16.take(),
+                planes,
+                mvf,
+            };
+            PictureStateEnum::U16(PictureState::new_recycled(sps, zscan, recycled))
+        } else {
+            let (planes, mvf) = self
+                .planes_u8
+                .pop()
+                .map_or((None, None), |(p, m)| (Some(p), Some(m)));
+            let recycled = RecycledBuffers {
+                state: self.state_u8.take(),
+                planes,
+                mvf,
+            };
+            PictureStateEnum::U8(PictureState::new_recycled(sps, zscan, recycled))
+        }
+    }
+
+    /// Keep a finished picture's state (its planes were moved out).
+    fn recycle_state(&mut self, state: PictureStateEnum) {
+        match state {
+            PictureStateEnum::U8(s) => self.state_u8 = Some(s),
+            PictureStateEnum::U16(s) => self.state_u16 = Some(s),
+        }
+    }
+
+    /// Take back the planes and motion field of a picture that left the
+    /// DPB, unless something else (a reference list) still holds it.
+    fn recycle_picture(&mut self, pic: Rc<DecodedPicture>) {
+        let Ok(pic) = Rc::try_unwrap(pic) else {
+            return;
+        };
+        match (pic.y, pic.u, pic.v) {
+            (PixelData::U8(y), PixelData::U8(u), PixelData::U8(v))
+                if self.planes_u8.len() < POOLED_PLANE_SETS =>
+            {
+                self.planes_u8.push(([y, u, v], pic.tab_mvf));
+            }
+            (PixelData::U16(y), PixelData::U16(u), PixelData::U16(v))
+                if self.planes_u16.len() < POOLED_PLANE_SETS =>
+            {
+                self.planes_u16.push(([y, u, v], pic.tab_mvf));
+            }
+            _ => {}
         }
     }
 }
@@ -1150,7 +1226,7 @@ impl Decoder {
             // Populate `tab_tile_id` on the fresh picture state so intra
             // availability checks can see it.
             let zscan = zscan_table(&mut self.zscan_cache, sps);
-            let mut ps_enum = new_picture_state(sps, zscan);
+            let mut ps_enum = self.pool.new_state(sps, zscan);
             with_picture_state!(&mut ps_enum, |ps| {
                 let n = ps.tab_tile_id.len();
                 ps.tab_tile_id.copy_from_slice(&tile_tables.tile_id[..n]);
@@ -1579,10 +1655,13 @@ impl Decoder {
             dp.ctb_slice_addr = std::mem::take(&mut state.tab_slice_addr_rs);
             Rc::new(dp)
         });
+        self.pool.recycle_state(pic.state);
         decoded_pic.mark(PictureReferenceStatus::ShortTerm);
         *decoded_pic.output.borrow_mut() = true;
         self.dpb.insert(decoded_pic);
-        self.dpb.cleanup_unused();
+        for retired in self.dpb.cleanup_unused() {
+            self.pool.recycle_picture(retired);
+        }
 
         // PicOutputFlag (spec 8.1.3): a picture with pic_output_flag = 0 is
         // decoded and kept for reference but never output. (Skipped RASL
@@ -4709,6 +4788,27 @@ mod tests {
                 .iter()
                 .all(|e| matches!(e, DecodeError::Unsupported(_))),
             "errors {errors:?}"
+        );
+    }
+
+    /// Pictures reuse the buffers of earlier ones: after decoding a stream
+    /// with inter prediction, the pool holds the last picture state and the
+    /// planes of pictures that left the DPB. Output stays byte-exact (the
+    /// fixture hash tests decode through the pool).
+    #[test]
+    fn test_picture_pool_recycles_buffers() {
+        let data = read_fixture("bframes3_128x128.h265");
+        let mut dec = Decoder::new();
+        for nal in parse_annex_b(&data) {
+            dec.decode_nal(&nal).unwrap();
+        }
+        assert!(
+            dec.pool.state_u8.is_some(),
+            "finished picture state not kept"
+        );
+        assert!(
+            !dec.pool.planes_u8.is_empty(),
+            "no planes recovered from retired pictures"
         );
     }
 
