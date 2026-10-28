@@ -296,8 +296,9 @@ pub fn parse_slice_segment_header(
     let mut slice_cr_qp_offset = 0i32;
     let mut cu_chroma_qp_offset_enabled_flag = false;
     let mut slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
-    let mut slice_beta_offset_div2 = 0i32;
-    let mut slice_tc_offset_div2 = 0i32;
+    // Inferred from the PPS unless the slice overrides them (spec 7.4.7.1).
+    let mut slice_beta_offset_div2 = pps.pps_beta_offset_div2;
+    let mut slice_tc_offset_div2 = pps.pps_tc_offset_div2;
     let mut slice_loop_filter_across_slices_enabled_flag =
         pps.pps_loop_filter_across_slices_enabled_flag;
 

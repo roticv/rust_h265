@@ -1023,6 +1023,7 @@ impl Decoder {
             collocated_ref,
             slice_temporal_mvp_enabled_flag: sh.slice_temporal_mvp_enabled_flag,
             collocated_from_l0_flag: sh.collocated_from_l0_flag,
+            deblocking_disabled: sh.slice_deblocking_filter_disabled_flag,
             slice_cb_qp_offset: sh.slice_cb_qp_offset,
             slice_cr_qp_offset: sh.slice_cr_qp_offset,
             cu_chroma_qp_offset_enabled_flag: sh.cu_chroma_qp_offset_enabled_flag,
@@ -1107,6 +1108,10 @@ impl Decoder {
                 let rx = (x_ctb >> sps.ctb_log2_size_y) as usize;
                 let ry = (y_ctb >> sps.ctb_log2_size_y) as usize;
                 state.tab_slice_addr_rs[ctb_addr_rs as usize] = recorded_slice_addr;
+                state.tab_deblock_offsets[ctb_addr_rs as usize] = (
+                    (sh.slice_beta_offset_div2 * 2) as i8,
+                    (sh.slice_tc_offset_div2 * 2) as i8,
+                );
                 state.filter_slice_edges[ctb_addr_rs as usize] =
                     sh.slice_loop_filter_across_slices_enabled_flag;
                 crate::sao::decode_sao_param(&mut cabac, &mut contexts, state, sps, &sh, rx, ry);
@@ -1168,7 +1173,6 @@ impl Decoder {
         let last_sh = &pic.last_slice_header;
 
         // Phase 3b-1: in-loop deblocking filter.
-        let deblock_disabled = last_sh.slice_deblocking_filter_disabled_flag;
         let last_sh_for_filters = last_sh.clone();
 
         // Phase 3d-1: snapshot everything we need from the SPS and the
@@ -1185,9 +1189,9 @@ impl Decoder {
 
         // Run deblock + SAO + crop + DPB insert, dispatching on pixel type.
         let emitted_frame = with_picture_state!(&mut pic.state, |state| {
-            if !deblock_disabled {
-                crate::deblock::deblock_picture(state, sps, pps, &last_sh_for_filters);
-            }
+            // Per-slice: CUs of slices with deblocking disabled have no
+            // boundary strengths, so this only filters enabled slices.
+            crate::deblock::deblock_picture(state, sps, pps, &last_sh_for_filters);
             crate::sao::apply_sao_picture(state, sps, &last_sh_for_filters);
 
             crop_frame(

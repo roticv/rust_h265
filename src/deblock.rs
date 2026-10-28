@@ -391,6 +391,16 @@ fn edge_no_filter<P: Pixel>(
     [[at(p0, 0), at(q0, 0)], [at(p0, 1), at(q0, 1)]]
 }
 
+/// Deblocking (beta_offset, tc_offset) for an edge whose Q side starts at
+/// luma `(x, y)`: those of the slice containing that sample (spec 8.7.2.5.3).
+fn deblock_offsets<P: Pixel>(state: &PictureState<P>, x: usize, y: usize) -> (i32, i32) {
+    let log2_ctb = state.log2_ctb_size as usize;
+    let w_ctbs = (state.width as usize).div_ceil(1 << log2_ctb);
+    let rs = (y >> log2_ctb) * w_ctbs + (x >> log2_ctb);
+    let (b, t) = state.tab_deblock_offsets.get(rs).copied().unwrap_or((0, 0));
+    (b as i32, t as i32)
+}
+
 fn get_qp_y<P: Pixel>(state: &PictureState<P>, x: i32, y: i32) -> i32 {
     let xc = (x.max(0) >> state.log2_min_cb_size) as usize;
     let yc = (y.max(0) >> state.log2_min_cb_size) as usize;
@@ -459,14 +469,12 @@ pub fn deblock_picture<P: Pixel>(
     state: &mut PictureState<P>,
     sps: &Sps,
     pps: &Pps,
-    sh: &SliceHeader,
+    _sh: &SliceHeader,
 ) {
     let pic_w = state.width as usize;
     let pic_h = state.height as usize;
     let stride_y = state.y_stride;
     let stride_uv = state.uv_stride;
-    let beta_offset = (sh.slice_beta_offset_div2 + pps.pps_beta_offset_div2) * 2;
-    let tc_offset = (sh.slice_tc_offset_div2 + pps.pps_tc_offset_div2) * 2;
     let bit_depth_luma = sps.bit_depth_luma;
     let bit_depth_chroma = sps.bit_depth_chroma;
 
@@ -488,6 +496,7 @@ pub fn deblock_picture<P: Pixel>(
                     >> 1;
                 let pix_base = y * stride_y + x;
                 let nf = edge_no_filter(state, (x - 1, y), (x, y), (0, 4));
+                let (beta_offset, tc_offset) = deblock_offsets(state, x, y);
                 filter_luma_edge::<P>(
                     &mut state.y_plane,
                     pix_base,
@@ -525,6 +534,7 @@ pub fn deblock_picture<P: Pixel>(
                     >> 1;
                 let pix_base = y * stride_y + x;
                 let nf = edge_no_filter(state, (x, y - 1), (x, y), (4, 0));
+                let (beta_offset, tc_offset) = deblock_offsets(state, x, y);
                 filter_luma_edge::<P>(
                     &mut state.y_plane,
                     pix_base,
@@ -571,6 +581,7 @@ pub fn deblock_picture<P: Pixel>(
             bs0: i32,
             bs1: i32,
             no_filter: [[bool; 2]; 2],
+            tc_offset: i32,
         }
         let mut edges: Vec<ChromaEdge> = Vec::new();
 
@@ -605,6 +616,7 @@ pub fn deblock_picture<P: Pixel>(
                         bs0,
                         bs1,
                         no_filter: edge_no_filter(state, (x_l - 1, y_l), (x_l, y_l), (0, bs_dy)),
+                        tc_offset: deblock_offsets(state, x_l, y_l).1,
                     });
                 }
                 x_l += step_x;
@@ -642,6 +654,7 @@ pub fn deblock_picture<P: Pixel>(
                         bs0,
                         bs1,
                         no_filter: edge_no_filter(state, (x_l, y_l - 1), (x_l, y_l), (bs_dx, 0)),
+                        tc_offset: deblock_offsets(state, x_l, y_l).1,
                     });
                 }
                 x_l += step_x;
@@ -670,7 +683,7 @@ pub fn deblock_picture<P: Pixel>(
                     e.qp0_avg,
                     e.qp1_avg,
                     qp_offset,
-                    tc_offset,
+                    e.tc_offset,
                     e.bs0,
                     e.bs1,
                     bit_depth_chroma,

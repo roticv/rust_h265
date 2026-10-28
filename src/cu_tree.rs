@@ -144,6 +144,9 @@ pub struct SliceParams {
     /// true = collocated picture is from L0 (collocated_list = 0),
     /// false = from L1 (collocated_list = 1).
     pub collocated_from_l0_flag: bool,
+    /// slice_deblocking_filter_disabled_flag: no boundary strengths (and so
+    /// no deblocking) for CUs of this slice.
+    pub deblocking_disabled: bool,
     /// Slice-level chroma QP offsets (summed with PPS offsets in chroma
     /// QP derivation per spec 8.6.1).
     pub slice_cb_qp_offset: i32,
@@ -263,6 +266,10 @@ pub struct PictureState<P: Pixel> {
     /// Consulted by `compute_luma_avail` to treat cross-tile neighbor
     /// samples as unavailable for intra prediction (spec 6.4.4 / 8.4.2).
     pub tab_tile_id: Vec<u32>,
+    /// Per CTB: the deblocking (beta_offset, tc_offset) of the slice that
+    /// contains it, i.e. slice_beta_offset_div2 * 2 and slice_tc_offset_div2
+    /// * 2. Edges use the values of the slice containing their Q side.
+    pub tab_deblock_offsets: Vec<(i8, i8)>,
     /// Per 4x4 luma block: 1 where deblocking and SAO must leave samples
     /// unchanged (a cu_transquant_bypass CU, or a PCM CU when
     /// pcm_loop_filter_disabled_flag is set; spec 8.7.2.5.7, 8.7.3).
@@ -412,6 +419,10 @@ impl<P: Pixel> PictureState<P> {
                 vec![0u32; pw * ph]
             },
             filter_across_tiles: true,
+            tab_deblock_offsets: {
+                let ctb_size = 1u32 << log2_ctb_size;
+                vec![(0, 0); (w.div_ceil(ctb_size) * h.div_ceil(ctb_size)) as usize]
+            },
             tab_no_filter: vec![0u8; min_pu_width * min_pu_height],
             any_no_filter: false,
             tab_mvf: vec![MvField::default(); min_pu_width * min_pu_height],
@@ -2229,6 +2240,11 @@ fn compute_deblocking_boundary_strengths<P: Pixel>(
     y0: u32,
     log2_size: u8,
 ) {
+    // Edges of CUs in a slice with deblocking disabled are not filtered
+    // (spec 8.7.2): leave their boundary strengths at 0.
+    if slice_params.deblocking_disabled {
+        return;
+    }
     let size = 1u32 << log2_size;
     let pic_w = state.width as usize;
     let bs_w = pic_w >> 2;
@@ -3629,7 +3645,9 @@ fn decode_transform_unit<P: Pixel>(
     // previous CU's QP into `tab_qp_y` for any TU that arrives before
     // `cu_qp_delta` is decoded.
     if is_intra {
-        mark_intra_tu_boundaries(state, x0, y0, log2_trafo_size);
+        if !slice_params.deblocking_disabled {
+            mark_intra_tu_boundaries(state, x0, y0, log2_trafo_size);
+        }
     } else {
         // Inter TU leaf: compute boundary strengths using cbf_luma + MV comparison.
         compute_deblocking_boundary_strengths(state, slice_params, x0, y0, log2_trafo_size);
@@ -4677,6 +4695,7 @@ mod tests {
             collocated_ref: None,
             slice_temporal_mvp_enabled_flag: false,
             collocated_from_l0_flag: true,
+            deblocking_disabled: false,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
             cu_chroma_qp_offset_enabled_flag: false,
