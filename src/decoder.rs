@@ -4074,6 +4074,27 @@ mod tests {
         assert_eq!(hash, expected, "tiles_hm_lf_across hash mismatch");
     }
 
+    /// 416×240, 4 frames (IPPP), HM reference encoder with
+    /// `Log2ParallelMergeLevel 3` (AMP and TMVP off). With a parallel merge
+    /// level above 2, every 8×8 CU derives one merge candidate list for the
+    /// whole CU (singleMCLFlag, spec 8.5.3.2.2). The second PU of an 8×4 /
+    /// 4×8 split used its own origin for that list instead of the CU's.
+    /// Byte-exact against FFmpeg.
+    ///
+    /// Fixture generated with HM `TAppEncoder` (testsrc2 input), cfg:
+    /// ```text
+    /// SourceWidth 416, SourceHeight 240, FramesToBeEncoded 4, IntraPeriod -1,
+    /// GOPSize 1 (Frame1: P 1 3 0.4624 0.0 0 0 1.0 0 0 0 1 1 -1 0),
+    /// MaxCUWidth/Height 64, MaxPartitionDepth 4, QP 32,
+    /// Log2ParallelMergeLevel 3, AMP 0, TMVPMode 0
+    /// ```
+    #[test]
+    fn test_decode_pmerge_level3_hash() {
+        let hash = decode_and_hash("pmerge_level3_hm_416x240.h265", 4);
+        let expected = "40e75a9535304a3cb50a5ebce908f40991f16e2b48a789d1707f2113ecba443c";
+        assert_eq!(hash, expected, "pmerge_level3 hash mismatch");
+    }
+
     #[test]
     fn test_decode_10bit_hash() {
         let hash = decode_and_hash("10bit_128x128.h265", 3);

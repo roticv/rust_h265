@@ -1852,11 +1852,12 @@ fn decode_prediction_unit<P: Pixel>(
         let n_cs = 1u32 << log2_cb_size;
         let single_mcl_flag = slice_params.log2_parallel_merge_level > 2 && n_cs == 8;
         let (mx0, my0, mw, mh, m_part_idx) = if single_mcl_flag {
-            // When singleMCLFlag, derive candidates from the CU origin
-            // with PU size = CU size, part_idx = 0 (FFmpeg merge_mode).
-            // x0/y0 for the CU are the same as for part_idx=0.
-            // For the skip path this is always the CU origin anyway.
-            (x0, y0, n_cs, n_cs, 0u8)
+            // When singleMCLFlag, derive candidates from the CU origin with
+            // PU size = CU size and part_idx = 0 (spec 8.5.3.2.2). (x0, y0)
+            // is this PU's origin, which for the second PU of an 8x4 / 4x8
+            // split is not the CU origin; CUs are aligned to their size, so
+            // round down to the 8x8 grid.
+            (x0 & !(n_cs - 1), y0 & !(n_cs - 1), n_cs, n_cs, 0u8)
         } else {
             (x0, y0, n_pb_w, n_pb_h, part_idx)
         };
