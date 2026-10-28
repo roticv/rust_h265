@@ -95,15 +95,6 @@ pub struct Pps {
 }
 
 impl Pps {
-    /// The first enabled PPS range-extension tool this decoder does not
-    /// implement yet, if any.
-    fn unimplemented_tool(&self) -> Option<&'static str> {
-        // Every PPS range-extension tool is implemented.
-        None
-    }
-}
-
-impl Pps {
     /// Derive `column_widths_in_ctbs` / `row_heights_in_ctbs` from the raw
     /// PPS tile syntax plus the active SPS. Idempotent — safe to call more
     /// than once. Must be called before any tile-scan address mapping is
@@ -365,7 +356,7 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
         }
     }
 
-    let pps = Pps {
+    Ok(Pps {
         pps_pic_parameter_set_id,
         pps_seq_parameter_set_id,
         dependent_slice_segments_enabled_flag,
@@ -416,9 +407,5 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
         cross_component_prediction_enabled_flag,
         log2_sao_offset_scale_luma,
         log2_sao_offset_scale_chroma,
-    };
-    if let Some(tool) = pps.unimplemented_tool() {
-        return Err(DecodeError::Unsupported(tool));
-    }
-    Ok(pps)
+    })
 }

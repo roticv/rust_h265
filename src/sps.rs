@@ -409,23 +409,6 @@ pub struct SpsRangeExtension {
     pub cabac_bypass_alignment_enabled_flag: bool,
 }
 
-/// The first enabled SPS range-extension tool this decoder does not
-/// implement yet, if any.
-fn unimplemented_sps_tool(r: &SpsRangeExtension) -> Option<&'static str> {
-    [
-        (
-            r.extended_precision_processing_flag,
-            "extended_precision_processing_flag",
-        ),
-        (
-            r.cabac_bypass_alignment_enabled_flag,
-            "cabac_bypass_alignment_enabled_flag",
-        ),
-    ]
-    .into_iter()
-    .find_map(|(on, name)| on.then_some(name))
-}
-
 impl Sps {
     /// Whether samples need 16-bit storage: luma or chroma deeper than 8
     /// bits (the two bit depths may differ).
@@ -1019,9 +1002,6 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
             ));
         }
     };
-    if let Some(tool) = unimplemented_sps_tool(&range) {
-        return Err(DecodeError::Unsupported(tool));
-    }
 
     Ok(Sps {
         sps_video_parameter_set_id,

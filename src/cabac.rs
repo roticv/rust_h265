@@ -164,6 +164,13 @@ impl<'a> CabacReader<'a> {
         }
     }
 
+    /// Alignment prior to aligned bypass decoding (spec 9.3.4.3.6, used with
+    /// cabac_bypass_alignment_enabled_flag): ivlCurrRange = 256, so the
+    /// following bypass bins read the bitstream one bit at a time.
+    pub fn align_bypass(&mut self) {
+        self.range = 256;
+    }
+
     /// Decode `n` bypass bins as an unsigned integer (MSB first).
     pub fn decode_bypass_bits(&mut self, n: u8) -> u32 {
         let mut val = 0u32;

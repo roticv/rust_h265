@@ -37,11 +37,12 @@ is updated as failures are fixed.
 | 2026-10-28 | 143 / 147 | SPS/PPS stored by ID and activated per picture; per-sample constrained intra prediction; single merge candidate list at the CU origin; SAO diagonal-CTB availability; MV sum wraps modulo 2^16; cu_qp_delta predicted from the CU origin (also fixed WPP_A/D/E/F); deblocking compares references through each slice's own lists; different luma and chroma bit depths. |
 | 2026-10-28 | 147 / 147 | Display-order output (`Decoder::with_display_order`, spec C.5.2 bumping and NoOutputOfPriorPicsFlag), used by `dump_frames`: BUMPING_A, NoOutPrior_A/B, RAP_B. |
 
-JCT-VC-RExt (49 vectors, range extensions): only the 4:2:0 general vectors
-are expected to pass. Every other vector enables a range-extension tool,
-uses 4:2:2 or monochrome, or is deeper than 12 bits, and is rejected with
-`Unsupported`.
+JCT-VC-RExt (49 vectors, range extensions): the 34 vectors in 4:2:0 or
+4:4:4 up to 12 bits are expected to pass. The other 15 are 4:2:2,
+monochrome or 16-bit and are rejected with `Unsupported`.
 
 | Date | Pass | Notes |
 |---|---:|---|
 | 2026-10-28 | 3 / 34 (8-, 10-, 12-bit) | GENERAL_8b_420, GENERAL_10b_420 and GENERAL_12b_420 pass. The rest enable RExt tools and are rejected; FFmpeg passes 14 of the 8- and 10-bit ones. |
+| 2026-10-28 | 26 / 34 | RExt coding tools except extended precision and CABAC bypass alignment; WPP with tiles; 4:4:4 32x32 chroma scaling lists. FFmpeg passes 21. |
+| 2026-10-28 | 34 / 34 | Extended precision processing and CABAC bypass alignment (neither in FFmpeg). |

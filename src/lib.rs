@@ -1,21 +1,22 @@
 //! Pure Rust H.265 / HEVC video decoder.
 //!
-//! Decodes Main and Main 10 profile HEVC bitstreams (8-bit and 10-bit
-//! 4:2:0) and 4:4:4 streams (8-bit and 10-bit, intra and inter, as used by
-//! HEIF/HEIC images). 12-bit streams decode but are lightly tested.
+//! Decodes Main and Main 10 profile HEVC bitstreams, and 4:2:0 and 4:4:4
+//! range-extensions streams up to 12 bits with every range-extension coding
+//! tool (cross-component prediction, RDPCM, transform-skip rotation and
+//! context, extended precision, persistent Rice adaptation, CABAC bypass
+//! alignment, chroma QP offset lists, ...). 4:4:4 covers HEIF/HEIC images.
 //! Streams the decoder cannot decode correctly are rejected with
-//! [`DecodeError::Unsupported`] instead of being decoded wrongly: 4:2:2 and
-//! monochrome, bit depths above 12, and the range-extension coding tools
-//! (cross-component prediction, RDPCM, transform-skip rotation and context,
-//! extended precision, persistent Rice adaptation, CABAC bypass alignment,
-//! chroma QP offset lists and others) as well as screen content coding. Input can be Annex B (start-code delimited,
+//! [`DecodeError::Unsupported`] instead of being decoded wrongly: 4:2:2,
+//! monochrome, bit depths above 12, and screen content coding. Input can be
+//! Annex B (start-code delimited,
 //! `.h265` files) via [`parse_annex_b`], length-prefixed NAL units from
 //! MP4/MKV containers via [`parse_hvcc`], or single NAL units via
 //! [`parse_nal`].
 //!
 //! The decoder passes all 147 vectors of the JCT-VC HEVC_v1 conformance
-//! suite and is byte-exact against FFmpeg on its test fixtures, including
-//! real 1080p Big Buck Bunny encodes in 8-bit and 10-bit.
+//! suite and the 34 JCT-VC-RExt vectors in its formats (4:2:0 and 4:4:4, up
+//! to 12 bits), and is byte-exact against FFmpeg on its test fixtures,
+//! including real 1080p Big Buck Bunny encodes in 8-bit and 10-bit.
 //!
 //! # Quick start
 //!

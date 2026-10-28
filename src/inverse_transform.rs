@@ -279,6 +279,67 @@ pub fn transform_4x4_luma(coeffs: &mut [i16], bit_depth: u32) {
     }
 }
 
+// ---- Extended precision -----------------------------------------------------
+
+/// One 1D inverse transform of size `n` (DST for the 4-point intra luma
+/// case), on `i32` samples.
+fn tr_1d(n: usize, dst_4x4: bool, out: &mut [i32], inp: &[i32]) {
+    macro_rules! run {
+        ($f:ident, $size:expr) => {{
+            let mut i = [0i32; $size];
+            i.copy_from_slice(inp);
+            let mut o = [0i32; $size];
+            $f(&mut o, &i);
+            out.copy_from_slice(&o);
+        }};
+    }
+    match n {
+        4 if dst_4x4 => run!(tr_4x4_luma, 4),
+        4 => run!(tr_4, 4),
+        8 => run!(tr_8, 8),
+        16 => run!(tr_16, 16),
+        _ => run!(tr_32, 32),
+    }
+}
+
+/// Inverse transform with extended_precision_processing_flag (spec 8.6.4.2):
+/// coefficients may exceed 16 bits (`|c| <= 1 << log2_range`), the
+/// intermediate after the first stage is clipped to that range, and the
+/// second-stage shift is `log2_range + 5 - BitDepth` (`20 - BitDepth`
+/// when the range is 15). Returns the residual.
+pub fn inverse_transform_ext(
+    coeffs: &[i32],
+    log2_size: u8,
+    bit_depth: u32,
+    log2_range: u32,
+    dst_4x4: bool,
+) -> Vec<i16> {
+    let n = 1usize << log2_size;
+    let (min, max) = (-(1i64 << log2_range), (1i64 << log2_range) - 1);
+    let mut tmp = vec![0i32; n * n];
+    let (mut col_in, mut col_out) = (vec![0i32; n], vec![0i32; n]);
+    for col in 0..n {
+        for row in 0..n {
+            col_in[row] = coeffs[row * n + col];
+        }
+        tr_1d(n, dst_4x4, &mut col_out, &col_in);
+        for row in 0..n {
+            tmp[row * n + col] = ((col_out[row] as i64 + 64) >> 7).clamp(min, max) as i32;
+        }
+    }
+    let shift = log2_range + 5 - bit_depth;
+    let add = 1i64 << (shift - 1);
+    let mut out = vec![0i16; n * n];
+    let mut row_out = vec![0i32; n];
+    for row in 0..n {
+        tr_1d(n, dst_4x4, &mut row_out, &tmp[row * n..(row + 1) * n]);
+        for col in 0..n {
+            out[row * n + col] = ((row_out[col] as i64 + add) >> shift).clamp(-32768, 32767) as i16;
+        }
+    }
+    out
+}
+
 // ---- Top-level dispatch -----------------------------------------------------
 
 /// Apply the inverse transform appropriate for `log2_size` and the residual's

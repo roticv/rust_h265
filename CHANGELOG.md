@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Range extensions (HEVC v2).** Every range-extension coding tool is
+  implemented, in 4:2:0 and 4:4:4 up to 12 bits: cross-component
+  prediction, implicit and explicit RDPCM, transform-skip rotation and
+  contexts, transform skip up to 32x32, extended precision processing,
+  persistent Rice adaptation, CABAC bypass alignment, chroma QP offset
+  lists, SAO offset scaling, disabled intra smoothing and high-precision
+  weighted-prediction offsets. WPP combined with tiles (allowed by the
+  high-throughput profiles) is supported. All 34 JCT-VC-RExt vectors in
+  these formats pass (FFmpeg passes 21; it lacks extended precision and
+  bypass alignment). 4:2:2, monochrome, 16-bit and screen content coding
+  are still rejected with `DecodeError::Unsupported`.
 - `DecodeError` now implements `Clone`, `PartialEq` and `Eq`.
 - **Display-order output:** `Decoder::new().with_display_order()` runs the
   spec C.5.2 output process ("bumping") inside the decoder. Frames are
@@ -22,16 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Streams using unimplemented coding tools were decoded wrongly without
-  an error.** The SPS and PPS range extensions were never parsed, so a
-  stream that enabled, for example, cross-component prediction or RDPCM
-  decoded as if the tool were off. The SPS VUI and HRD parameters are now
-  skipped to reach the SPS extension, and any enabled range-extension tool
-  or screen content coding is rejected with `DecodeError::Unsupported`
-  naming it, at the parameter set and at each slice that uses it. A
-  rejected SPS or PPS also replaces an earlier one with the same ID, so
-  later slices do not decode with a stale parameter set. On the 8-bit and
-  10-bit JCT-VC RExt vectors this turns 18 wrong outputs into errors.
+- **Range-extension streams decoded wrongly without an error.** The SPS
+  and PPS extensions were never parsed, so a stream that enabled, for
+  example, cross-component prediction decoded as if the tool were off. The
+  extensions are now parsed (the SPS VUI and HRD parameters are skipped to
+  reach them) and the tools implemented; screen content coding is rejected
+  with `DecodeError::Unsupported`. A rejected SPS or PPS replaces an earlier
+  one with the same ID, so later slices do not decode with a stale
+  parameter set.
+- **Chroma QP offset groups:** `cu_chroma_qp_offset_flag` was allowed once
+  per CU instead of once per chroma QP offset group, and the offsets were
+  reset per CU instead of per slice segment.
 - **Bit depths above 12 are rejected** with `DecodeError::Unsupported`.
   14- and 16-bit streams were accepted, but motion compensation shifts
   underflow above 13 bits (found by fuzzing).

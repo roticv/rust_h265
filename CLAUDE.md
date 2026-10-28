@@ -4,15 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**Complete for Main and Main 10 profile (8-bit and 10-bit 4:2:0), plus
-4:4:4 (ChromaArrayType 3, 8-bit and 10-bit, intra and inter).** JCT-VC
-HEVC_v1 conformance: 147 / 147 (`tools/conformance/`). Byte-exact against
-FFmpeg on all in-tree fixtures plus 6 real-world Big Buck Bunny 1080p
-transcodes (8-bit and 10-bit). 12-bit decodes but is lightly tested (one
-RExt vector). Rejected with `DecodeError::Unsupported` rather than decoded
-wrongly: 4:2:2, monochrome, bit depth > 12, every range-extension coding
-tool and SCC. Display-order output (`with_display_order`) and recovery from
-damaged slices are in place. No threading or SIMD yet.
+**Complete for Main and Main 10, and for the 4:2:0 / 4:4:4 range-extension
+profiles up to 12 bits with every RExt coding tool.** Conformance
+(`tools/conformance/`): JCT-VC HEVC_v1 147 / 147, JCT-VC-RExt 34 / 34 of
+the vectors in supported formats. Byte-exact against FFmpeg on all in-tree
+fixtures plus 6 real-world Big Buck Bunny 1080p transcodes (8-bit and
+10-bit). Rejected with `DecodeError::Unsupported` rather than decoded
+wrongly: 4:2:2, monochrome, bit depth > 12, SCC. Display-order output
+(`with_display_order`) and recovery from damaged slices are in place. No
+threading or SIMD yet.
 
 ## Build Commands
 
@@ -102,6 +102,7 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 - **Neighbour availability (spec 6.4.1) means same slice AND same tile:** use `cu_tree::neighbour_available` for CABAC context neighbours (split_cu_flag, cu_skip_flag), MPM candidates and similar; SAO merge and merge/AMVP candidates do their own slice+tile checks. Loop filters must honour `loop_filter_across_tiles_enabled_flag` (`PictureState::filter_across_tiles`). Flat-content fixtures hide these bugs; test tiles with real content (`tiles_inter_kvazaar_384x256.h265`, `tiles_hm_*_832x256.h265`).
 - **QP prediction uses the CU origin:** `cu_qp_delta` coded in a TU derives qPY_PRED from the CU origin (`PictureState::cu_origin`), not the TU or transform-tree base. In a CU larger than the quantization group the two differ and the TU version reads stale QPs from inside the CU. Only 64×64 CTBs with `diff_cu_qp_delta_depth > 0` expose it.
 - **Luma and chroma bit depths can differ:** use `PictureState::bit_depth_c` / `sps.bit_depth_chroma` for every chroma path (MC shifts, weighted prediction, intra default value, clipping, SAO offset cMax). `Sps::needs_u16_samples()` picks the sample type from both depths.
-- **Unimplemented tools are rejected, not ignored:** the SPS parser skips the VUI/HRD (`skip_vui`) to reach the range extension, and `parse_vui_and_extensions` / the PPS parser return `Unsupported` for any enabled RExt or SCC tool. A failed SPS/PPS is stored in the ID table as its error (activation returns it), so it replaces an older set with the same ID. When implementing a RExt tool, remove its rejection and verify with the JCT-VC-RExt vectors.
+- **Unsupported features are rejected, not ignored:** the SPS parser skips the VUI/HRD (`skip_vui`) to reach the extensions; SCC returns `Unsupported`. A failed SPS/PPS is stored in the ID table as its error (activation returns it), so it replaces an older set with the same ID.
+- **Range extensions:** flags live in `Sps::range` and the PPS range fields. Rotation applies to transform-skip *and* transquant-bypass 4×4 intra blocks (HM; FFmpeg skips bypass). StatCoeff (persistent Rice) lives in `CabacContexts`, so it resets and syncs with the contexts. Extended precision with a coefficient range above 16 bits uses `ResidualBlock::coeffs_wide` and `inverse_transform::inverse_transform_ext`; the 8-bit path is unchanged. With WPP and tiles together, a CTB row of a tile is a substream (`tile_col_start` in `decode_slice`). Verify RExt work with the JCT-VC-RExt suite and the HM-recon fixtures (`test_decode_rext_tools_match_hm`); FFmpeg lacks extended precision and bypass alignment and differs on lossless RDPCM.
 - **Conformance:** `tools/conformance/run_suite.py` runs the JCT-VC suites from Fluster's JSON (see its README). Re-run it after changes to parsing, prediction or loop filters.
 - **EPB compensation for WPP entry points:** `entry_point_offset` is in NAL-byte space (includes EPBs). Must convert to RBSP-byte offset by subtracting EPB count.

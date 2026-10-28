@@ -333,7 +333,42 @@ fn decode_coeff_abs_level_greater2_flag(
 }
 
 /// Decode `coeff_abs_level_remaining` (Rice + Exp-Golomb), HEVC spec 9.3.4.2.8.
-fn decode_coeff_abs_level_remaining(cabac: &mut CabacReader, c_rice_param: u32) -> u32 {
+///
+/// `limited_range`: with extended_precision_processing_flag, the prefix is
+/// limited to `32 - log2TransformRange` ones beyond the first three, and a
+/// maximal prefix is followed by `log2TransformRange - cRiceParam` suffix
+/// bits (spec 9.3.3.11; HM `xReadCoefRemainExGolomb`).
+fn decode_coeff_abs_level_remaining(
+    cabac: &mut CabacReader,
+    c_rice_param: u32,
+    limited_range: Option<u32>,
+) -> u32 {
+    if let Some(log2_range) = limited_range {
+        let max_prefix_ext = 32 - (3 + log2_range);
+        let mut prefix = 0u32;
+        while prefix < max_prefix_ext + 3 && cabac.decode_bypass() != 0 {
+            prefix += 1;
+        }
+        if prefix < 3 {
+            let mut suffix = 0u32;
+            for _ in 0..c_rice_param {
+                suffix = (suffix << 1) | cabac.decode_bypass();
+            }
+            return (prefix << c_rice_param) + suffix;
+        }
+        let prefix_len = prefix - 3;
+        let suffix_len = if prefix_len == max_prefix_ext {
+            log2_range.saturating_sub(c_rice_param)
+        } else {
+            prefix_len
+        };
+        let mut code = 0u64;
+        for _ in 0..(suffix_len + c_rice_param).min(32) {
+            code = (code << 1) | cabac.decode_bypass() as u64;
+        }
+        let val = code + ((((1u64 << prefix_len) - 1) + 3) << c_rice_param);
+        return val.min(u32::MAX as u64) as u32;
+    }
     let mut prefix = 0u32;
     while prefix < CABAC_MAX_BIN && cabac.decode_bypass() != 0 {
         prefix += 1;
@@ -402,6 +437,13 @@ pub struct ResidualBlock {
     /// the raw decoded coefficient levels are the spatial-domain residual.
     /// Also disables deblocking on this CU's boundaries (HEVC spec 8.7.2).
     pub cu_transquant_bypass: bool,
+    /// With extended precision and a coefficient range above 16 bits, the
+    /// dequantized coefficients are here (and `coeffs` is unused); the
+    /// inverse transform then takes the `i32` path.
+    pub coeffs_wide: Option<Vec<i32>>,
+    /// log2TransformRange: 15, or Max(15, BitDepth + 6) with extended
+    /// precision.
+    pub log2_range: u32,
 }
 
 /// Compute the dequantization scale parameters for a TU.
@@ -491,6 +533,10 @@ pub fn decode_residual_coding(
     // persistent_rice_adaptation_enabled_flag: sbType selects a StatCoeff.
     let persistent_rice = rext.persistent_rice_adaptation_enabled_flag;
     let sb_type = 2 * usize::from(plane == ResidualPlane::Luma) + usize::from(ts_or_bypass);
+    // extended_precision_processing_flag: coefficient range
+    // log2TransformRange = Max(15, BitDepth + 6) (spec 7.4.3.2.2) and a
+    // limited coeff_abs_level_remaining prefix.
+    let extended = rext.extended_precision_processing_flag;
 
     // Horizontal and vertical scan orders are used for angular intra modes
     // 6..14 (vert) and 22..30 (horiz) at log2_trafo_size <= 3.
@@ -588,7 +634,31 @@ pub fn decode_residual_coding(
         sps.bit_depth_chroma
     };
     let qp_bd_offset = 6 * (bd as i32 - 8);
-    let (shift, add, scale) = compute_dequant_scale(qp + qp_bd_offset, log2_trafo_size, bd);
+    let (_, _, scale) = compute_dequant_scale(qp + qp_bd_offset, log2_trafo_size, bd);
+    let log2_range: u32 = if extended {
+        (bd as u32 + 6).max(15)
+    } else {
+        15
+    };
+    let limited_range = extended.then_some(log2_range);
+    // Forward transform shift log2TransformRange - BitDepth - log2(nTbS);
+    // clipped at 0 for transform skip with extended precision (HM).
+    let mut transform_shift = log2_range as i32 - bd as i32 - log2_trafo_size as i32;
+    if transform_skip && extended {
+        transform_shift = transform_shift.max(0);
+    }
+    // Dequantization bdShift (spec 8.6.3): BitDepth + log2(nTbS) + 10 -
+    // log2TransformRange, i.e. 10 - transform_shift (scale carries the
+    // QP / 6 shift).
+    let shift = (10 - transform_shift) as u32;
+    let add = 1u32 << (shift - 1);
+    let (coeff_min, coeff_max) = (-(1i64 << log2_range), (1i64 << log2_range) - 1);
+    let wide = log2_range > 15 && !cu_transquant_bypass;
+    let mut coeffs_wide: Vec<i32> = if wide {
+        vec![0; trafo_size * trafo_size]
+    } else {
+        Vec::new()
+    };
 
     // Resolve the active scaling matrix and DC scale value. Transform-skip
     // blocks larger than 4x4 use the flat factor 16 (spec 8.6.4.2).
@@ -741,6 +811,9 @@ pub fn decode_residual_coding(
 
         let mut coeff_abs_level_greater1_flag = [0u8; 8];
         let mut first_greater1_idx: i32 = -1;
+        // escapeDataPresent (spec 7.3.8.11): some level in the sub-block
+        // needs coeff_abs_level_remaining.
+        let mut escape_data_present = n_end > 8;
         let g1_count = (n_end as usize).min(8);
         for (m, slot) in coeff_abs_level_greater1_flag
             .iter_mut()
@@ -754,6 +827,8 @@ pub fn decode_residual_coding(
                 greater1_ctx = 0;
                 if first_greater1_idx == -1 {
                     first_greater1_idx = m as i32;
+                } else {
+                    escape_data_present = true;
                 }
             } else if greater1_ctx > 0 && greater1_ctx < 3 {
                 greater1_ctx += 1;
@@ -773,6 +848,7 @@ pub fn decode_residual_coding(
             let greater2 =
                 decode_coeff_abs_level_greater2_flag(cabac, contexts, c_idx, ctx_set) as u8;
             coeff_abs_level_greater1_flag[first_greater1_idx as usize] += greater2;
+            escape_data_present |= greater2 != 0;
         }
 
         // Sign data hiding gating (HEVC spec 7.4.9.11 / FFmpeg cabac.c:1348-1355).
@@ -801,6 +877,9 @@ pub fn decode_residual_coding(
         // then spuriously flip later coefficients. Earlier fixtures hid
         // this pre-existing bug because they had few non-zero coefficients
         // per sub-block; the new signhide fixture forces the issue.
+        if rext.cabac_bypass_alignment_enabled_flag && escape_data_present {
+            cabac.align_bypass();
+        }
         let sign_nb = if sign_hidden { n_end - 1 } else { n_end };
         let coeff_sign_flag = decode_coeff_sign_flag(cabac, sign_nb);
         let mut sign_bits: u32 = (coeff_sign_flag << (16 - sign_nb)) & 0xffff;
@@ -809,8 +888,11 @@ pub fn decode_residual_coding(
         // persistent Rice adaptation the Rice parameter starts from
         // StatCoeff, which the first coeff_abs_level_remaining of the
         // sub-block updates, and is not capped at 4 (spec 9.3.3.11).
+        // Valid streams keep the Rice parameter far below 31 (it would need
+        // levels near 3 << 30); the cap only stops malformed input from
+        // shifting past the integer width.
         let mut c_rice_param = if persistent_rice {
-            u32::from(contexts.stat_coeff[sb_type]) / 4
+            (u32::from(contexts.stat_coeff[sb_type]) / 4).min(31)
         } else {
             0
         };
@@ -818,7 +900,7 @@ pub fn decode_residual_coding(
         let mut update_rice = |c_rice_param: &mut u32, level: i64, remaining: i64| {
             if level > (3i64 << *c_rice_param) {
                 *c_rice_param = if persistent_rice {
-                    *c_rice_param + 1
+                    (*c_rice_param + 1).min(31)
                 } else {
                     (*c_rice_param + 1).min(4)
                 };
@@ -845,12 +927,14 @@ pub fn decode_residual_coding(
                 trans_coeff_level = 1 + coeff_abs_level_greater1_flag[m] as i64;
                 let needed_for_remaining = if m as i32 == first_greater1_idx { 3 } else { 2 };
                 if trans_coeff_level == needed_for_remaining {
-                    let last = decode_coeff_abs_level_remaining(cabac, c_rice_param) as i64;
+                    let last =
+                        decode_coeff_abs_level_remaining(cabac, c_rice_param, limited_range) as i64;
                     trans_coeff_level += last;
                     update_rice(&mut c_rice_param, trans_coeff_level, last);
                 }
             } else {
-                let last = decode_coeff_abs_level_remaining(cabac, c_rice_param) as i64;
+                let last =
+                    decode_coeff_abs_level_remaining(cabac, c_rice_param, limited_range) as i64;
                 trans_coeff_level = 1 + last;
                 update_rice(&mut c_rice_param, trans_coeff_level, last);
             }
@@ -894,8 +978,12 @@ pub fn decode_residual_coding(
                     None => 16,
                 };
                 let dq = (trans_coeff_level * scale as i64 * scale_m as i64 + add as i64) >> shift;
-                let dq = dq.clamp(-32768, 32767) as i16;
-                coeffs[y_c * trafo_size + x_c] = dq;
+                let dq = dq.clamp(coeff_min, coeff_max);
+                if wide {
+                    coeffs_wide[y_c * trafo_size + x_c] = dq as i32;
+                } else {
+                    coeffs[y_c * trafo_size + x_c] = dq as i16;
+                }
             }
         }
     }
@@ -910,25 +998,33 @@ pub fn decode_residual_coding(
     // transform_skip_rotation_enabled_flag: 4x4 intra blocks without a
     // transform are rotated by 180 degrees (spec 8.6.2; HM applies it to
     // transquant-bypass blocks as well as transform-skip ones).
-    if rext.transform_skip_rotation_enabled_flag && log2_trafo_size == 2 && is_intra && ts_or_bypass
-    {
-        coeffs.reverse();
-    }
+    let rotate = rext.transform_skip_rotation_enabled_flag
+        && log2_trafo_size == 2
+        && is_intra
+        && ts_or_bypass;
     if transform_skip {
         // tsShift = 5 + Log2(nTbS) then bdShift = 20 - BitDepth (spec
-        // 8.6.4.2), folded into one shift; it is negative for large blocks
-        // at high bit depths.
-        let ts_shift = 15 - bd as i32 - log2_trafo_size as i32;
-        if ts_shift > 0 {
-            let ts_offset = 1i32 << (ts_shift - 1);
-            for c in coeffs.iter_mut() {
-                *c = ((*c as i32 + ts_offset) >> ts_shift) as i16;
-            }
-        } else if ts_shift < 0 {
-            for c in coeffs.iter_mut() {
-                *c = ((*c as i32) << -ts_shift) as i16;
-            }
+        // 8.6.4.2), folded into one shift (the forward transform shift);
+        // it is negative for large blocks at high bit depths.
+        let mut wide_or_narrow: Vec<i32> = if wide {
+            std::mem::take(&mut coeffs_wide)
+        } else {
+            coeffs.iter().map(|&c| c as i32).collect()
+        };
+        if rotate {
+            wide_or_narrow.reverse();
         }
+        let ts_shift = transform_shift;
+        for (dst, &c) in coeffs.iter_mut().zip(&wide_or_narrow) {
+            let v = if ts_shift > 0 {
+                (c + (1 << (ts_shift - 1))) >> ts_shift
+            } else {
+                c << -ts_shift
+            };
+            *dst = v as i16;
+        }
+    } else if rotate {
+        coeffs.reverse();
     }
     if rdpcm {
         // Directional residual modification (spec 8.6.8): accumulate along
@@ -953,6 +1049,8 @@ pub fn decode_residual_coding(
         last_sig_y,
         transform_skip,
         cu_transquant_bypass,
+        coeffs_wide: (wide && !transform_skip).then_some(coeffs_wide),
+        log2_range,
     })
 }
 

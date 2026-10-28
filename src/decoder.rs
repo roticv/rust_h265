@@ -4654,6 +4654,9 @@ mod tests {
     ///   transform-skip shift).
     /// - hp_wp: HighPrecisionPredictionWeighting, WeightedPredP, fade-in input.
     /// - chroma_qp_adj: MaxCUChromaQpAdjustmentDepth 1 (chroma QP offset lists).
+    /// - bypass_align: intra only (no GOP, IntraPeriod 1), QP 4, `Profile
+    ///   high_throughput_444_16_intra`, AlignCABACBeforeBypass 1 (CABAC
+    ///   bypass alignment; FFmpeg does not implement it).
     #[test]
     fn test_decode_rext_tools_match_hm() {
         for (name, expected) in [
@@ -4672,6 +4675,10 @@ mod tests {
             (
                 "rext_hp_wp_hm_444_96x64.h265",
                 "8cd1a02bd582e6bdbc9bb04c5dbc49268c8a5f7110cd1958beb1cf7d7bc48929",
+            ),
+            (
+                "rext_bypass_align_hm_444_96x64.h265",
+                "33ea5e4e900abeb4d6e86a4380d8b68f44fc0a8b8714900a2e6d4ac4fbdc9638",
             ),
             (
                 "rext_chroma_qp_adj_hm_444_96x64.h265",

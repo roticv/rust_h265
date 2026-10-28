@@ -3976,18 +3976,28 @@ fn decode_chroma_residuals<P: Pixel>(
                 cu_transquant_bypass,
             )?;
             // Apply inverse transform + add to chroma plane.
-            let mut residual = block.coeffs;
-            if !block.transform_skip && !block.cu_transquant_bypass {
-                apply_inverse_transform(
-                    &mut residual,
+            if let Some(wide) = &block.coeffs_wide {
+                crate::inverse_transform::inverse_transform_ext(
+                    wide,
                     log2_trafo_size_c,
-                    block.last_sig_x,
-                    block.last_sig_y,
                     sps.bit_depth_chroma as u32,
-                    false, // chroma never uses DST
-                );
+                    block.log2_range,
+                    false,
+                )
+            } else {
+                let mut residual = block.coeffs;
+                if !block.transform_skip && !block.cu_transquant_bypass {
+                    apply_inverse_transform(
+                        &mut residual,
+                        log2_trafo_size_c,
+                        block.last_sig_x,
+                        block.last_sig_y,
+                        sps.bit_depth_chroma as u32,
+                        false, // chroma never uses DST
+                    );
+                }
+                residual
             }
-            residual
         } else {
             vec![0i16; size_c * size_c]
         };
@@ -4471,6 +4481,30 @@ fn apply_residual_to_luma<P: Pixel>(
     keep_for_ccp: bool,
 ) {
     let size = 1usize << log2_size;
+    if let Some(wide) = &block.coeffs_wide {
+        // Extended precision with coefficients beyond 16 bits.
+        let residual_pixels = crate::inverse_transform::inverse_transform_ext(
+            wide,
+            log2_size,
+            state.bit_depth as u32,
+            block.log2_range,
+            log2_size == 2 && is_intra,
+        );
+        let dst_stride = state.y_stride;
+        let dst_offset = (y0 as usize) * dst_stride + (x0 as usize);
+        let dst = &mut state.y_plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
+        add_residual(
+            dst,
+            dst_stride,
+            &residual_pixels,
+            log2_size,
+            state.bit_depth,
+        );
+        if keep_for_ccp {
+            state.ccp_luma_residual = residual_pixels;
+        }
+        return;
+    }
     let mut residual_pixels = block.coeffs.clone();
     // Spec 8.6.4.2: 4×4 DST is only used for INTRA luma. Inter 4×4 uses
     // regular DCT. Previously this flag was `log2_size == 2`, which silently

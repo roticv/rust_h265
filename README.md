@@ -8,7 +8,7 @@ A pure Rust H.265 / HEVC video decoder.
 > encodes (x265 `ultrafast` / `medium` / `slow`, 8-bit and 10-bit).
 >
 > - **Formats:** 4:2:0 and 4:4:4 (as used by HEIF/HEIC images), 8-bit and
->   10-bit; 12-bit decodes but is lightly tested.
+>   10-bit, plus 12-bit for the range-extension profiles.
 > - **Tools:** CTU 16/32/64, I/P/B slices including hierarchical B and
 >   open-GOP CRA, WPP, tiles, dependent slice segments, SAO, deblocking,
 >   `cu_qp_delta`, scaling lists, sign-data hiding, weighted prediction,
@@ -17,9 +17,13 @@ A pure Rust H.265 / HEVC video decoder.
 >   process (`Decoder::with_display_order`).
 > - **Robustness:** damaged or missing slices cost the affected pictures, not
 >   the rest of the stream. Fuzzed.
-> - **Not supported:** 4:2:2, monochrome, bit depths above 12, and the
->   range-extension and screen-content coding tools. These streams are
->   rejected with `DecodeError::Unsupported` rather than decoded wrongly.
+> - **Range extensions:** every range-extension coding tool, in 4:2:0 and
+>   4:4:4 up to 12 bits. Passes the 34 JCT-VC-RExt conformance vectors in
+>   those formats, including extended precision and CABAC bypass
+>   alignment, which FFmpeg does not implement.
+> - **Not supported:** 4:2:2, monochrome, bit depths above 12, and screen
+>   content coding. These streams are rejected with
+>   `DecodeError::Unsupported` rather than decoded wrongly.
 > - **Speed:** no threading or hand-written SIMD yet; about 2.5× slower than
 >   single-threaded FFmpeg on 8-bit content and roughly at parity on 10-bit.
 >   See [`BENCHMARK.md`](BENCHMARK.md).
@@ -33,9 +37,9 @@ A pure Rust H.264 decoder ([`rust_h264`](https://github.com/roticv/rust_h264)) a
 - **Input:** Both **Annex B** (start-code delimited, `.h265` raw files) and **HVCC** (length-prefixed, MP4/MKV containers) formats via `parse_annex_b()` and `parse_hvcc()`.
 - **Streaming:** `Decoder::decode_nal(&NalUnit) -> Result<Option<Frame>, DecodeError>` plus `flush()`. NAL units are fed incrementally. Frames come out in **decoding order** by default, or in **display order** with `Decoder::new().with_display_order()` and `next_output()` (see [frame ordering](#important-frame-ordering)).
 - **Performance:** The decoder aims to be fast, with FFmpeg's software HEVC decoder as the target benchmark. Current gap vs single-threaded FFmpeg: ~2.5× on 8-bit, roughly parity on 10-bit real 1080p content. Motion compensation is compiler-vectorised; there are no hand-written NEON / SSE kernels yet.
-- **Multi-bit-depth:** 8-bit and 10-bit (Main / Main 10 profile) via a generic `Pixel` trait. 12-bit decodes (one 12-bit range-extensions conformance vector passes) but is lightly tested; deeper streams are rejected with `DecodeError::Unsupported`. Pixel planes are `PixelData::U8(Vec<u8>)` or `PixelData::U16(Vec<u16>)` — check `frame.bit_depth` to determine which.
+- **Multi-bit-depth:** 8-bit and 10-bit (Main / Main 10 profile) via a generic `Pixel` trait. 12-bit decodes (the 12-bit range-extensions conformance vectors pass); deeper streams are rejected with `DecodeError::Unsupported`. Pixel planes are `PixelData::U8(Vec<u8>)` or `PixelData::U16(Vec<u16>)` — check `frame.bit_depth` to determine which.
 - **Chroma formats:** 4:2:0 and 4:4:4, intra and inter. Check `frame.chroma_format_idc` (1 = 4:2:0, 3 = 4:4:4) to size the `u`/`v` planes: half width and height for 4:2:0, full size for 4:4:4. 4:2:2 and monochrome streams are rejected with `DecodeError::Unsupported`.
-- **Range extensions:** streams that enable a range-extension coding tool (cross-component prediction, RDPCM, transform-skip rotation or context, extended precision, persistent Rice adaptation, CABAC bypass alignment, chroma QP offset lists, larger transform-skip blocks, SAO offset scaling, disabled intra smoothing, high-precision weighted-prediction offsets) or screen content coding are rejected with `DecodeError::Unsupported`, naming the tool, rather than decoded with the tool ignored. Plain 4:4:4 as produced by x265 uses none of them.
+- **Range extensions:** all range-extension coding tools are implemented: cross-component prediction, implicit and explicit RDPCM, transform-skip rotation and contexts, transform skip up to 32×32, extended precision processing, persistent Rice adaptation, CABAC bypass alignment, chroma QP offset lists, SAO offset scaling, disabled intra smoothing and high-precision weighted-prediction offsets, plus WPP combined with tiles. Screen content coding is rejected with `DecodeError::Unsupported`.
 - **Resource limits:** `Decoder::new()` rejects any SPS whose picture exceeds 35,651,584 luma samples (the Level 6.2 maximum) or an estimated 512 MB of per-picture state, returning `DecodeError::ResourceLimit`. Use `Decoder::with_limits(DecodeLimits { .. })` to change either bound.
 - **Pure Rust, no `unsafe`** in the current codebase. `unsafe` will be reserved for SIMD paths once they land.
 
@@ -186,8 +190,9 @@ and 10-bit and requires `ffmpeg` and `x265` on `$PATH`.
 JCT-VC conformance bitstreams (using the suite definitions from
 [Fluster](https://github.com/fluendo/fluster)) and compares the MD5 of the
 decoded output with the expected value. JCT-VC HEVC_v1 passes 147 / 147.
-On JCT-VC-RExt only the plain 4:2:0 vectors pass; the rest use
-range-extension tools and are rejected as unsupported.
+JCT-VC-RExt passes the 34 vectors in the supported formats (4:2:0 and
+4:4:4, up to 12 bits); the other 15 are 4:2:2, monochrome or 16-bit and are
+rejected as unsupported.
 
 ### Fuzzing
 
