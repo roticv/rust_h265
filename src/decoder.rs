@@ -1275,7 +1275,14 @@ impl Decoder {
         self.dpb.insert(decoded_pic);
         self.dpb.cleanup_unused();
 
-        Ok(Some(emitted_frame))
+        // PicOutputFlag (spec 8.1.3): a picture with pic_output_flag = 0 is
+        // decoded and kept for reference but never output. (Skipped RASL
+        // pictures never reach this point.)
+        if last_sh_cloned.pic_output_flag {
+            Ok(Some(emitted_frame))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Phase 3d-1: compute a picture's POC from `prev_tid0_poc`, the
