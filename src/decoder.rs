@@ -156,9 +156,8 @@ struct PictureInProgress {
 /// identity tables and `tile_id` = 0 everywhere, preserving raster scan.
 #[derive(Debug, Clone)]
 struct TileScanTables {
-    /// Raster → tile-scan. Kept for completeness (we currently only need the
-    /// inverse during decode) and for future parallel / out-of-order work.
-    #[allow(dead_code)]
+    /// Raster → tile-scan; converts `slice_segment_address` to the
+    /// tile-scan position decoding starts at.
     ctb_addr_rs_to_ts: Vec<u32>,
     ctb_addr_ts_to_rs: Vec<u32>,
     tile_id: Vec<u32>,
@@ -757,14 +756,34 @@ impl Decoder {
         let pic_width_in_ctbs_for_init = sps.pic_width_in_ctbs_y();
         let wpp_for_init = pps.entropy_coding_sync_enabled_flag;
         let tiles_for_init = pps.tiles_enabled_flag;
-        let mut contexts = if sh.dependent_slice_segment_flag {
+        // slice_segment_address is a CTB address in raster scan (spec
+        // 7.4.7.1); CTBs are decoded in tile scan, so convert it.
+        let slice_start_ts = *tile_tables
+            .ctb_addr_rs_to_ts
+            .get(sh.slice_segment_address as usize)
+            .ok_or(DecodeError::InvalidSyntax(
+                "slice_segment_address out of range",
+            ))?;
+        let tile_of_ts = |ts: u32| {
+            tile_tables
+                .ctb_addr_ts_to_rs
+                .get(ts as usize)
+                .and_then(|&rs| tile_tables.tile_id.get(rs as usize))
+                .copied()
+        };
+        let slice_starts_tile = tiles_for_init
+            && (slice_start_ts == 0
+                || tile_of_ts(slice_start_ts) != tile_of_ts(slice_start_ts - 1));
+        let mut contexts = if sh.dependent_slice_segment_flag && slice_starts_tile {
+            // The first CTB of a tile always starts from initialised contexts
+            // (spec 9.3.1), even in a dependent slice segment.
+            CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag)
+        } else if sh.dependent_slice_segment_flag {
             let pic = self.current_picture.as_ref().expect("checked above");
             // Does the dependent slice's first CTB sit on a WPP row
-            // boundary? `slice_segment_address` is a tile-scan address, so
-            // for single-tile pictures it equals the raster address and
-            // `% pic_width_in_ctbs` gives the column. WPP is incompatible
-            // with multi-tile slices in practice so we only special-case
-            // the single-tile path.
+            // boundary? `slice_segment_address` is a raster address, so
+            // `% pic_width_in_ctbs` gives the column. WPP with tiles is
+            // only special-cased for the single-tile path.
             let on_row_start = !tiles_for_init
                 && sh
                     .slice_segment_address
@@ -817,10 +836,9 @@ impl Decoder {
 
         // Phase 3c-1: a first slice segment starts a new picture. Subsequent
         // slice segments (`first_slice_segment_in_pic_flag = 0`) attach to
-        // the already-in-flight picture. Phase 3c-2: `slice_segment_address`
-        // is a tile-scan address (not raster), and `pic.ctbs_decoded`
-        // likewise counts in tile-scan order so the continuity check below
-        // still works for tiled pictures.
+        // the already-in-flight picture. `pic.ctbs_decoded` counts CTBs in
+        // tile-scan order (`slice_start_ts` above is the tile-scan position
+        // of the raster `slice_segment_address`).
         if sh.first_slice_segment_in_pic_flag {
             if self.current_picture.is_some() {
                 // Starting a new picture while the previous one is still
@@ -957,8 +975,17 @@ impl Decoder {
         // `last_qp_y` (FFmpeg: `lc->qp_y`) must be re-seeded to
         // `slice_qp_y` at the start of every independent slice segment
         // (FFmpeg `hls_decode_entry`: `lc->qp_y = s->sh.slice_qp_y`).
+        // A dependent segment that starts a tile, or a CTB row under WPP,
+        // also starts a new QP prediction chain: the first quantization group
+        // of a tile / WPP row predicts from SliceQpY (spec 8.6.1).
+        let segment_starts_qp_chain = !sh.dependent_slice_segment_flag
+            || slice_starts_tile
+            || (wpp_for_init
+                && sh
+                    .slice_segment_address
+                    .is_multiple_of(pic_width_in_ctbs_for_init));
         with_picture_state!(&mut pic.state, |state| {
-            state.first_qp_group = !sh.dependent_slice_segment_flag;
+            state.first_qp_group = segment_starts_qp_chain;
             if !sh.dependent_slice_segment_flag {
                 state.last_qp_y = sh.slice_qp_y;
             }
@@ -966,7 +993,6 @@ impl Decoder {
 
         let wpp = pps.entropy_coding_sync_enabled_flag;
         let tiles_on = pps.tiles_enabled_flag;
-        let slice_start_ts = sh.slice_segment_address;
 
         // Phase 3c-3 (WPP): saved CABAC context state captured after the
         // second CTB of each row, to be loaded at the start of the next row.
