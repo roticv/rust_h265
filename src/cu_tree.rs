@@ -132,6 +132,11 @@ pub struct SliceParams {
     pub ref_pic_list_pocs: [Vec<i32>; 2],
     /// Whether each reference list entry is a long-term reference picture.
     pub ref_pic_list_is_lt: [Vec<bool>; 2],
+    /// Reference lists of every slice of the current picture decoded so
+    /// far, keyed by slice address (SliceAddrRs). Deblocking compares the
+    /// reference pictures of a block in an earlier slice through that
+    /// slice's lists, not the current slice's.
+    pub picture_slice_ref_lists: Vec<(i32, crate::dpb::SliceRefLists)>,
     /// Phase 3d-6: actual reference frame pixel data for L0 MC.
     pub ref_frames_l0: Vec<Rc<DecodedPicture>>,
     /// Phase 3d-6: actual reference frame pixel data for L1 MC.
@@ -2271,8 +2276,38 @@ fn compute_deblocking_boundary_strengths<P: Pixel>(
     let y_pu = (y0 >> log2_min_pu) as usize;
     let is_intra = state.tab_mvf[y_pu * min_pu_w + x_pu].pred_flag == 0;
 
-    // Use the current slice's ref_pic_list_pocs as the "current" ref list
+    // The current block's reference lists are the current slice's. A
+    // neighbour across a slice boundary uses its own slice's lists (spec
+    // 8.7.2.4 compares reference pictures, not indices).
     let curr_ref_pocs = &slice_params.ref_pic_list_pocs;
+    let log2_ctb = state.log2_ctb_size;
+    let ctb_w = pic_w.div_ceil(1 << log2_ctb);
+    let slice_at = |x: u32, y: u32| -> i32 {
+        state.tab_slice_addr_rs[(y as usize >> log2_ctb) * ctb_w + (x as usize >> log2_ctb)]
+    };
+    let curr_slice = slice_at(x0, y0);
+    let ref_pocs_at = |x: u32, y: u32| -> &[Vec<i32>; 2] {
+        let addr = slice_at(x, y);
+        if addr == curr_slice {
+            return curr_ref_pocs;
+        }
+        slice_params
+            .picture_slice_ref_lists
+            .iter()
+            .rev()
+            .find(|(a, _)| *a == addr)
+            .map_or(curr_ref_pocs, |(_, l)| &l.pocs)
+    };
+    let top_ref_pocs = if y0 > 0 {
+        ref_pocs_at(x0, y0 - 1)
+    } else {
+        curr_ref_pocs
+    };
+    let left_ref_pocs = if x0 > 0 {
+        ref_pocs_at(x0 - 1, y0)
+    } else {
+        curr_ref_pocs
+    };
 
     // Top boundary: y0 > 0 && 8-aligned
     if y0 > 0 && (y0 & 7) == 0 {
@@ -2300,9 +2335,7 @@ fn compute_deblocking_boundary_strengths<P: Pixel>(
                 if top_cbf != 0 || curr_cbf != 0 {
                     1
                 } else {
-                    // For the neighbor's ref_pocs, we use the same slice's pocs
-                    // (correct for non-cross-slice-boundary edges)
-                    inter_boundary_strength(curr_mvf, top_mvf, curr_ref_pocs, curr_ref_pocs)
+                    inter_boundary_strength(curr_mvf, top_mvf, curr_ref_pocs, top_ref_pocs)
                 }
             };
             state.bs_horizontal[yy * bs_w + xx] = bs;
@@ -2334,7 +2367,7 @@ fn compute_deblocking_boundary_strengths<P: Pixel>(
                 if left_cbf != 0 || curr_cbf != 0 {
                     1
                 } else {
-                    inter_boundary_strength(curr_mvf, left_mvf, curr_ref_pocs, curr_ref_pocs)
+                    inter_boundary_strength(curr_mvf, left_mvf, curr_ref_pocs, left_ref_pocs)
                 }
             };
             state.bs_vertical[yy * bs_w + xx] = bs;
@@ -4690,6 +4723,7 @@ mod tests {
             poc: 0,
             ref_pic_list_pocs: [vec![], vec![]],
             ref_pic_list_is_lt: [Vec::new(), Vec::new()],
+            picture_slice_ref_lists: Vec::new(),
             ref_frames_l0: vec![],
             ref_frames_l1: vec![],
             collocated_ref: None,

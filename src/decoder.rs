@@ -1065,6 +1065,7 @@ impl Decoder {
                 &self.current_ref_list_l1,
             )
             .is_long_term,
+            picture_slice_ref_lists: pic.slice_ref_pocs.clone(),
             ref_frames_l0: self.current_ref_list_l0.clone(),
             ref_frames_l1: self.current_ref_list_l1.clone(),
             collocated_ref,
