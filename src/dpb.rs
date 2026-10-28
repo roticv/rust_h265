@@ -1,28 +1,21 @@
-//! Phase 3d-1: Decoded Picture Buffer (DPB) infrastructure.
+//! Decoded picture buffer (DPB), reference picture sets and reference
+//! picture lists (spec 8.3.2 - 8.3.4).
 //!
 //! HEVC references pictures by POC (picture order count) rather than by
-//! index. The DPB is a pool of recently decoded pictures, each marked as
+//! index. The DPB holds recently decoded pictures, each marked as
 //! "short-term reference", "long-term reference", or "unused for reference".
-//! Pictures are removed from the DPB when no future slice in decode order
-//! could reference them any more.
+//! Pictures are removed once they are unused for reference; output order is
+//! handled separately by `crate::output`.
 //!
-//! **Phase 3d-1 scope**: only the data structures + insertion / lookup /
-//! marking plumbing. No actual inter decoding uses the DPB yet — see Phase
-//! 3d-2 / 3d-3 for that. The purpose of landing the DPB now is to give
-//! non-IDR slice header parsing somewhere to look up references and mark
-//! them.
-//!
-//! The lifetime shape intentionally uses `Rc<RefCell<...>>` so that the
-//! same decoded picture can be simultaneously held by the DPB (for
-//! marking / lookup) and later by a `RefPicList` entry during inter
-//! decode, without resorting to raw pointers or indices that would be
-//! invalidated when the DPB is compacted.
+//! Pictures are shared as `Rc<DecodedPicture>` (with `RefCell` marking
+//! state) so the same picture can be held by the DPB and by a slice's
+//! reference lists at once, without indices that compaction would
+//! invalidate.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::pixel::PixelData;
-use crate::sps::Sps;
 
 /// How this picture is currently marked in the DPB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,10 +48,8 @@ pub struct DecodedPicture {
     pub v: PixelData,
     pub width: u32,
     pub height: u32,
-    /// Signed picture order count (may be negative if a non-IDR with
-    /// earlier LSB appears after an IDR — in practice this is only
-    /// non-positive for RASL / RADL pictures, which Phase 3d-1 doesn't
-    /// decode anyway).
+    /// Signed picture order count (negative for leading pictures that
+    /// precede an IDR or CRA in output order).
     pub poc: i32,
     /// Reference marking state. Mutable since a picture's state changes
     /// over its lifetime in the DPB.
@@ -66,16 +57,16 @@ pub struct DecodedPicture {
     /// Whether the picture has been output yet (emitted as a `Frame`).
     pub output: RefCell<bool>,
 
-    /// Phase 3e: per min-PU motion field stored when inserting into the DPB.
+    /// per min-PU motion field stored when inserting into the DPB.
     /// Used by temporal merge/AMVP candidate derivation (spec 8.5.3.2.3 / 8.5.3.2.7).
     pub tab_mvf: Vec<crate::cu_tree::MvField>,
-    /// Phase 3e: `log2_min_pu_size` of this picture (needed to index `tab_mvf`).
+    /// `log2_min_pu_size` of this picture (needed to index `tab_mvf`).
     pub log2_min_pu_size: u8,
-    /// Phase 3e: min-PU width = `width >> log2_min_pu_size`.
+    /// min-PU width = `width >> log2_min_pu_size`.
     pub min_pu_width: usize,
-    /// Phase 3e: `log2_ctb_size` of this picture (needed for CTB row check in temporal candidate).
+    /// `log2_ctb_size` of this picture (needed for CTB row check in temporal candidate).
     pub log2_ctb_size: u8,
-    /// Phase 3e: per-list reference POCs at the time this picture was decoded.
+    /// per-list reference POCs at the time this picture was decoded.
     /// Used to compute POC distances for temporal MV scaling.
     /// `ref_pic_list_pocs[0]` = L0 POCs, `ref_pic_list_pocs[1]` = L1 POCs.
     pub ref_pic_list_pocs: [Vec<i32>; 2],
@@ -200,32 +191,17 @@ impl DecodedPicture {
     }
 }
 
-/// The decoded picture buffer.
-///
-/// Holds a pool of recently decoded pictures. Phase 3d-1 does not
-/// implement proper bumping / reorder-aware output — it only provides the
-/// scaffolding so later phases can wire in actual inter decoding and
-/// display ordering.
+/// The decoded picture buffer: decoded pictures kept for reference (spec
+/// 8.3.2 marking). Output order is handled separately by
+/// `crate::output::OutputQueue`; a picture here is removed once it is no
+/// longer used for reference.
 #[derive(Debug, Default)]
 pub struct DecodedPictureBuffer {
     pictures: Vec<Rc<DecodedPicture>>,
-    /// Maximum number of pictures that may sit in the DPB at once
-    /// (`sps_max_dec_pic_buffering_minus1 + 1`). Zero means "unbounded";
-    /// the caller will fill it in from the active SPS.
-    max_dec_pic_buffering: usize,
-    /// `sps_max_num_reorder_pics` — the maximum number of pictures that
-    /// may sit in the DPB before the current picture in decode order
-    /// precedes the current picture in output order. Used by `bump()`.
-    max_num_reorder_pics: usize,
-    /// `sps_max_latency_increase_plus1` — when non-zero, a latency bound
-    /// on how long a picture may sit in the DPB awaiting output.
-    #[allow(dead_code)]
-    max_latency_increase_plus1: u32,
 }
 
 impl DecodedPictureBuffer {
-    /// Create an empty DPB. Call `configure_from_sps` on the first slice
-    /// of each new sequence to populate the sizing fields from the SPS.
+    /// Create an empty DPB.
     pub fn new() -> Self {
         Self::default()
     }
@@ -233,14 +209,6 @@ impl DecodedPictureBuffer {
     /// Discard all pictures (e.g. on a bit-depth change between sequences).
     pub fn clear(&mut self) {
         self.pictures.clear();
-    }
-
-    /// Populate sizing fields from the active SPS. Should be called once
-    /// per activated SPS (idempotent — calling twice is harmless).
-    pub fn configure_from_sps(&mut self, sps: &Sps) {
-        self.max_dec_pic_buffering = (sps.sps_max_dec_pic_buffering_minus1 + 1) as usize;
-        self.max_num_reorder_pics = sps.sps_max_num_reorder_pics as usize;
-        self.max_latency_increase_plus1 = sps.sps_max_latency_increase_plus1;
     }
 
     /// Insert a freshly decoded picture into the DPB. The new picture
@@ -275,19 +243,6 @@ impl DecodedPictureBuffer {
             .cloned()
     }
 
-    /// Find a long-term reference picture by POC LSB. Checks the picture's
-    /// full POC's low bits against `poc_lsb`, which mirrors how HEVC LT
-    /// refs are identified (spec 8.3.2).
-    pub fn find_lt_ref_by_lsb(&self, poc_lsb: u32, max_poc_lsb: i32) -> Option<Rc<DecodedPicture>> {
-        self.pictures
-            .iter()
-            .find(|p| {
-                p.reference_status() == PictureReferenceStatus::LongTerm
-                    && (p.poc.rem_euclid(max_poc_lsb)) == poc_lsb as i32
-            })
-            .cloned()
-    }
-
     /// Mark every reference picture in the DPB as `UnusedForReference`.
     /// Used when the current RPS has been fully resolved and we need to
     /// flip everything that wasn't referenced back to unused state.
@@ -297,25 +252,21 @@ impl DecodedPictureBuffer {
         }
     }
 
-    /// Remove every picture that is both "unused for reference" and has
-    /// already been output. Mirrors FFmpeg's DPB cleanup step. Safe to
-    /// call after every picture insertion.
-    /// Returns the removed pictures, so their buffers can be reused.
-    pub fn cleanup_unused(&mut self) -> Vec<Rc<DecodedPicture>> {
-        let (keep, removed): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pictures)
-            .into_iter()
-            .partition(|p| p.is_reference() || !*p.output.borrow());
-        self.pictures = keep;
-        removed
-    }
-
-    /// Phase 3d-1 stub: return the next picture in output order if the
-    /// DPB is "full enough" to bump one out, or `None` otherwise. Because
-    /// we don't yet handle reorder-aware output, this always returns None
-    /// — the `Decoder` emits each picture immediately after it is decoded.
-    /// Phase 3d-3+ will replace this with a real bumping process.
-    pub fn bump(&mut self) -> Option<Rc<DecodedPicture>> {
-        None
+    /// Remove every picture that is unused for reference and already
+    /// output, keeping the order of the rest, and return the removed ones
+    /// (so their buffers can be reused). Allocation-free: the vector is
+    /// partitioned in place and the removed tail drained. Safe to call after
+    /// every picture insertion.
+    pub fn cleanup_unused(&mut self) -> std::vec::Drain<'_, Rc<DecodedPicture>> {
+        let mut kept = 0;
+        for i in 0..self.pictures.len() {
+            let p = &self.pictures[i];
+            if p.is_reference() || !*p.output.borrow() {
+                self.pictures.swap(kept, i);
+                kept += 1;
+            }
+        }
+        self.pictures.drain(kept..)
     }
 
     /// Direct access to the pictures list, for iteration by the caller
@@ -325,11 +276,9 @@ impl DecodedPictureBuffer {
     }
 }
 
-/// Phase 3d-1: derived reference picture set groupings per spec 8.3.2.
-///
-/// The five sets are the input to `RefPicList0` / `RefPicList1`
-/// construction (which Phase 3d-1 doesn't yet do). We compute them here
-/// so that inter-decode phases can slot straight in.
+/// The reference picture set of the current picture, in the five groups of
+/// spec 8.3.2. The "Curr" sets feed `RefPicList0` / `RefPicList1`
+/// construction; the "Foll" sets are kept for later pictures.
 #[derive(Debug, Default, Clone)]
 pub struct ReferencePictureSets {
     /// Short-term "before current picture" references that the current
@@ -366,7 +315,7 @@ impl ReferencePictureSets {
     }
 }
 
-/// Phase 3d-2: construct `RefPicListTemp0` per spec 8.3.2.
+/// construct `RefPicListTemp0` per spec 8.3.2.
 ///
 /// The temp list is built by concatenating (in order) the POCs in
 /// `st_curr_before`, `st_curr_after`, and `lt_curr`, repeating the
@@ -383,7 +332,7 @@ pub fn build_ref_pic_list_temp0(
     )
 }
 
-/// Phase 3d-2: construct `RefPicListTemp1` per spec 8.3.2.
+/// construct `RefPicListTemp1` per spec 8.3.2.
 ///
 /// Same as `build_ref_pic_list_temp0` but with `st_curr_after` visited
 /// **before** `st_curr_before` — for B-slice L1 construction.
@@ -428,7 +377,7 @@ fn build_ref_pic_list_temp(sub_lists: &[&Vec<i32>], target_len: usize) -> Vec<i3
     out
 }
 
-/// Phase 3d-2: apply `ref_pic_list_modification()` to a temp list to
+/// apply `ref_pic_list_modification()` to a temp list to
 /// produce `RefPicList{0,1}` (spec 8.3.2 eq. 8-8 / 8-10). When the
 /// modification flag is false, returns the first `num_active` entries of
 /// the temp list unchanged. When true, the i-th output entry is
@@ -466,7 +415,7 @@ pub fn apply_ref_pic_list_modification(
     Ok(out)
 }
 
-/// Phase 3d-2: resolve a list of reference-picture POCs to actual DPB
+/// resolve a list of reference-picture POCs to actual DPB
 /// entries. Each POC in the list must be present in the DPB; an
 /// unresolved POC is a hard error. Matches FFmpeg's `find_ref_idx`
 /// behavior when no "generate missing ref" fallback is required.
@@ -544,6 +493,44 @@ mod tests {
         assert_eq!(pic.reference_status(), PictureReferenceStatus::LongTerm);
         pic.mark(PictureReferenceStatus::UnusedForReference);
         assert!(!pic.is_reference());
+    }
+
+    /// Cleanup keeps the remaining pictures in insertion order and hands
+    /// back exactly the removed ones.
+    #[test]
+    fn cleanup_keeps_order_and_returns_removed() {
+        let pic = |poc: i32, referenced: bool, output: bool| {
+            let p = Rc::new(DecodedPicture::new(
+                PixelData::U8(vec![]),
+                PixelData::U8(vec![]),
+                PixelData::U8(vec![]),
+                0,
+                0,
+                poc,
+            ));
+            if !referenced {
+                p.mark(PictureReferenceStatus::UnusedForReference);
+            }
+            *p.output.borrow_mut() = output;
+            p
+        };
+        let mut dpb = DecodedPictureBuffer::new();
+        // Removable: unused for reference and output (POC 1 and 3).
+        for (poc, r, o) in [
+            (0, true, true),
+            (1, false, true),
+            (2, false, false),
+            (3, false, true),
+            (4, true, false),
+        ] {
+            dpb.insert(pic(poc, r, o));
+        }
+        let mut removed: Vec<i32> = dpb.cleanup_unused().map(|p| p.poc).collect();
+        removed.sort();
+        assert_eq!(removed, vec![1, 3]);
+        let kept: Vec<i32> = dpb.pictures().iter().map(|p| p.poc).collect();
+        assert_eq!(kept, vec![0, 2, 4]);
+        assert_eq!(dpb.cleanup_unused().count(), 0);
     }
 
     #[test]

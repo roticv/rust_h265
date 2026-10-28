@@ -1189,7 +1189,6 @@ impl Decoder {
                 let sps_for_rps = self.sps.as_ref().expect("sps present");
                 let sps_st_rps = sps_for_rps.st_ref_pic_sets.clone();
                 let log2_max_poc_lsb = sps_for_rps.log2_max_pic_order_cnt_lsb;
-                self.dpb.configure_from_sps(sps_for_rps);
                 let mut rps =
                     Self::derive_rps_from_slice_header_parts(&sh, &sps_st_rps, log2_max_poc_lsb);
                 Self::apply_rps_marking(&mut rps, &self.dpb, log2_max_poc_lsb);
@@ -1591,12 +1590,6 @@ impl Decoder {
         // The borrows `sps` / `pps` / `tile_tables` / `last_sh` are no
         // longer used beyond this point — NLL will release them here so
         // we can take mutable borrows of `self.*` below.
-
-        // Phase 3d-1: configure DPB from the active SPS (idempotent).
-        {
-            let sps_for_dpb = self.sps.as_ref().expect("sps still present after decode");
-            self.dpb.configure_from_sps(sps_for_dpb);
-        }
 
         let nut_for_tid0 = last_sh_cloned.nal_unit_type;
         let is_tid0 = last_sh_cloned.temporal_id == 0
