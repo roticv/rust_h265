@@ -200,8 +200,8 @@ fn put_weighted<P: Pixel>(
 /// Locates the reference window with `ref_window` (the block plus
 /// `N/2 - 1` samples before and `N/2` after on each axis with a fractional
 /// phase), interpolates the block into the spec's 14-bit intermediate
-/// domain (`predSamplesLX`, spec 8.5.3.3.3), and hands each finished row to
-/// `emit(j, row)`. `pos` is `(x_int, y_int, x_frac, y_frac)`.
+/// domain (`predSamplesLX`, spec 8.5.3.3.3), one row at a time through
+/// `sink`. `pos` is `(x_int, y_int, x_frac, y_frac)`.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn mc_block<P: Pixel, const N: usize>(
@@ -216,7 +216,7 @@ fn mc_block<P: Pixel, const N: usize>(
     bit_depth: u8,
     tmp: &mut [i32],
     edge: &mut [P],
-    emit: impl FnMut(usize, &[i32]),
+    sink: &mut impl RowSink,
 ) {
     let (x_int, y_int, x_frac, y_frac) = pos;
     let (before, after) = ((N / 2 - 1) as i32, (N / 2) as i32);
@@ -236,7 +236,7 @@ fn mc_block<P: Pixel, const N: usize>(
     );
     let hf = (x_frac != 0).then(|| &filters[x_frac]);
     let vf = (y_frac != 0).then(|| &filters[y_frac]);
-    interp_block::<P, N>(src, src_stride, org, w, h, hf, vf, bit_depth, tmp, emit);
+    interp_block::<P, N>(src, src_stride, org, w, h, hf, vf, bit_depth, tmp, sink);
 }
 
 /// Interpolate a `w × h` block into 14-bit intermediate samples, one row at
@@ -262,32 +262,32 @@ fn interp_block<P: Pixel, const N: usize>(
     vf: Option<&[i16; N]>,
     bit_depth: u8,
     tmp: &mut [i32],
-    mut emit: impl FnMut(usize, &[i32]),
+    sink: &mut impl RowSink,
 ) {
     let shift1 = (bit_depth as u32).saturating_sub(8);
-    let mut row_buf = [0i32; MAX_PB_SIZE];
-    let row = &mut row_buf[..w];
     match (hf, vf) {
         (None, None) => {
             let shift3 = crate::pixel::mc_shift(bit_depth) as u32;
             for j in 0..h {
                 let s = &src[org + j * src_stride..][..w];
-                for (o, &p) in row.iter_mut().zip(s) {
+                for (o, &p) in sink.row(j, w).iter_mut().zip(s) {
                     *o = p.to_i32() << shift3;
                 }
-                emit(j, row);
+                sink.done(j);
             }
         }
         (Some(f), None) => {
             for j in 0..h {
+                let row = sink.row(j, w);
                 filter_h(row, &src[org + j * src_stride..][..w + N - 1], f, shift1);
-                emit(j, row);
+                sink.done(j);
             }
         }
         (None, Some(f)) => {
             for j in 0..h {
+                let row = sink.row(j, w);
                 filter_v_px(row, src, org + j * src_stride, src_stride, f, shift1);
-                emit(j, row);
+                sink.done(j);
             }
         }
         (Some(fh), Some(fv)) => {
@@ -301,8 +301,9 @@ fn interp_block<P: Pixel, const N: usize>(
                 );
             }
             for j in 0..h {
+                let row = sink.row(j, w);
                 filter_v_i32(row, tmp, j * MAX_PB_SIZE, MAX_PB_SIZE, fv, 6);
-                emit(j, row);
+                sink.done(j);
             }
         }
     }
@@ -406,21 +407,72 @@ fn filter_v_i32<const N: usize>(
     }
 }
 
-/// Write one row of 14-bit intermediates to pixels:
-/// `dst[start + i] = clip((row[i] + offset) >> shift)`. A row that would
-/// fall outside `dst` is skipped rather than panicking on malformed input.
-#[inline(always)]
-fn emit_pixels<P: Pixel>(
-    dst: &mut [P],
-    start: usize,
-    row: &[i32],
+/// Destination for the rows `interp_block` produces. `row(j, w)` gives the
+/// buffer to write row `j` into; `done(j)` is called once it is complete.
+trait RowSink {
+    fn row(&mut self, j: usize, w: usize) -> &mut [i32];
+    fn done(&mut self, j: usize);
+}
+
+/// Writes 14-bit intermediates straight into a block of i32s
+/// (bi-prediction and weighted-prediction inputs), with no extra copy.
+struct I32Sink<'a> {
+    dst: &'a mut [i32],
+    stride: usize,
+}
+
+impl RowSink for I32Sink<'_> {
+    #[inline(always)]
+    fn row(&mut self, j: usize, w: usize) -> &mut [i32] {
+        &mut self.dst[j * self.stride..][..w]
+    }
+    #[inline(always)]
+    fn done(&mut self, _j: usize) {}
+}
+
+/// Rounds each row of 14-bit intermediates to pixels:
+/// `dst[j * stride + i] = clip((row[i] + offset) >> shift)`. A row that
+/// would fall outside `dst` is skipped rather than panicking on malformed
+/// input.
+struct PixelSink<'a, P: Pixel> {
+    dst: &'a mut [P],
+    stride: usize,
     offset: i32,
     shift: i32,
     bit_depth: u8,
-) {
-    if let Some(d) = dst.get_mut(start..start + row.len()) {
-        for (o, &v) in d.iter_mut().zip(row) {
-            *o = P::from_i32_clamped((v + offset) >> shift, bit_depth);
+    buf: [i32; MAX_PB_SIZE],
+    w: usize,
+}
+
+impl<'a, P: Pixel> PixelSink<'a, P> {
+    #[inline(always)]
+    fn new(dst: &'a mut [P], stride: usize, offset: i32, shift: i32, bit_depth: u8) -> Self {
+        Self {
+            dst,
+            stride,
+            offset,
+            shift,
+            bit_depth,
+            buf: [0; MAX_PB_SIZE],
+            w: 0,
+        }
+    }
+}
+
+impl<P: Pixel> RowSink for PixelSink<'_, P> {
+    #[inline(always)]
+    fn row(&mut self, _j: usize, w: usize) -> &mut [i32] {
+        self.w = w;
+        &mut self.buf[..w]
+    }
+    #[inline(always)]
+    fn done(&mut self, j: usize) {
+        let start = j * self.stride;
+        let (offset, shift, bd) = (self.offset, self.shift, self.bit_depth);
+        if let Some(d) = self.dst.get_mut(start..start + self.w) {
+            for (o, &v) in d.iter_mut().zip(&self.buf[..self.w]) {
+                *o = P::from_i32_clamped((v + offset) >> shift, bd);
+            }
         }
     }
 }
@@ -535,7 +587,7 @@ pub fn mc_luma<P: Pixel>(
         bit_depth,
         tmp,
         edge,
-        |j, row| emit_pixels(dst, j * dst_stride, row, offset, shift, bit_depth),
+        &mut PixelSink::new(dst, dst_stride, offset, shift, bit_depth),
     );
 }
 
@@ -585,7 +637,10 @@ pub fn mc_luma_i32<P: Pixel>(
         bit_depth,
         tmp,
         edge,
-        |j, row| dst[j * dst_stride..][..row.len()].copy_from_slice(row),
+        &mut I32Sink {
+            dst,
+            stride: dst_stride,
+        },
     );
 }
 
@@ -627,7 +682,10 @@ pub fn mc_chroma_i32<P: Pixel>(
         bit_depth,
         tmp,
         edge,
-        |j, row| dst[j * dst_stride..][..row.len()].copy_from_slice(row),
+        &mut I32Sink {
+            dst,
+            stride: dst_stride,
+        },
     );
 }
 
@@ -675,7 +733,7 @@ pub fn mc_chroma<P: Pixel>(
         bit_depth,
         tmp,
         edge,
-        |j, row| emit_pixels(dst, j * dst_stride, row, offset, shift, bit_depth),
+        &mut PixelSink::new(dst, dst_stride, offset, shift, bit_depth),
     );
 }
 
