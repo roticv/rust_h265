@@ -171,6 +171,12 @@ impl Pps {
     }
 }
 
+/// `pps_pic_parameter_set_id` of a PPS, for remembering a rejected PPS
+/// under its ID.
+pub fn peek_pps_id(rbsp: &[u8]) -> Option<u32> {
+    BitstreamReader::new(rbsp).read_ue().ok()
+}
+
 pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
     let mut r = BitstreamReader::new(rbsp);
 
@@ -275,9 +281,39 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
     let log2_parallel_merge_level_minus2 = r.read_ue()?;
     let slice_segment_header_extension_present_flag = r.read_bit()? == 1;
 
-    // pps_extension_present_flag and any extensions follow — Phase 1 stops
-    // here. The next NAL start code bounds the PPS.
-    let _pps_extension_present_flag = r.read_bit()?;
+    // PPS extensions (spec 7.3.2.3.1). Range-extension tools this decoder
+    // does not implement are rejected instead of being silently ignored.
+    if r.read_bit()? == 1 {
+        let range = r.read_bit()? == 1;
+        let _multilayer = r.read_bit()?;
+        let _3d = r.read_bit()?;
+        let scc = r.read_bit()? == 1;
+        let _extension_4bits = r.read_bits(4)?;
+        if range {
+            // pps_range_extension() (spec 7.3.2.3.2).
+            if transform_skip_enabled_flag && r.read_ue()? != 0 {
+                return Err(DecodeError::Unsupported(
+                    "log2_max_transform_skip_block_size_minus2 > 0",
+                ));
+            }
+            if r.read_bit()? == 1 {
+                return Err(DecodeError::Unsupported(
+                    "cross_component_prediction_enabled_flag",
+                ));
+            }
+            if r.read_bit()? == 1 {
+                return Err(DecodeError::Unsupported(
+                    "chroma_qp_offset_list_enabled_flag",
+                ));
+            }
+            if r.read_ue()? != 0 || r.read_ue()? != 0 {
+                return Err(DecodeError::Unsupported("log2_sao_offset_scale > 0"));
+            }
+        }
+        if scc {
+            return Err(DecodeError::Unsupported("screen content coding extension"));
+        }
+    }
 
     Ok(Pps {
         pps_pic_parameter_set_id,

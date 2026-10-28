@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DecodeError` now implements `Clone`, `PartialEq` and `Eq`.
 - **Display-order output:** `Decoder::new().with_display_order()` runs the
   spec C.5.2 output process ("bumping") inside the decoder. Frames are
   released in display order through the new `Decoder::next_output()` as
@@ -21,6 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Streams using unimplemented coding tools were decoded wrongly without
+  an error.** The SPS and PPS range extensions were never parsed, so a
+  stream that enabled, for example, cross-component prediction or RDPCM
+  decoded as if the tool were off. The SPS VUI and HRD parameters are now
+  skipped to reach the SPS extension, and any enabled range-extension tool
+  or screen content coding is rejected with `DecodeError::Unsupported`
+  naming it, at the parameter set and at each slice that uses it. A
+  rejected SPS or PPS also replaces an earlier one with the same ID, so
+  later slices do not decode with a stale parameter set. On the 8-bit and
+  10-bit JCT-VC RExt vectors this turns 18 wrong outputs into errors.
+- **Bit depths above 12 are rejected** with `DecodeError::Unsupported`.
+  14- and 16-bit streams were accepted, but motion compensation shifts
+  underflow above 13 bits (found by fuzzing).
 - **One bad slice no longer stops decoding.** A picture whose slices
   failed or were lost stayed "in progress", and every later picture was
   rejected with "new first slice segment arrived while previous picture

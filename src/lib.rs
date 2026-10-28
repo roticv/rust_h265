@@ -2,8 +2,13 @@
 //!
 //! Decodes Main and Main 10 profile HEVC bitstreams (8-bit and 10-bit
 //! 4:2:0) and 4:4:4 streams (8-bit and 10-bit, intra and inter, as used by
-//! HEIF/HEIC images). 4:2:2 and monochrome streams are rejected with
-//! [`DecodeError::Unsupported`]. Input can be Annex B (start-code delimited,
+//! HEIF/HEIC images). 12-bit streams decode but are lightly tested.
+//! Streams the decoder cannot decode correctly are rejected with
+//! [`DecodeError::Unsupported`] instead of being decoded wrongly: 4:2:2 and
+//! monochrome, bit depths above 12, and the range-extension coding tools
+//! (cross-component prediction, RDPCM, transform-skip rotation and context,
+//! extended precision, persistent Rice adaptation, CABAC bypass alignment,
+//! chroma QP offset lists and others) as well as screen content coding. Input can be Annex B (start-code delimited,
 //! `.h265` files) via [`parse_annex_b`], length-prefixed NAL units from
 //! MP4/MKV containers via [`parse_hvcc`], or single NAL units via
 //! [`parse_nal`].

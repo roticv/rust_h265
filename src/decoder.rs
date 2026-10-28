@@ -361,8 +361,11 @@ pub struct Decoder {
     /// Parameter sets received so far, indexed by their IDs (up to 16 SPSs
     /// and 64 PPSs). `sps` / `pps` hold the active pair, activated from
     /// these tables at the first slice of each picture.
-    sps_table: Vec<Option<Sps>>,
-    pps_table: Vec<Option<Pps>>,
+    /// A set that failed to parse (e.g. it enables an unsupported coding
+    /// tool) is kept as its error, so slices using that ID report it
+    /// instead of decoding with an older set of the same ID.
+    sps_table: Vec<Option<Result<Sps, DecodeError>>>,
+    pps_table: Vec<Option<Result<Pps, DecodeError>>>,
     /// IDs of the active SPS / PPS, and whether a parameter set arrived
     /// since they were activated.
     active_sps_id: Option<u32>,
@@ -735,31 +738,53 @@ impl Decoder {
                 Ok(None)
             }
             NalUnitType::Sps => {
-                let new_sps = parse_sps(&nal.rbsp)?;
-                self.validate_picture_limits(&new_sps)?;
-                let id = new_sps.sps_seq_parameter_set_id as usize;
-                if id > 15 {
-                    return Err(DecodeError::InvalidSyntax("sps_seq_parameter_set_id > 15"));
-                }
+                let parsed = parse_sps(&nal.rbsp).and_then(|sps| {
+                    self.validate_picture_limits(&sps)?;
+                    Ok(sps)
+                });
+                let id = match &parsed {
+                    Ok(sps) => Some(sps.sps_seq_parameter_set_id),
+                    Err(_) => crate::sps::peek_sps_id(&nal.rbsp),
+                };
+                let err = parsed.as_ref().err().cloned();
+                let id = match id {
+                    Some(id) if id <= 15 => id as usize,
+                    _ => {
+                        return Err(err.unwrap_or(DecodeError::InvalidSyntax(
+                            "sps_seq_parameter_set_id > 15",
+                        )));
+                    }
+                };
                 if self.sps_table.len() <= id {
                     self.sps_table.resize(id + 1, None);
                 }
-                self.sps_table[id] = Some(new_sps);
+                // A rejected SPS replaces any earlier one with its ID.
+                self.sps_table[id] = Some(parsed);
                 self.parameter_sets_changed = true;
-                Ok(None)
+                err.map_or(Ok(None), Err)
             }
             NalUnitType::Pps => {
-                let new_pps = parse_pps(&nal.rbsp)?;
-                let id = new_pps.pps_pic_parameter_set_id as usize;
-                if id > 63 {
-                    return Err(DecodeError::InvalidSyntax("pps_pic_parameter_set_id > 63"));
-                }
+                let parsed = parse_pps(&nal.rbsp);
+                let id = match &parsed {
+                    Ok(pps) => Some(pps.pps_pic_parameter_set_id),
+                    Err(_) => crate::pps::peek_pps_id(&nal.rbsp),
+                };
+                let err = parsed.as_ref().err().cloned();
+                let id = match id {
+                    Some(id) if id <= 63 => id as usize,
+                    _ => {
+                        return Err(err.unwrap_or(DecodeError::InvalidSyntax(
+                            "pps_pic_parameter_set_id > 63",
+                        )));
+                    }
+                };
                 if self.pps_table.len() <= id {
                     self.pps_table.resize(id + 1, None);
                 }
-                self.pps_table[id] = Some(new_pps);
+                // A rejected PPS replaces any earlier one with its ID.
+                self.pps_table[id] = Some(parsed);
                 self.parameter_sets_changed = true;
-                Ok(None)
+                err.map_or(Ok(None), Err)
             }
             NalUnitType::Eos => {
                 // End of sequence: the next picture must be an IRAP and
@@ -1761,19 +1786,17 @@ impl Decoder {
         if !self.parameter_sets_changed && self.active_pps_id == Some(pps_id) {
             return Ok(());
         }
-        let pps = self
-            .pps_table
-            .get(pps_id as usize)
-            .and_then(Option::as_ref)
-            .ok_or(DecodeError::InvalidSyntax("slice refers to a missing PPS"))?
-            .clone();
+        let pps = match self.pps_table.get(pps_id as usize).and_then(Option::as_ref) {
+            Some(Ok(pps)) => pps.clone(),
+            Some(Err(e)) => return Err(e.clone()),
+            None => return Err(DecodeError::InvalidSyntax("slice refers to a missing PPS")),
+        };
         let sps_id = pps.pps_seq_parameter_set_id;
-        let sps = self
-            .sps_table
-            .get(sps_id as usize)
-            .and_then(Option::as_ref)
-            .ok_or(DecodeError::InvalidSyntax("PPS refers to a missing SPS"))?
-            .clone();
+        let sps = match self.sps_table.get(sps_id as usize).and_then(Option::as_ref) {
+            Some(Ok(sps)) => sps.clone(),
+            Some(Err(e)) => return Err(e.clone()),
+            None => return Err(DecodeError::InvalidSyntax("PPS refers to a missing SPS")),
+        };
         // A bit-depth change invalidates every picture in the DPB.
         let bit_depths = |s: &Sps| (s.bit_depth_luma, s.bit_depth_chroma);
         let old_bd = self.sps.as_ref().map(bit_depths);
@@ -4546,6 +4569,72 @@ mod tests {
         }
     }
 
+    /// Frames decoded from `data` and every error returned on the way.
+    fn decode_collect_errors(data: &[u8]) -> (usize, Vec<DecodeError>) {
+        let mut dec = Decoder::new();
+        let (mut frames, mut errors) = (0, Vec::new());
+        for nal in parse_annex_b(data) {
+            match dec.decode_nal(&nal) {
+                Ok(Some(_)) => frames += 1,
+                Ok(None) => {}
+                Err(e) => errors.push(e),
+            }
+        }
+        frames += std::iter::from_fn(|| dec.flush()).count();
+        (frames, errors)
+    }
+
+    /// Range-extension coding tools the decoder does not implement are
+    /// rejected with `Unsupported`, at the parameter set and at every slice
+    /// that uses it, instead of being decoded as if they were off.
+    ///
+    /// Fixtures: HM `TAppEncoder`, 64x64 4:4:4 8-bit, one intra frame,
+    /// `Profile main_444`, `TransformSkip 1`, CTU 32, QP 30, plus
+    /// `ImplicitResidualDPCM 1` (an SPS range-extension flag) or
+    /// `CrossComponentPrediction 1` (a PPS range-extension flag).
+    #[test]
+    fn test_unimplemented_range_extension_tools_rejected() {
+        for (name, tool) in [
+            (
+                "rext_implicit_rdpcm_hm_444_64x64.h265",
+                "implicit_rdpcm_enabled_flag",
+            ),
+            (
+                "rext_ccp_hm_444_64x64.h265",
+                "cross_component_prediction_enabled_flag",
+            ),
+        ] {
+            let (frames, errors) = decode_collect_errors(&read_fixture(name));
+            assert_eq!(frames, 0, "{name}: decoded with {tool} ignored");
+            // The parameter set and the slice both report it.
+            assert!(errors.len() >= 2, "{name}: errors {errors:?}");
+            assert!(
+                errors.iter().all(|e| *e == DecodeError::Unsupported(tool)),
+                "{name}: errors {errors:?}"
+            );
+        }
+    }
+
+    /// A rejected SPS replaces an earlier SPS with the same ID: the slices
+    /// that follow it fail instead of decoding with the stale SPS.
+    #[test]
+    fn test_rejected_sps_replaces_same_id() {
+        let good = read_fixture("intra444_96x96.h265");
+        let (good_frames, good_errors) = decode_collect_errors(&good);
+        assert!(good_errors.is_empty());
+        let mut data = good.clone();
+        data.extend_from_slice(&read_fixture("rext_implicit_rdpcm_hm_444_64x64.h265"));
+        let (frames, errors) = decode_collect_errors(&data);
+        assert_eq!(frames, good_frames);
+        assert!(!errors.is_empty());
+        assert!(
+            errors
+                .iter()
+                .all(|e| *e == DecodeError::Unsupported("implicit_rdpcm_enabled_flag")),
+            "errors {errors:?}"
+        );
+    }
+
     #[test]
     fn test_decode_10bit_hash() {
         let hash = decode_and_hash("10bit_128x128.h265", 3);
@@ -4811,6 +4900,17 @@ mod tests {
         fuzz_single_nal(&[
             97, 20, 0, 0, 0, 64, 0, 235, 0, 0, 178, 0, 0, 178, 178, 0, 0, 64, 0, 235, 0, 0, 178, 0,
             0, 178, 178, 0, 0, 0, 64, 0, 235, 0, 0, 178, 178, 178, 0, 0, 20, 165,
+        ]);
+    }
+
+    /// 14- or 16-bit samples: the motion compensation shift `14 - BitDepth`
+    /// underflowed (crash-9d8c35f4). Bit depths above 12 are now rejected.
+    #[test]
+    fn test_fuzz_bit_depth_above_12_rejected() {
+        fuzz_single_nal(&[
+            34, 220, 225, 255, 193, 9, 0, 0, 1, 67, 98, 1, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 34, 34,
+            162, 34, 58, 34, 0, 197, 146, 73, 36, 238, 146, 171, 225, 255, 0, 0, 1, 0, 1, 255, 255,
+            255, 67, 255,
         ]);
     }
 

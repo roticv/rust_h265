@@ -36,3 +36,12 @@ is updated as failures are fixed.
 | 2026-10-28 | 121 / 147 | pic_output_flag; weighted bi-prediction and 10-bit offsets; 10-bit QP range; lossless/PCM loop-filter protection and PCM CU edges; per-slice deblocking offsets and disable; raster slice addresses with tiles; tile-start context/QP resets; spec slice-boundary rules for mixed across-slice flags. |
 | 2026-10-28 | 143 / 147 | SPS/PPS stored by ID and activated per picture; per-sample constrained intra prediction; single merge candidate list at the CU origin; SAO diagonal-CTB availability; MV sum wraps modulo 2^16; cu_qp_delta predicted from the CU origin (also fixed WPP_A/D/E/F); deblocking compares references through each slice's own lists; different luma and chroma bit depths. |
 | 2026-10-28 | 147 / 147 | Display-order output (`Decoder::with_display_order`, spec C.5.2 bumping and NoOutputOfPriorPicsFlag), used by `dump_frames`: BUMPING_A, NoOutPrior_A/B, RAP_B. |
+
+JCT-VC-RExt (49 vectors, range extensions): only the 4:2:0 general vectors
+are expected to pass. Every other vector enables a range-extension tool,
+uses 4:2:2 or monochrome, or is deeper than 12 bits, and is rejected with
+`Unsupported`.
+
+| Date | Pass | Notes |
+|---|---:|---|
+| 2026-10-28 | 3 / 34 (8-, 10-, 12-bit) | GENERAL_8b_420, GENERAL_10b_420 and GENERAL_12b_420 pass. The rest enable RExt tools and are rejected; FFmpeg passes 14 of the 8- and 10-bit ones. |

@@ -536,6 +536,186 @@ fn validate_transform_hierarchy_depths(
     Ok(())
 }
 
+/// `sps_seq_parameter_set_id` of an SPS, for remembering a rejected SPS
+/// under its ID.
+pub fn peek_sps_id(rbsp: &[u8]) -> Option<u32> {
+    let mut r = BitstreamReader::new(rbsp);
+    r.read_bits(4).ok()?;
+    let max_sub_layers_minus1 = r.read_bits(3).ok()? as u8;
+    if max_sub_layers_minus1 > 6 {
+        return None;
+    }
+    r.read_bit().ok()?;
+    parse_profile_tier_level(&mut r, max_sub_layers_minus1).ok()?;
+    r.read_ue().ok()
+}
+
+/// Skip `vui_parameters()` (spec E.2.1) and read the SPS extension flags.
+/// Returns the name of the first enabled coding tool that this decoder does
+/// not implement, if any.
+fn parse_vui_and_extensions(
+    r: &mut BitstreamReader,
+    max_sub_layers_minus1: u8,
+) -> Result<Option<&'static str>, DecodeError> {
+    if r.read_bit()? == 1 {
+        skip_vui(r, max_sub_layers_minus1)?;
+    }
+    if r.read_bit()? == 0 {
+        return Ok(None); // sps_extension_present_flag
+    }
+    let range = r.read_bit()? == 1;
+    let _multilayer = r.read_bit()?;
+    let _3d = r.read_bit()?;
+    let scc = r.read_bit()? == 1;
+    let _extension_4bits = r.read_bits(4)?;
+    if range {
+        // sps_range_extension() (spec 7.3.2.2.2), in syntax order.
+        const TOOLS: [&str; 9] = [
+            "transform_skip_rotation_enabled_flag",
+            "transform_skip_context_enabled_flag",
+            "implicit_rdpcm_enabled_flag",
+            "explicit_rdpcm_enabled_flag",
+            "extended_precision_processing_flag",
+            "intra_smoothing_disabled_flag",
+            "high_precision_offsets_enabled_flag",
+            "persistent_rice_adaptation_enabled_flag",
+            "cabac_bypass_alignment_enabled_flag",
+        ];
+        let mut first = None;
+        for tool in TOOLS {
+            if r.read_bit()? == 1 && first.is_none() {
+                first = Some(tool);
+            }
+        }
+        if first.is_some() {
+            return Ok(first);
+        }
+    }
+    // The multilayer and 3D extensions only carry constraints for layers
+    // above the base layer, which is all this decoder decodes; their data
+    // follows the range extension and needs no parsing.
+    if scc {
+        return Ok(Some("screen content coding extension"));
+    }
+    Ok(None)
+}
+
+/// Skip `vui_parameters()` (spec E.2.1).
+fn skip_vui(r: &mut BitstreamReader, max_sub_layers_minus1: u8) -> Result<(), DecodeError> {
+    if r.read_bit()? == 1 {
+        // aspect_ratio_idc; EXTENDED_SAR adds sar_width / sar_height.
+        if r.read_bits(8)? == 255 {
+            r.read_bits(16)?;
+            r.read_bits(16)?;
+        }
+    }
+    if r.read_bit()? == 1 {
+        r.read_bit()?; // overscan_appropriate_flag
+    }
+    if r.read_bit()? == 1 {
+        // video_format, video_full_range_flag
+        r.read_bits(4)?;
+        if r.read_bit()? == 1 {
+            // colour_primaries, transfer_characteristics, matrix_coeffs
+            r.read_bits(24)?;
+        }
+    }
+    if r.read_bit()? == 1 {
+        r.read_ue()?; // chroma_sample_loc_type_top_field
+        r.read_ue()?; // chroma_sample_loc_type_bottom_field
+    }
+    // neutral_chroma_indication_flag, field_seq_flag,
+    // frame_field_info_present_flag
+    r.read_bits(3)?;
+    if r.read_bit()? == 1 {
+        for _ in 0..4 {
+            r.read_ue()?; // default display window offsets
+        }
+    }
+    if r.read_bit()? == 1 {
+        // vui_num_units_in_tick, vui_time_scale
+        r.read_bits(32)?;
+        r.read_bits(32)?;
+        if r.read_bit()? == 1 {
+            r.read_ue()?; // vui_num_ticks_poc_diff_one_minus1
+        }
+        if r.read_bit()? == 1 {
+            skip_hrd_parameters(r, true, max_sub_layers_minus1)?;
+        }
+    }
+    if r.read_bit()? == 1 {
+        // tiles_fixed_structure_flag, motion_vectors_over_pic_boundaries_flag,
+        // restricted_ref_pic_lists_flag
+        r.read_bits(3)?;
+        for _ in 0..5 {
+            // min_spatial_segmentation_idc, max_bytes_per_pic_denom,
+            // max_bits_per_min_cu_denom, log2_max_mv_length_horizontal,
+            // log2_max_mv_length_vertical
+            r.read_ue()?;
+        }
+    }
+    Ok(())
+}
+
+/// Skip `hrd_parameters()` (spec E.2.2).
+fn skip_hrd_parameters(
+    r: &mut BitstreamReader,
+    common_inf_present: bool,
+    max_sub_layers_minus1: u8,
+) -> Result<(), DecodeError> {
+    let (mut nal_hrd, mut vcl_hrd, mut sub_pic) = (false, false, false);
+    if common_inf_present {
+        nal_hrd = r.read_bit()? == 1;
+        vcl_hrd = r.read_bit()? == 1;
+        if nal_hrd || vcl_hrd {
+            sub_pic = r.read_bit()? == 1;
+            if sub_pic {
+                // tick_divisor_minus2 (8), du_cpb_removal_delay_increment_
+                // length_minus1 (5), sub_pic_cpb_params_in_pic_timing_sei_flag
+                // (1), dpb_output_delay_du_length_minus1 (5)
+                r.read_bits(19)?;
+            }
+            r.read_bits(8)?; // bit_rate_scale, cpb_size_scale
+            if sub_pic {
+                r.read_bits(4)?; // cpb_size_du_scale
+            }
+            // initial_cpb_removal_delay_length_minus1,
+            // au_cpb_removal_delay_length_minus1, dpb_output_delay_length_minus1
+            r.read_bits(15)?;
+        }
+    }
+    for _ in 0..=max_sub_layers_minus1 {
+        let fixed_general = r.read_bit()? == 1;
+        let fixed_within_cvs = fixed_general || r.read_bit()? == 1;
+        let mut low_delay = false;
+        if fixed_within_cvs {
+            r.read_ue()?; // elemental_duration_in_tc_minus1
+        } else {
+            low_delay = r.read_bit()? == 1;
+        }
+        let cpb_cnt = if low_delay { 1 } else { r.read_ue()? + 1 };
+        if cpb_cnt > 32 {
+            return Err(DecodeError::InvalidSyntax("cpb_cnt_minus1 out of range"));
+        }
+        for present in [nal_hrd, vcl_hrd] {
+            if !present {
+                continue;
+            }
+            // sub_layer_hrd_parameters()
+            for _ in 0..cpb_cnt {
+                r.read_ue()?; // bit_rate_value_minus1
+                r.read_ue()?; // cpb_size_value_minus1
+                if sub_pic {
+                    r.read_ue()?; // cpb_size_du_value_minus1
+                    r.read_ue()?; // bit_rate_du_value_minus1
+                }
+                r.read_bit()?; // cbr_flag
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     let mut r = BitstreamReader::new(rbsp);
 
@@ -620,8 +800,11 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
 
     let bit_depth_luma_minus8 = r.read_ue()?;
     let bit_depth_chroma_minus8 = r.read_ue()?;
-    if bit_depth_luma_minus8 > 8 || bit_depth_chroma_minus8 > 8 {
-        return Err(DecodeError::Unsupported("bit depth > 16 not supported"));
+    // Up to 12 bits are implemented. Deeper samples need extended
+    // precision arithmetic (motion compensation shifts of 14 - BitDepth
+    // would go negative), which this decoder does not do.
+    if bit_depth_luma_minus8 > 4 || bit_depth_chroma_minus8 > 4 {
+        return Err(DecodeError::Unsupported("bit depth > 12"));
     }
     let bit_depth_luma = 8 + bit_depth_luma_minus8 as u8;
     let bit_depth_chroma = 8 + bit_depth_chroma_minus8 as u8;
@@ -796,8 +979,23 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     let sps_temporal_mvp_enabled_flag = r.read_bit()? == 1;
     let strong_intra_smoothing_enabled_flag = r.read_bit()? == 1;
 
-    // VUI and SPS extensions follow but we deliberately stop here — we don't
-    // need them for Phase 1, and parsing them in full is a separate task.
+    // VUI, then the SPS extensions (spec 7.3.2.2.1). Only the range
+    // extension's tool flags matter: coding tools this decoder does not
+    // implement are rejected instead of being silently ignored.
+    match parse_vui_and_extensions(&mut r, sps_max_sub_layers_minus1) {
+        Ok(None) => {}
+        Ok(Some(tool)) => return Err(DecodeError::Unsupported(tool)),
+        // A Main, Main 10 or Main Still Picture SPS cannot enable extension
+        // tools, so a VUI this parser cannot follow is harmless there. For
+        // other profiles the tool flags are unknown: refuse rather than
+        // risk decoding with tools ignored.
+        Err(_) if ptl.general_profile_idc <= 3 => {}
+        Err(_) => {
+            return Err(DecodeError::Unsupported(
+                "SPS VUI / extension data could not be parsed",
+            ));
+        }
+    }
 
     Ok(Sps {
         sps_video_parameter_set_id,

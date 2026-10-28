@@ -6,7 +6,7 @@ use std::fmt;
 ///
 /// Non-exhaustive: new variants may be added in minor releases, so match
 /// with a wildcard arm.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DecodeError {
     /// Bitstream ended unexpectedly during parsing.
