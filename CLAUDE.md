@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 plus 4:4:4 (ChromaArrayType 3, 8-bit and 10-bit, intra and inter).** 4:2:2
 and monochrome are rejected at SPS parse. Byte-exact against FFmpeg on all
 in-tree fixtures plus 6 real-world Big Buck Bunny 1080p transcodes (8-bit and
-10-bit). 188 tests pass. No SIMD yet.
+10-bit). No SIMD yet.
 
 ## Build Commands
 
@@ -68,7 +68,7 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 
 ## Testing Strategy
 
-- 188 tests, all byte-exact against FFmpeg
+- All tests byte-exact against FFmpeg
 - Fixtures in `testdata/` (committed in-tree, < 1 MB each)
 - Large outputs (1080p, 10-bit) use SHA-256 hashes
 - `decode_and_hash()` helper handles both `PixelData::U8` and `PixelData::U16` (10-bit hashes as LE u16 bytes)
