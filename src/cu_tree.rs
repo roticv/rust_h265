@@ -1911,8 +1911,8 @@ fn decode_prediction_unit<P: Pixel>(
             );
             let mvp = mvp_list[mvp_l0_flag as usize];
             current_mv.mv[0] = Mv {
-                x: (mvp.x as i32 + mvd.x as i32).clamp(-32768, 32767) as i16,
-                y: (mvp.y as i32 + mvd.y as i32).clamp(-32768, 32767) as i16,
+                x: mvp.x.wrapping_add(mvd.x),
+                y: mvp.y.wrapping_add(mvd.y),
             };
         }
 
@@ -1942,8 +1942,8 @@ fn decode_prediction_unit<P: Pixel>(
             );
             let mvp = mvp_list[mvp_l1_flag as usize];
             current_mv.mv[1] = Mv {
-                x: (mvp.x as i32 + mvd.x as i32).clamp(-32768, 32767) as i16,
-                y: (mvp.y as i32 + mvd.y as i32).clamp(-32768, 32767) as i16,
+                x: mvp.x.wrapping_add(mvd.x),
+                y: mvp.y.wrapping_add(mvd.y),
             };
         }
     }
