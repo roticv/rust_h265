@@ -3944,6 +3944,8 @@ fn predict_intra_luma<P: Pixel>(
     let pic_w = state.width as usize;
     let pic_h = state.height as usize;
     let avail = compute_luma_avail_inner(state, x0, y0, size as u32, constrained_intra_pred_flag);
+    let cip = constrained_intra_pred_flag
+        .then(|| cip_masks(state, x0 as usize, y0 as usize, size, (0, 0)));
     let (mut top, mut left) = build_reference_samples(
         &state.y_plane,
         state.y_stride,
@@ -3954,6 +3956,7 @@ fn predict_intra_luma<P: Pixel>(
         log2_size,
         state.bit_depth,
         avail,
+        cip.as_ref().map(|(t, l)| (t.as_slice(), l.as_slice())),
     );
 
     // Reference sample filtering (spec 8.4.4.2.3). Applied for all non-DC
@@ -4145,7 +4148,7 @@ fn compute_luma_avail_inner<P: Pixel>(
     let left = cand_left && x0 > 0;
     let up_left = cand_up_left && x0 > 0 && y0 > 0;
 
-    let mut avail = ReferenceAvailability {
+    let avail = ReferenceAvailability {
         up_left,
         up,
         up_right,
@@ -4153,72 +4156,44 @@ fn compute_luma_avail_inner<P: Pixel>(
         bottom_left,
     };
 
-    // --- constrained_intra_pred enforcement (spec 8.4.4.2.2) ---
-    // When enabled, neighbor samples from inter-coded PUs are treated as
-    // unavailable. We check per-direction that ALL min-PU samples in that
-    // direction have pred_flag == 0 (intra). If any sample is inter, the
-    // entire direction is marked unavailable and the substitution process
-    // in build_reference_samples will fill it.
-    if constrained_intra_pred {
-        let log2_min_pu = state.log2_min_pu_size;
-        let min_pu_w = state.min_pu_width;
-        let tab_mvf = &state.tab_mvf;
-
-        // Helper: check if sample at (sx, sy) is intra (pred_flag == 0).
-        let is_intra_at = |sx: u32, sy: u32| -> bool {
-            let idx = (sy >> log2_min_pu) as usize * min_pu_w + (sx >> log2_min_pu) as usize;
-            tab_mvf.get(idx).is_some_and(|m| m.pred_flag == 0)
-        };
-
-        // Up-left corner: single sample at (x0-1, y0-1).
-        if avail.up_left && !is_intra_at(x0 - 1, y0 - 1) {
-            avail.up_left = false;
-        }
-
-        // Up: samples at (x0..x0+size-1, y0-1).
-        if avail.up {
-            for i in 0..size {
-                if !is_intra_at(x0 + i, y0 - 1) {
-                    avail.up = false;
-                    break;
-                }
-            }
-        }
-
-        // Up-right: samples at (x0+size..x0+2*size-1, y0-1), clamped to pic.
-        if avail.up_right {
-            let count = (pic_w.saturating_sub(x0 + size)).min(size);
-            for i in 0..count {
-                if !is_intra_at(x0 + size + i, y0 - 1) {
-                    avail.up_right = false;
-                    break;
-                }
-            }
-        }
-
-        // Left: samples at (x0-1, y0..y0+size-1).
-        if avail.left {
-            for i in 0..size {
-                if !is_intra_at(x0 - 1, y0 + i) {
-                    avail.left = false;
-                    break;
-                }
-            }
-        }
-
-        // Bottom-left: samples at (x0-1, y0+size..y0+2*size-1), clamped to pic.
-        if avail.bottom_left {
-            let count = (pic_h.saturating_sub(y0 + size)).min(size);
-            for i in 0..count {
-                if !is_intra_at(x0 - 1, y0 + size + i) {
-                    avail.bottom_left = false;
-                    break;
-                }
-            }
-        }
-    }
-
+    // constrained_intra_pred is applied per sample by the caller through
+    // `cip_masks` (spec 8.4.4.2.2 marks individual samples of non-intra
+    // blocks unavailable), not per direction here.
+    let _ = constrained_intra_pred;
     avail
+}
+
+/// Per-sample "from an intra block" flags for constrained intra prediction
+/// (spec 8.4.4.2.2): with constrained_intra_pred_flag, a reference sample in
+/// a non-intra CU is unavailable. Returns `(top, left)` in the layout of
+/// `build_reference_samples` (index 0 is the corner, then the top row
+/// rightwards / the left column downwards, 2 * size samples each). `x0`,
+/// `y0` are plane sample coordinates; `(sw, sh)` map them to luma.
+fn cip_masks<P: Pixel>(
+    state: &PictureState<P>,
+    x0: usize,
+    y0: usize,
+    size: usize,
+    (sw, sh): (u32, u32),
+) -> (Vec<bool>, Vec<bool>) {
+    let intra_at = |x: isize, y: isize| -> bool {
+        if x < 0 || y < 0 {
+            return false;
+        }
+        let (lx, ly) = ((x as usize) << sw, (y as usize) << sh);
+        let idx =
+            (ly >> state.log2_min_pu_size) * state.min_pu_width + (lx >> state.log2_min_pu_size);
+        state.tab_mvf.get(idx).is_some_and(|m| m.pred_flag == 0)
+    };
+    let (x0, y0) = (x0 as isize, y0 as isize);
+    let corner = intra_at(x0 - 1, y0 - 1);
+    let mut top = vec![corner; 2 * size + 1];
+    let mut left = vec![corner; 2 * size + 1];
+    for i in 0..2 * size {
+        top[1 + i] = intra_at(x0 + i as isize, y0 - 1);
+        left[1 + i] = intra_at(x0 - 1, y0 + i as isize);
+    }
+    (top, left)
 }
 
 /// Same as `predict_intra_luma` but for one chroma plane (Cb and Cr both
@@ -4250,6 +4225,15 @@ fn predict_intra_chroma<P: Pixel>(
         constrained_intra_pred_flag,
     );
     let dst_stride = state.uv_stride;
+    let cip = constrained_intra_pred_flag.then(|| {
+        cip_masks(
+            state,
+            x_c,
+            y_c,
+            size,
+            (state.chroma_shift_w, state.chroma_shift_h),
+        )
+    });
 
     for plane_idx in 0..2 {
         let c_idx = (plane_idx + 1) as u8; // 1 = Cb, 2 = Cr
@@ -4269,6 +4253,7 @@ fn predict_intra_chroma<P: Pixel>(
                 log2_size,
                 state.bit_depth,
                 avail,
+                cip.as_ref().map(|(t, l)| (t.as_slice(), l.as_slice())),
             )
         };
 

@@ -54,6 +54,7 @@ pub fn build_reference_samples<P: Pixel>(
     log2_size: u8,
     bit_depth: u8,
     avail: ReferenceAvailability,
+    intra_only: Option<(&[bool], &[bool])>,
 ) -> (Vec<P>, Vec<P>) {
     let size = 1usize << log2_size;
     let len = 2 * size + 1;
@@ -107,6 +108,16 @@ pub fn build_reference_samples<P: Pixel>(
         for i in 0..count {
             left[1 + size + i] = plane[(y0 + size + i) * stride + (x0 - 1)];
             left_avail[1 + size + i] = true;
+        }
+    }
+
+    // constrained_intra_pred: samples of non-intra blocks are unavailable.
+    if let Some((top_intra, left_intra)) = intra_only {
+        for (a, &ok) in top_avail.iter_mut().zip(top_intra) {
+            *a &= ok;
+        }
+        for (a, &ok) in left_avail.iter_mut().zip(left_intra) {
+            *a &= ok;
         }
     }
 
@@ -544,7 +555,7 @@ mod tests {
     fn test_no_neighbors_fills_with_midpoint() {
         let plane = vec![0u8; 0];
         let avail = ReferenceAvailability::default();
-        let (top, left) = build_reference_samples(&plane, 0, 0, 0, 0, 0, 4, 8, avail);
+        let (top, left) = build_reference_samples(&plane, 0, 0, 0, 0, 0, 4, 8, avail, None);
         assert_eq!(top.len(), 33); // 2 * 16 + 1
         assert_eq!(left.len(), 33);
         assert!(top.iter().all(|&p| p == 128));
@@ -569,7 +580,7 @@ mod tests {
         };
         // Building refs for CTU 2 at (16, 0), size 16x16. The left column
         // pulls from plane[(0..15) * stride + 15], all 0x7E.
-        let (top, left) = build_reference_samples(&plane, stride, 32, 16, 16, 0, 4, 8, avail);
+        let (top, left) = build_reference_samples(&plane, stride, 32, 16, 16, 0, 4, 8, avail, None);
         // The 16 immediate left neighbors should be 0x7E.
         for i in 0..16 {
             assert_eq!(left[1 + i], 0x7E, "left[{}]", 1 + i);
@@ -630,7 +641,7 @@ mod tests {
     fn test_fixture_luma_reconstruction() {
         let plane = vec![0u8; 0];
         let avail = ReferenceAvailability::default();
-        let (top, left) = build_reference_samples(&plane, 0, 0, 0, 0, 0, 4, 8, avail);
+        let (top, left) = build_reference_samples(&plane, 0, 0, 0, 0, 0, 4, 8, avail, None);
         let mut block = vec![0u8; 256];
         predict_planar(&mut block, 16, &top, &left, 4, 8);
         let residual = vec![-2i16; 256];
@@ -648,7 +659,7 @@ mod tests {
     fn test_fixture_chroma_reconstruction() {
         let plane = vec![0u8; 0];
         let avail = ReferenceAvailability::default();
-        let (top, left) = build_reference_samples(&plane, 0, 0, 0, 0, 0, 3, 8, avail);
+        let (top, left) = build_reference_samples(&plane, 0, 0, 0, 0, 0, 3, 8, avail, None);
         let mut block = vec![0u8; 64];
         predict_planar(&mut block, 8, &top, &left, 3, 8);
         // No chroma residual in our fixture (cbf_cb = cbf_cr = 0).
