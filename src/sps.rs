@@ -249,6 +249,16 @@ pub fn parse_st_ref_pic_set(
         // `delta_poc_s0` we built above is already in "closest-first"
         // order thanks to the walk direction. Same for `delta_poc_s1`.
 
+        // A predicted set can hold one more entry than the set it predicts
+        // from, so chained predictions could otherwise grow without bound.
+        // Apply the same limit as the explicit path (spec 7.4.8 bounds both
+        // counts by sps_max_dec_pic_buffering_minus1, at most 15).
+        if delta_poc_s0.len() > 16 || delta_poc_s1.len() > 16 {
+            return Err(DecodeError::InvalidSyntax(
+                "st_ref_pic_set: too many reference pictures",
+            ));
+        }
+
         Ok(ShortTermRps {
             num_negative_pics: delta_poc_s0.len(),
             num_positive_pics: delta_poc_s1.len(),
@@ -807,6 +817,55 @@ mod tests {
             validate_conformance_window(16, 16, 2, 2, u32::MAX, 1, 0, 0),
             Err(DecodeError::InvalidSyntax(
                 "conformance window width overflow"
+            ))
+        ));
+    }
+
+    /// A reference set with `n` negative pictures at deltas -1..=-n, all used.
+    fn negative_ref_rps(n: usize) -> ShortTermRps {
+        ShortTermRps {
+            num_negative_pics: n,
+            num_positive_pics: 0,
+            delta_poc_s0: (1..=n as i32).map(|d| -d).collect(),
+            delta_poc_s1: Vec::new(),
+            used_by_curr_pic_s0_flag: vec![true; n],
+            used_by_curr_pic_s1_flag: Vec::new(),
+        }
+    }
+
+    /// Predicted `st_ref_pic_set(1, ...)` from `ref`: deltaRps = -1 and every
+    /// `used_by_curr_pic_flag` set, which keeps all `ref` entries and adds
+    /// deltaRps itself, so the result has one more negative picture.
+    ///
+    /// Bits: inter_ref_pic_set_prediction_flag = 1, delta_rps_sign = 1,
+    /// abs_delta_rps_minus1 = 0 ("1"), then `ref.len() + 1` used flags of 1.
+    fn parse_predicted_from(reference: ShortTermRps) -> Result<ShortTermRps, DecodeError> {
+        let n_bits = 3 + reference.num_delta_pocs() + 1;
+        let mut bytes = vec![0u8; n_bits.div_ceil(8) + 1];
+        for i in 0..n_bits {
+            bytes[i / 8] |= 0x80 >> (i % 8);
+        }
+        let mut r = BitstreamReader::new(&bytes);
+        parse_st_ref_pic_set(&mut r, 1, 2, &[reference])
+    }
+
+    /// The predicted path may reach the 16-picture limit...
+    #[test]
+    fn predicted_rps_with_sixteen_pictures_is_accepted() {
+        let rps = parse_predicted_from(negative_ref_rps(15)).expect("16 entries are legal");
+        assert_eq!(rps.num_negative_pics, 16);
+        assert_eq!(rps.delta_poc_s0[0], -1);
+        assert_eq!(rps.delta_poc_s0[15], -16);
+    }
+
+    /// ...but not exceed it. libde265 wrote this case past a fixed 16-entry
+    /// array (GHSA-g2rg-wj66-w594); here it is rejected as invalid syntax.
+    #[test]
+    fn predicted_rps_over_sixteen_pictures_is_rejected() {
+        assert!(matches!(
+            parse_predicted_from(negative_ref_rps(16)),
+            Err(DecodeError::InvalidSyntax(
+                "st_ref_pic_set: too many reference pictures"
             ))
         ));
     }

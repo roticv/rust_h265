@@ -362,14 +362,17 @@ fn skip_vertical_slice_boundary<P: Pixel>(state: &PictureState<P>, x: usize, y: 
     let ctb_row = y >> log2_ctb;
     let left_rs = ctb_row * ctb_width + left_ctb_col;
     let right_rs = ctb_row * ctb_width + right_ctb_col;
+    if !state.filter_across_tiles && state.tab_tile_id[left_rs] != state.tab_tile_id[right_rs] {
+        return true; // tile boundary, filtering across tiles disabled
+    }
     if state.tab_slice_addr_rs[left_rs] == state.tab_slice_addr_rs[right_rs] {
         return false; // same slice
     }
     !state.filter_slice_edges[left_rs] || !state.filter_slice_edges[right_rs]
 }
 
-/// Check whether a horizontal edge at luma y crosses a slice boundary and
-/// should be skipped.
+/// Check whether a horizontal edge at luma y crosses a slice or tile
+/// boundary and should be skipped.
 #[inline]
 fn skip_horizontal_slice_boundary<P: Pixel>(state: &PictureState<P>, x: usize, y: usize) -> bool {
     let log2_ctb = state.log2_ctb_size as usize;
@@ -382,6 +385,9 @@ fn skip_horizontal_slice_boundary<P: Pixel>(state: &PictureState<P>, x: usize, y
     let ctb_col = x >> log2_ctb;
     let top_rs = top_ctb_row * ctb_width + ctb_col;
     let bot_rs = bot_ctb_row * ctb_width + ctb_col;
+    if !state.filter_across_tiles && state.tab_tile_id[top_rs] != state.tab_tile_id[bot_rs] {
+        return true; // tile boundary, filtering across tiles disabled
+    }
     if state.tab_slice_addr_rs[top_rs] == state.tab_slice_addr_rs[bot_rs] {
         return false; // same slice
     }

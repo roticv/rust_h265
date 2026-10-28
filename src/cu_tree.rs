@@ -260,6 +260,9 @@ pub struct PictureState<P: Pixel> {
     /// Consulted by `compute_luma_avail` to treat cross-tile neighbor
     /// samples as unavailable for intra prediction (spec 6.4.4 / 8.4.2).
     pub tab_tile_id: Vec<u32>,
+    /// PPS `loop_filter_across_tiles_enabled_flag`: when false, deblocking
+    /// and SAO must not use samples across a tile boundary.
+    pub filter_across_tiles: bool,
 
     /// Phase 3d-3: per min-PU motion field (MV + ref_idx + pred_flag).
     /// Indexed by `(y >> log2_min_pu_size) * min_pu_width + (x >> log2_min_pu_size)`.
@@ -398,6 +401,7 @@ impl<P: Pixel> PictureState<P> {
                 let ph = h.div_ceil(ctb_size) as usize;
                 vec![0u32; pw * ph]
             },
+            filter_across_tiles: true,
             tab_mvf: vec![MvField::default(); min_pu_width * min_pu_height],
             tab_skip_flag: vec![0u8; min_cb_width * min_cb_height],
             min_tb_addr_zs: zscan,
@@ -700,31 +704,13 @@ fn decode_split_cu_flag<P: Pixel>(
 ) -> Result<u32, DecodeError> {
     let x_cb = (x0 >> state.log2_min_cb_size) as usize;
     let y_cb = (y0 >> state.log2_min_cb_size) as usize;
-    let ctb_log2 = state.log2_ctb_size;
-    let ctb_w = state.width.div_ceil(1 << ctb_log2) as usize;
-
-    // Current CTB's slice address for cross-slice availability check.
-    let cur_ctb_rs = (y0 >> ctb_log2) as usize * ctb_w + (x0 >> ctb_log2) as usize;
-    let cur_slice = state.tab_slice_addr_rs[cur_ctb_rs];
-
-    let depth_left = if x_cb > 0 {
-        // Check if the left neighbor is in the same slice.
-        let left_ctb_rs = (y0 >> ctb_log2) as usize * ctb_w + ((x0 - 1) >> ctb_log2) as usize;
-        if state.tab_slice_addr_rs[left_ctb_rs] == cur_slice {
-            state.tab_ct_depth[y_cb * state.min_cb_width + x_cb - 1]
-        } else {
-            0
-        }
+    let depth_left = if x_cb > 0 && neighbour_available(state, x0, y0, x0 as i64 - 1, y0 as i64) {
+        state.tab_ct_depth[y_cb * state.min_cb_width + x_cb - 1]
     } else {
         0
     };
-    let depth_top = if y_cb > 0 {
-        let top_ctb_rs = ((y0 - 1) >> ctb_log2) as usize * ctb_w + (x0 >> ctb_log2) as usize;
-        if state.tab_slice_addr_rs[top_ctb_rs] == cur_slice {
-            state.tab_ct_depth[(y_cb - 1) * state.min_cb_width + x_cb]
-        } else {
-            0
-        }
+    let depth_top = if y_cb > 0 && neighbour_available(state, x0, y0, x0 as i64, y0 as i64 - 1) {
+        state.tab_ct_depth[(y_cb - 1) * state.min_cb_width + x_cb]
     } else {
         0
     };
@@ -762,6 +748,38 @@ fn set_ct_depth<P: Pixel>(
 // Phase 3d-3: inter syntax element decoders
 // ---------------------------------------------------------------------------
 
+/// Whether the neighbouring luma location `(xn, yn)` is available to the
+/// block at `(x0, y0)` for CABAC context selection and intra mode
+/// prediction (spec 6.4.1, FFmpeg `ctb_left_flag` / `ctb_up_flag`). It must
+/// be inside the picture, and either in the current CTB or in a CTB that
+/// belongs to the same slice and the same tile.
+#[inline]
+fn neighbour_available<P: Pixel>(
+    state: &PictureState<P>,
+    x0: u32,
+    y0: u32,
+    xn: i64,
+    yn: i64,
+) -> bool {
+    if xn < 0 || yn < 0 || xn >= state.width as i64 || yn >= state.height as i64 {
+        return false;
+    }
+    let log2_ctb = state.log2_ctb_size as u32;
+    let (cx, cy) = ((x0 >> log2_ctb) as usize, (y0 >> log2_ctb) as usize);
+    let (nx, ny) = (
+        (xn as u32 >> log2_ctb) as usize,
+        (yn as u32 >> log2_ctb) as usize,
+    );
+    if (cx, cy) == (nx, ny) {
+        return true;
+    }
+    let ctb_w = state.width.div_ceil(1 << log2_ctb) as usize;
+    let (cur, nb) = (cy * ctb_w + cx, ny * ctb_w + nx);
+    let slice = |rs: usize| state.tab_slice_addr_rs.get(rs).copied().unwrap_or(-1);
+    let tile = |rs: usize| state.tab_tile_id.get(rs).copied();
+    slice(nb) >= 0 && slice(nb) == slice(cur) && tile(nb) == tile(cur)
+}
+
 /// `cu_skip_flag` decode (FFmpeg `ff_hevc_skip_flag_decode`).
 /// Context: SKIP_FLAG offset + (skip_left + skip_above).
 fn decode_skip_flag<P: Pixel>(
@@ -774,10 +792,10 @@ fn decode_skip_flag<P: Pixel>(
     let x_cb = (x0 >> state.log2_min_cb_size) as usize;
     let y_cb = (y0 >> state.log2_min_cb_size) as usize;
     let mut inc = 0usize;
-    if x_cb > 0 {
+    if x_cb > 0 && neighbour_available(state, x0, y0, x0 as i64 - 1, y0 as i64) {
         inc += (state.tab_skip_flag[y_cb * state.min_cb_width + x_cb - 1] != 0) as usize;
     }
-    if y_cb > 0 {
+    if y_cb > 0 && neighbour_available(state, x0, y0, x0 as i64, y0 as i64 - 1) {
         inc += (state.tab_skip_flag[(y_cb - 1) * state.min_cb_width + x_cb] != 0) as usize;
     }
     cabac.decode_bin(&mut contexts.state[ctx::SKIP_FLAG + inc])
@@ -4424,13 +4442,14 @@ fn compute_luma_intra_pred_mode<P: Pixel>(
     let y_pu = (y0 >> state.log2_min_pu_size) as usize;
     let y_ctb = (y0 >> log2_ctb) << log2_ctb;
 
-    // Within a single-CTU picture, "neighbor exists" reduces to "x_pu/y_pu > 0".
-    let mut cand_up = if y_pu > 0 {
+    // An unavailable neighbour (outside the picture, or in another slice or
+    // tile) contributes INTRA_DC (spec 8.4.2).
+    let mut cand_up = if y_pu > 0 && neighbour_available(state, x0, y0, x0 as i64, y0 as i64 - 1) {
         state.tab_ipm[(y_pu - 1) * state.min_pu_width + x_pu]
     } else {
         INTRA_DC
     };
-    let cand_left = if x_pu > 0 {
+    let cand_left = if x_pu > 0 && neighbour_available(state, x0, y0, x0 as i64 - 1, y0 as i64) {
         state.tab_ipm[y_pu * state.min_pu_width + x_pu - 1]
     } else {
         INTRA_DC

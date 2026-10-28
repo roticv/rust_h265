@@ -126,8 +126,12 @@ pub fn decode_sao_param<P: Pixel>(
     let ctb_rs = ry * pic_w_in_ctbs + rx;
     let cur_slice = state.tab_slice_addr_rs[ctb_rs];
 
-    let left_avail = rx > 0 && state.tab_slice_addr_rs[ctb_rs - 1] == cur_slice;
-    let up_avail = ry > 0 && state.tab_slice_addr_rs[ctb_rs - pic_w_in_ctbs] == cur_slice;
+    let same_tile = |rs: usize| state.tab_tile_id.get(rs) == state.tab_tile_id.get(ctb_rs);
+    let left_avail =
+        rx > 0 && state.tab_slice_addr_rs[ctb_rs - 1] == cur_slice && same_tile(ctb_rs - 1);
+    let up_avail = ry > 0
+        && state.tab_slice_addr_rs[ctb_rs - pic_w_in_ctbs] == cur_slice
+        && same_tile(ctb_rs - pic_w_in_ctbs);
 
     if left_avail {
         sao_merge_left = decode_sao_merge_flag(cabac, contexts);
@@ -335,11 +339,15 @@ fn sao_edge_filter<P: Pixel>(
     }
 }
 
-/// Check if two adjacent CTBs (by raster address) are in the same slice,
-/// and if not, whether loop filtering across that boundary is allowed.
+/// Check if two adjacent CTBs (by raster address) are separated by a tile
+/// boundary that must not be filtered across, or are in different slices
+/// with loop filtering across that slice boundary disabled.
 /// Returns true if the boundary should be treated as "no filtering across".
 #[inline]
 fn sao_skip_slice_boundary<P: Pixel>(state: &PictureState<P>, rs_a: usize, rs_b: usize) -> bool {
+    if !state.filter_across_tiles && state.tab_tile_id[rs_a] != state.tab_tile_id[rs_b] {
+        return true; // tile boundary, filtering across tiles disabled
+    }
     if state.tab_slice_addr_rs[rs_a] == state.tab_slice_addr_rs[rs_b] {
         return false;
     }

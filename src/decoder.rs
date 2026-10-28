@@ -533,6 +533,14 @@ impl Decoder {
                 }
                 self.sps = Some(new_sps);
                 self.tile_tables = None;
+                // The active PPS's tile geometry was resolved against the
+                // previous SPS. Clear it so the next slice re-derives column
+                // widths / row heights for the new picture size (a stream may
+                // change resolution and keep its PPS).
+                if let Some(pps) = self.pps.as_mut() {
+                    pps.column_widths_in_ctbs.clear();
+                    pps.row_heights_in_ctbs.clear();
+                }
                 Ok(None)
             }
             NalUnitType::Pps => {
@@ -859,6 +867,7 @@ impl Decoder {
                 let mut ps = PictureState::<u16>::new_with_zscan(sps, zscan);
                 let n = ps.tab_tile_id.len();
                 ps.tab_tile_id.copy_from_slice(&tile_tables.tile_id[..n]);
+                ps.filter_across_tiles = pps.loop_filter_across_tiles_enabled_flag;
                 ps.qpy_pred = sh.slice_qp_y;
                 ps.last_qp_y = sh.slice_qp_y;
                 ps.first_qp_group = !sh.dependent_slice_segment_flag;
@@ -867,6 +876,7 @@ impl Decoder {
                 let mut ps = PictureState::<u8>::new_with_zscan(sps, zscan);
                 let n = ps.tab_tile_id.len();
                 ps.tab_tile_id.copy_from_slice(&tile_tables.tile_id[..n]);
+                ps.filter_across_tiles = pps.loop_filter_across_tiles_enabled_flag;
                 // QP-prediction state (spec 8.6.1 / FFmpeg hevcdec.c:3066-3069):
                 // at the first independent segment of a picture, seed `qpy_pred`
                 // and `last_qp_y` from `slice_qp` and arm `first_qp_group` so the
@@ -3801,6 +3811,119 @@ mod tests {
             hash, expected,
             "444 PCM 10-bit hash mismatch:\n  got: {hash}\n  exp: {expected}"
         );
+    }
+
+    /// Two kvazaar `--tiles 2x2` streams concatenated: 2 intra frames at
+    /// 256×256, then 2 at 384×256 whose PPS was dropped because it is
+    /// byte-identical to the first stream's. The second SPS changes the
+    /// picture width from 4 to 6 CTBs, so the uniform tile columns must be
+    /// re-derived from 2+2 to 3+3 CTBs. Regression test: the resolved tile
+    /// geometry was cached on the PPS and not recomputed for the new SPS,
+    /// so the second stream decoded with the first stream's tile layout.
+    ///
+    /// Expected output is FFmpeg's decode of each original stream on its
+    /// own, concatenated. Fixture generated with:
+    /// ```text
+    /// for sz in 256x256 384x256; do
+    ///   ffmpeg -f lavfi -i "testsrc2=size=$sz:rate=30" -frames:v 2 \
+    ///     -pix_fmt yuv420p src_$sz.yuv
+    ///   kvazaar --input src_$sz.yuv --input-res $sz --input-fps 30 \
+    ///     --frames 2 --preset ultrafast --tiles 2x2 --no-wpp --gop 0 \
+    ///     --period 1 --qp 30 --output t_$sz.h265
+    /// done
+    /// # tiles_resize.h265 = every NAL of t_256x256.h265, then every NAL of
+    /// # t_384x256.h265 except its PPS.
+    /// ```
+    #[test]
+    fn test_decode_tiles_resolution_change_keeps_pps() {
+        use sha2::{Digest, Sha256};
+        let h265 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/tiles_resize.h265"
+        ))
+        .unwrap();
+        let mut decoder = Decoder::new();
+        let mut frames = Vec::new();
+        for nal in parse_annex_b(&h265).iter() {
+            if let Some(f) = decoder.decode_nal(nal).unwrap() {
+                frames.push(f);
+            }
+        }
+        while let Some(f) = decoder.flush() {
+            frames.push(f);
+        }
+        let sizes: Vec<(u32, u32)> = frames.iter().map(|f| (f.width, f.height)).collect();
+        assert_eq!(sizes, vec![(256, 256), (256, 256), (384, 256), (384, 256)]);
+        // Decode order equals output order here (all intra), so hash in order.
+        let mut hasher = Sha256::new();
+        for f in &frames {
+            hash_pixel_data(&mut hasher, &f.y);
+            hash_pixel_data(&mut hasher, &f.u);
+            hash_pixel_data(&mut hasher, &f.v);
+        }
+        let hash: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let expected = "bc55385a64e5e0392c10cfc693b87c51db67bfd2a8b2b8f9613f091b9483b8ea";
+        assert_eq!(hash, expected, "tiles_resize hash mismatch");
+    }
+
+    /// 384×256, 8 frames (IPPPPPPP), kvazaar `--tiles 3x2` with deblocking
+    /// and SAO on and `loop_filter_across_tiles_enabled_flag = 0`. Real
+    /// content (testsrc2), so every derivation that must treat a neighbour in
+    /// another tile as unavailable matters: split_cu_flag and cu_skip_flag
+    /// CABAC contexts, the intra MPM candidates, SAO merge flags, and
+    /// deblocking / SAO at tile boundaries. 0.2.0 and earlier decoded this
+    /// wrongly; the older `tiles.h265` fixture is flat gray, which hid it.
+    ///
+    /// Fixture generated with:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=384x256:rate=30" -frames:v 8 \
+    ///   -pix_fmt yuv420p src.yuv
+    /// kvazaar --input src.yuv --input-res 384x256 --input-fps 30 --frames 8 \
+    ///   --preset ultrafast --tiles 3x2 --no-wpp --gop 0 --period 0 --qp 30 \
+    ///   --output tiles_inter_kvazaar_384x256.h265
+    /// ```
+    #[test]
+    fn test_decode_tiles_inter_kvazaar_hash() {
+        let hash = decode_and_hash("tiles_inter_kvazaar_384x256.h265", 8);
+        let expected = "5a1d4639e2fbaec4e76ba9d766be598bf4dbef39d5b636cc4c88554e7793b95b";
+        assert_eq!(hash, expected, "tiles_inter_kvazaar hash mismatch");
+    }
+
+    /// 832×256, 4 frames (IPPP), HM reference encoder, non-uniform 3×2 tiles
+    /// (columns 8/9/9 CTBs, rows 3/5 CTBs at CTU 32), deblocking and SAO on,
+    /// `LFCrossTileBoundaryFlag = 0`: deblocking and SAO must not use samples
+    /// across tile boundaries.
+    ///
+    /// Fixture generated with HM `TAppEncoder -c cfg`, where cfg sets:
+    /// ```text
+    /// SourceWidth 832, SourceHeight 256, FramesToBeEncoded 4, IntraPeriod 4,
+    /// GOPSize 1 (Frame1: P 1 3 0.4624 0.0 0 0 1.0 0 0 0 1 1 -1 0),
+    /// MaxCUWidth/Height 32, MaxPartitionDepth 3, QP 30,
+    /// TileUniformSpacing 0, NumTileColumnsMinus1 2, TileColumnWidthArray 8 9,
+    /// NumTileRowsMinus1 1, TileRowHeightArray 3,
+    /// LFCrossTileBoundaryFlag 0, LoopFilterDisable 0, SAO 1
+    /// ```
+    /// with testsrc2 input. Expected hash: FFmpeg's yuv420p output.
+    #[test]
+    fn test_decode_tiles_hm_no_filter_across_tiles_hash() {
+        let hash = decode_and_hash("tiles_hm_no_lf_across_832x256.h265", 4);
+        let expected = "cad2c0739f8275782631dde5815d8841ffea42568ee52804146c6b40553b22d2";
+        assert_eq!(hash, expected, "tiles_hm_no_lf_across hash mismatch");
+    }
+
+    /// Same as `tiles_hm_no_lf_across_832x256.h265` but with
+    /// `LFCrossTileBoundaryFlag = 1`, so deblocking and SAO do filter across
+    /// tile boundaries. The two fixtures decode to different pictures, so
+    /// together they pin both settings of the flag.
+    #[test]
+    fn test_decode_tiles_hm_filter_across_tiles_hash() {
+        let hash = decode_and_hash("tiles_hm_lf_across_832x256.h265", 4);
+        let expected = "1e687da4160ec0543db3e00f73a8ce92328dc3058b91b70b46b39511624eaeaf";
+        assert_eq!(hash, expected, "tiles_hm_lf_across hash mismatch");
     }
 
     #[test]

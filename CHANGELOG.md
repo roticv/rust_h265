@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Tiled streams with real content decoded incorrectly.** Several
+  derivations that must treat a neighbour in another tile as unavailable
+  (spec 6.4.1) checked only the slice, or nothing: the `split_cu_flag` and
+  `cu_skip_flag` CABAC contexts, the intra most-probable-mode candidates and
+  the SAO merge flags. The CABAC desynchronised at the first tile boundary.
+  The existing tiled fixture is flat gray, which hid this. The skip-flag
+  context and MPM candidates also now respect slice boundaries.
+- `loop_filter_across_tiles_enabled_flag` was parsed but ignored, so
+  deblocking and SAO always filtered across tile boundaries.
+- A new SPS now clears the active PPS's resolved tile geometry, so a stream
+  that changes resolution while keeping its PPS uses the right tile layout.
+- A predicted short-term reference picture set is rejected when it holds
+  more than 16 pictures in either direction, the same limit as the explicit
+  syntax. It was unbounded. This is the input pattern behind libde265
+  GHSA-g2rg-wj66-w594; here it caused no memory-safety issue.
+
 ## [0.2.0] - 2026-10-28
 
 Adds 4:4:4 decoding, fixes open-GOP streams, hardens the decoder against
