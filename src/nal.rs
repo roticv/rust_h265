@@ -20,33 +20,60 @@ use std::borrow::Cow;
 /// HEVC NAL unit type (HEVC spec table 7-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NalUnitType {
-    // VCL (slice) NAL units
-    TrailN,   // 0
-    TrailR,   // 1
-    TsaN,     // 2
-    TsaR,     // 3
-    StsaN,    // 4
-    StsaR,    // 5
-    RadlN,    // 6
-    RadlR,    // 7
-    RaslN,    // 8
-    RaslR,    // 9
-    BlaWLp,   // 16
-    BlaWRadl, // 17
-    BlaNLp,   // 18
-    IdrWRadl, // 19
-    IdrNLp,   // 20
-    Cra,      // 21
-    // Non-VCL NAL units
-    Vps,       // 32
-    Sps,       // 33
-    Pps,       // 34
-    Aud,       // 35
-    Eos,       // 36
-    Eob,       // 37
-    Fd,        // 38
-    PrefixSei, // 39
-    SuffixSei, // 40
+    // VCL (slice) NAL units.
+    /// TRAIL_N: trailing picture, sub-layer non-reference. Type 0.
+    TrailN,
+    /// TRAIL_R: trailing picture, sub-layer reference. Type 1.
+    TrailR,
+    /// TSA_N: temporal sub-layer access picture, sub-layer non-reference. Type 2.
+    TsaN,
+    /// TSA_R: temporal sub-layer access picture, sub-layer reference. Type 3.
+    TsaR,
+    /// STSA_N: step-wise temporal sub-layer access picture, sub-layer non-reference. Type 4.
+    StsaN,
+    /// STSA_R: step-wise temporal sub-layer access picture, sub-layer reference. Type 5.
+    StsaR,
+    /// RADL_N: random access decodable leading picture, sub-layer non-reference. Type 6.
+    RadlN,
+    /// RADL_R: random access decodable leading picture, sub-layer reference. Type 7.
+    RadlR,
+    /// RASL_N: random access skipped leading picture, sub-layer non-reference. Type 8.
+    RaslN,
+    /// RASL_R: random access skipped leading picture, sub-layer reference. Type 9.
+    RaslR,
+    /// BLA_W_LP: broken link access picture, may have leading pictures. Type 16.
+    BlaWLp,
+    /// BLA_W_RADL: broken link access picture, may have RADL leading pictures. Type 17.
+    BlaWRadl,
+    /// BLA_N_LP: broken link access picture without leading pictures. Type 18.
+    BlaNLp,
+    /// IDR_W_RADL: instantaneous decoding refresh picture, may have RADL leading pictures. Type 19.
+    IdrWRadl,
+    /// IDR_N_LP: instantaneous decoding refresh picture without leading pictures. Type 20.
+    IdrNLp,
+    /// CRA_NUT: clean random access picture. Type 21.
+    Cra,
+    // Non-VCL NAL units.
+    /// VPS_NUT: video parameter set. Type 32.
+    Vps,
+    /// SPS_NUT: sequence parameter set. Type 33.
+    Sps,
+    /// PPS_NUT: picture parameter set. Type 34.
+    Pps,
+    /// AUD_NUT: access unit delimiter. Type 35.
+    Aud,
+    /// EOS_NUT: end of sequence. Type 36.
+    Eos,
+    /// EOB_NUT: end of bitstream. Type 37.
+    Eob,
+    /// FD_NUT: filler data. Type 38.
+    Fd,
+    /// PREFIX_SEI_NUT: supplemental enhancement information, prefix. Type 39.
+    PrefixSei,
+    /// SUFFIX_SEI_NUT: supplemental enhancement information, suffix. Type 40.
+    SuffixSei,
+    /// Any other type: reserved or unspecified values, which the decoder
+    /// ignores. Holds the raw `nal_unit_type`.
     Other(u8),
 }
 
@@ -136,9 +163,15 @@ impl From<u8> for NalUnitType {
     }
 }
 
+/// One NAL unit, as produced by [`parse_annex_b`], [`parse_hvcc`] or
+/// [`parse_nal`] and consumed by
+/// [`Decoder::decode_nal`](crate::Decoder::decode_nal).
 #[derive(Debug)]
 pub struct NalUnit<'a> {
+    /// `nal_unit_type` from the NAL unit header.
     pub nal_unit_type: NalUnitType,
+    /// `nuh_layer_id` from the NAL unit header: 0 for the base layer, the
+    /// only layer this decoder decodes.
     pub nuh_layer_id: u8,
     /// `temporal_id` derived as `nuh_temporal_id_plus1 - 1`. Always 0..6.
     pub temporal_id: u8,

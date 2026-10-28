@@ -1,35 +1,75 @@
 //! Pure Rust H.265 / HEVC video decoder.
 //!
-//! Decodes Main and Main 10 profile (8-bit and 10-bit 4:2:0) HEVC bitstreams
-//! end-to-end. Supports both Annex B (start-code delimited) and HVCC
-//! (length-prefixed, MP4/MKV) input formats via [`parse_annex_b`] and
-//! [`parse_hvcc`]. Byte-exact against FFmpeg on all test fixtures plus
-//! real 1080p Big Buck Bunny at x265 presets ultrafast / medium / slow
-//! in both 8-bit and 10-bit.
+//! Decodes Main and Main 10 profile HEVC bitstreams (8-bit and 10-bit
+//! 4:2:0) and 4:4:4 streams (8-bit and 10-bit, intra and inter, as used by
+//! HEIF/HEIC images). 4:2:2 and monochrome streams are rejected with
+//! [`DecodeError::Unsupported`]. Input can be Annex B (start-code delimited,
+//! `.h265` files) via [`parse_annex_b`], length-prefixed NAL units from
+//! MP4/MKV containers via [`parse_hvcc`], or single NAL units via
+//! [`parse_nal`].
+//!
+//! The decoder passes all 147 vectors of the JCT-VC HEVC_v1 conformance
+//! suite and is byte-exact against FFmpeg on its test fixtures, including
+//! real 1080p Big Buck Bunny encodes in 8-bit and 10-bit.
 //!
 //! # Quick start
 //!
-//! ```no_run
-//! use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, NalUnitType};
+//! [`Decoder::with_display_order`] returns frames in display order, as the
+//! spec's output process does. Take frames with
+//! [`next_output`](Decoder::next_output) after each NAL unit, and call
+//! [`flush`](Decoder::flush) until it returns `None` at the end of the
+//! stream:
 //!
-//! let data = std::fs::read("input.h265").unwrap();
-//! let nals = parse_annex_b(&data);
-//! let mut decoder = Decoder::new();
+//! ```no_run
+//! use rust_h265::{Decoder, PixelData, parse_annex_b};
+//!
+//! let data = std::fs::read("input.h265")?;
+//! let mut decoder = Decoder::new().with_display_order();
 //! let mut frames = Vec::new();
 //!
-//! for nal in &nals {
-//!     match decoder.decode_nal(nal) {
-//!         Ok(Some(frame)) => frames.push(frame),
-//!         Ok(None) => {}
-//!         Err(e) => eprintln!("decode error: {e:?}"),
+//! for nal in parse_annex_b(&data) {
+//!     decoder.decode_nal(&nal)?;
+//!     while let Some(frame) = decoder.next_output() {
+//!         frames.push(frame);
 //!     }
 //! }
 //! while let Some(frame) = decoder.flush() {
 //!     frames.push(frame);
 //! }
-//! // Sort by POC for display order.
-//! frames.sort_by_key(|f| f.pic_order_cnt);
+//!
+//! for frame in &frames {
+//!     match &frame.y {
+//!         PixelData::U8(luma) => { /* 8-bit samples */ }
+//!         PixelData::U16(luma) => { /* 10-bit samples */ }
+//!     }
+//! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
+//!
+//! # Decoding order
+//!
+//! A decoder made with [`Decoder::new`] returns each picture from
+//! [`decode_nal`](Decoder::decode_nal) as soon as it is decoded, in
+//! decoding order, and returns every decoded picture, including those the
+//! spec does not output. This suits callers that pair each frame with the
+//! container packet it came from. To display such frames, sort them by
+//! [`pic_order_cnt`](Frame::pic_order_cnt) within each coded video
+//! sequence: POC restarts at every IDR or BLA picture, and at a CRA
+//! picture that follows an end-of-sequence NAL unit.
+//!
+//! # Frames
+//!
+//! A [`Frame`] holds cropped `y`, `u` and `v` planes as [`PixelData`]:
+//! `U8` for 8-bit streams, `U16` for deeper ones. `chroma_format_idc` is 1
+//! for 4:2:0, where `u` and `v` have half the width and height, and 3 for
+//! 4:4:4, where they are full size.
+//!
+//! # Resource limits
+//!
+//! [`Decoder::new`] rejects any SPS whose picture exceeds the Level 6.2
+//! maximum of 35,651,584 luma samples or an estimated 512 MB of
+//! per-picture state, with [`DecodeError::ResourceLimit`]. Use
+//! [`Decoder::with_limits`] to change either bound.
 
 // --- Internal modules (not part of the public API) ---
 // allow(dead_code): internal modules contain utility functions, struct fields,

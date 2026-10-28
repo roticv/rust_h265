@@ -1,3 +1,5 @@
+//! The [`DecodeError`] type returned by parsing and decoding.
+
 use std::fmt;
 
 /// Errors produced by the H.265 decoder.

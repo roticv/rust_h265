@@ -52,11 +52,19 @@ use crate::vps::{Vps, parse_vps};
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Frame {
+    /// Luma plane, `width * height` samples in raster order.
     pub y: PixelData,
+    /// Cb plane. Half the luma width and height for 4:2:0, full size for
+    /// 4:4:4 (see `chroma_format_idc`).
     pub u: PixelData,
+    /// Cr plane, the same size as `u`.
     pub v: PixelData,
+    /// Luma width in samples, after cropping to the conformance window.
     pub width: u32,
+    /// Luma height in samples, after cropping to the conformance window.
     pub height: u32,
+    /// Picture order count: the picture's position in display order within
+    /// its coded video sequence. It restarts at every IDR or BLA picture.
     pub pic_order_cnt: i32,
     /// Bit depth of the luma samples: 8, 10, or 12. Chroma samples
     /// normally have the same depth; a stream may code them at a different
@@ -68,20 +76,6 @@ pub struct Frame {
     pub chroma_format_idc: u32,
 }
 
-/// Streaming HEVC decoder.
-///
-/// Usage:
-/// ```ignore
-/// let mut dec = rust_h265::decoder::Decoder::new();
-/// for nal in nal_units {
-///     if let Some(frame) = dec.decode_nal(&nal)? {
-///         // ... display, encode, etc.
-///     }
-/// }
-/// if let Some(frame) = dec.flush() {
-///     // ... last buffered frame
-/// }
-/// ```
 /// Runtime-dispatched picture state that can hold either 8-bit or 16-bit pixels.
 enum PictureStateEnum {
     U8(PictureState<u8>),
@@ -281,6 +275,40 @@ impl Default for DecodeLimits {
 /// height, log2 CTB size, log2 min TB size.
 type ZscanKey = (u32, u32, u8, u8);
 
+/// Streaming HEVC decoder.
+///
+/// Feed NAL units in bitstream order with [`decode_nal`](Self::decode_nal).
+/// Parameter sets are stored as they arrive and activated by the slices
+/// that use them.
+///
+/// Frames come out in one of two orders:
+///
+/// - **Decoding order** (the default, [`Decoder::new`]): `decode_nal`
+///   returns each picture once it is decoded, and [`flush`](Self::flush)
+///   returns any picture still in progress at the end of the stream.
+/// - **Display order** ([`with_display_order`](Self::with_display_order)):
+///   the spec's output process releases frames, taken with
+///   [`next_output`](Self::next_output).
+///
+/// ```no_run
+/// use rust_h265::{Decoder, parse_annex_b};
+///
+/// let data = std::fs::read("input.h265")?;
+/// let mut decoder = Decoder::new();
+/// for nal in parse_annex_b(&data) {
+///     if let Some(frame) = decoder.decode_nal(&nal)? {
+///         // `frame` is in decoding order
+///     }
+/// }
+/// while let Some(frame) = decoder.flush() {
+///     // last picture, if any
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// Error recovery is limited: once a slice fails to decode, the decoder
+/// rejects the pictures that follow it. To resume after an error, create a
+/// new `Decoder` and feed it from the next parameter sets and IRAP picture.
 #[derive(Default)]
 pub struct Decoder {
     limits: DecodeLimits,
@@ -479,10 +507,15 @@ fn crop_frame<P: Pixel>(
 }
 
 impl Decoder {
+    /// A decoder in decoding-order mode with the default
+    /// [`DecodeLimits`]: Level 6.2's maximum picture size and an estimated
+    /// 512 MB of state per picture.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// A decoder in decoding-order mode with custom resource limits. An SPS
+    /// that exceeds them is rejected with [`DecodeError::ResourceLimit`].
     pub fn with_limits(limits: DecodeLimits) -> Self {
         Self {
             limits,
