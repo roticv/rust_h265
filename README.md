@@ -10,8 +10,9 @@ A pure Rust H.265 / HEVC video decoder.
 > transform skip, transquant bypass, constrained intra prediction, and PCM.
 > Byte-exact against FFmpeg on every in-tree fixture plus
 > real 1080p Big Buck Bunny at x265 presets `ultrafast` / `medium` / `slow`
-> in both 8-bit and 10-bit. No threading or SIMD yet — ~4× slower than
-> single-threaded FFmpeg on 8-bit content, ~1.25–1.6× on 10-bit; see
+> in both 8-bit and 10-bit. No threading or hand-written SIMD yet — ~2.5×
+> slower than single-threaded FFmpeg on 8-bit content, roughly at parity
+> on 10-bit; see
 > [`BENCHMARK.md`](BENCHMARK.md).
 
 While working on `rust_media` it became clear that there isn't a sufficiently good open source software HEVC decoder that ships as a standalone library. FFmpeg has one, but it isn't split out. Most devices have hardware HEVC decoders, but a portable software fallback is still useful when you want one binary that runs anywhere.
@@ -22,7 +23,7 @@ A pure Rust H.264 decoder ([`rust_h264`](https://github.com/roticv/rust_h264)) a
 
 - **Input:** Both **Annex B** (start-code delimited, `.h265` raw files) and **HVCC** (length-prefixed, MP4/MKV containers) formats via `parse_annex_b()` and `parse_hvcc()`.
 - **Streaming:** `Decoder::decode_nal(&[u8]) -> Result<Option<Frame>, DecodeError>` plus `flush()`. NAL units are fed incrementally and decoded frames are emitted as they become available, in **decode order** (callers re-sort by POC for display).
-- **Performance:** The decoder aims to be fast, with FFmpeg's software HEVC decoder as the target benchmark. Current gap vs single-threaded FFmpeg: ~4× on 8-bit, ~1.25–1.6× on 10-bit real 1080p content. No NEON / SSE kernels yet.
+- **Performance:** The decoder aims to be fast, with FFmpeg's software HEVC decoder as the target benchmark. Current gap vs single-threaded FFmpeg: ~2.5× on 8-bit, roughly parity on 10-bit real 1080p content. Motion compensation is compiler-vectorised; there are no hand-written NEON / SSE kernels yet.
 - **Multi-bit-depth:** 8-bit and 10-bit (Main / Main 10 profile) via a generic `Pixel` trait. 12-bit infrastructure is in place but untested. Pixel planes are `PixelData::U8(Vec<u8>)` or `PixelData::U16(Vec<u16>)` — check `frame.bit_depth` to determine which.
 - **Chroma formats:** 4:2:0 and 4:4:4, intra and inter. Check `frame.chroma_format_idc` (1 = 4:2:0, 3 = 4:4:4) to size the `u`/`v` planes: half width and height for 4:2:0, full size for 4:4:4. 4:2:2 and monochrome streams are rejected with `DecodeError::Unsupported`.
 - **Resource limits:** `Decoder::new()` rejects any SPS whose picture exceeds 35,651,584 luma samples (the Level 6.2 maximum) or an estimated 512 MB of per-picture state, returning `DecodeError::ResourceLimit`. Use `Decoder::with_limits(DecodeLimits { .. })` to change either bound.

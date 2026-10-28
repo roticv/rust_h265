@@ -46,77 +46,90 @@ cargo run --release --example bench_realworld
 
 | Fixture | Resolution | Frames | ours | ff-t1 | ff-tN | gap (ff-t1) |
 |---|---:|---:|---:|---:|---:|---:|
-| `bbb_1080p_5s_safe` | 1920×1080 | 120 | 304 Mpx/s (147 fps) | 1232 Mpx/s | 4218 Mpx/s | **4.1× slower** |
-| `bbb_720p_10s_safe` | 1280×720 | 240 | 250 Mpx/s (271 fps) | 987 Mpx/s | 3511 Mpx/s | **4.0× slower** |
-| `bbb_1080p_5s_medium` | 1920×1080 | 120 | 228 Mpx/s (110 fps) | 943 Mpx/s | 2370 Mpx/s | **4.1× slower** |
-| `bbb_1080p_5s_slow` | 1920×1080 | 120 | 233 Mpx/s (112 fps) | 939 Mpx/s | 2370 Mpx/s | **4.0× slower** |
+| `bbb_1080p_5s_safe` | 1920×1080 | 120 | 486 Mpx/s (234 fps) | 1220 Mpx/s | 4366 Mpx/s | **2.5× slower** |
+| `bbb_720p_10s_safe` | 1280×720 | 240 | 399 Mpx/s (433 fps) | 1001 Mpx/s | 3950 Mpx/s | **2.5× slower** |
+| `bbb_1080p_5s_medium` | 1920×1080 | 120 | 375 Mpx/s (181 fps) | 964 Mpx/s | 2592 Mpx/s | **2.6× slower** |
+| `bbb_1080p_5s_slow` | 1920×1080 | 120 | 377 Mpx/s (182 fps) | 957 Mpx/s | 2592 Mpx/s | **2.5× slower** |
 
 ### Results — 10-bit (Main 10 profile)
 
 | Fixture | Resolution | Frames | ours | ff-t1 | ff-tN | gap (ff-t1) |
 |---|---:|---:|---:|---:|---:|---:|
-| `bbb_1080p_5s_10bit_safe` | 1920×1080 | 120 | 293 Mpx/s (141 fps) | 463 Mpx/s | 1975 Mpx/s | **1.6× slower** |
-| `bbb_1080p_5s_10bit_medium` | 1920×1080 | 120 | 241 Mpx/s (116 fps) | 301 Mpx/s | 1020 Mpx/s | **1.25× slower** |
+| `bbb_1080p_5s_10bit_safe` | 1920×1080 | 120 | 414 Mpx/s (200 fps) | 487 Mpx/s | 2393 Mpx/s | **1.2× slower** |
+| `bbb_1080p_5s_10bit_medium` | 1920×1080 | 120 | 328 Mpx/s (158 fps) | 317 Mpx/s | 1310 Mpx/s | **1.03× faster** |
 
 Each figure is the best of two full `bench_realworld --no-generate` runs,
 taken per column, on the same cached fixtures as earlier rounds.
 
 ### Headline
 
-**8-bit:** At 1080p on real content, `rust_h265` delivers 228–304 Mpx/s
-(110–147 fps); single-threaded FFmpeg delivers ~940–1230 Mpx/s. FFmpeg is
-≈ 4× faster, consistently across 720p and 1080p and all three presets.
+**8-bit:** At 1080p on real content, `rust_h265` delivers 375–486 Mpx/s
+(181–234 fps); single-threaded FFmpeg delivers ~960–1220 Mpx/s. FFmpeg is
+≈ 2.5× faster, consistently across 720p and 1080p and all three presets.
 
-**10-bit:** The gap is much smaller, 1.25–1.6× vs FFmpeg single-threaded.
-Our decoder runs at 241–293 Mpx/s (116–141 fps) against FFmpeg's 301–463
-Mpx/s. Our 10-bit throughput is within a few percent of our 8-bit
-throughput, while FFmpeg's drops to under 40% of its 8-bit speed (see
-Interpretation). Note that FFmpeg 9.0.2 measured 10–16% lower on the 10-bit
-fixtures than FFmpeg 8.1 did in the previous round, so part of the
-narrower 10-bit gap reflects FFmpeg, not this decoder.
+**10-bit:** Roughly at parity with single-threaded FFmpeg: 1.2× slower on
+the `safe` preset and 3% faster on `medium`, at 328–414 Mpx/s (158–200
+fps) against FFmpeg's 317–487 Mpx/s. Our 10-bit throughput is 85% of our
+8-bit throughput, while FFmpeg's drops to 40% (see Interpretation). Note
+that FFmpeg 9.0.2 measured 10–16% lower on the 10-bit fixtures than FFmpeg
+8.1 did in the earlier round, so part of the narrower 10-bit gap reflects
+FFmpeg, not this decoder.
 
 All six fixtures are byte-exact against FFmpeg.
 
-### What changed since the previous round
+### What changed since the earlier round
 
-The previous round measured 146–223 Mpx/s for `rust_h265`. Three changes
-to motion compensation and picture setup account for a 1.3–1.65× speedup:
+The earlier round measured 146–223 Mpx/s for `rust_h265`. Six changes to
+motion compensation (MC) and picture setup account for a 2.1–2.45×
+speedup:
 
-| Fixture | previous ours | ours now | speedup |
+| Fixture | earlier round | ours now | speedup |
 |---|---:|---:|---:|
-| `bbb_1080p_5s_safe` | 223 Mpx/s | 304 Mpx/s | 1.36× |
-| `bbb_720p_10s_safe` | 191 Mpx/s | 250 Mpx/s | 1.31× |
-| `bbb_1080p_5s_medium` | 153 Mpx/s | 228 Mpx/s | 1.49× |
-| `bbb_1080p_5s_slow` | 157 Mpx/s | 233 Mpx/s | 1.48× |
-| `bbb_1080p_5s_10bit_safe` | 199 Mpx/s | 293 Mpx/s | 1.47× |
-| `bbb_1080p_5s_10bit_medium` | 146 Mpx/s | 241 Mpx/s | 1.65× |
+| `bbb_1080p_5s_safe` | 223 Mpx/s | 486 Mpx/s | 2.18× |
+| `bbb_720p_10s_safe` | 191 Mpx/s | 399 Mpx/s | 2.09× |
+| `bbb_1080p_5s_medium` | 153 Mpx/s | 375 Mpx/s | 2.45× |
+| `bbb_1080p_5s_slow` | 157 Mpx/s | 377 Mpx/s | 2.40× |
+| `bbb_1080p_5s_10bit_safe` | 199 Mpx/s | 414 Mpx/s | 2.08× |
+| `bbb_1080p_5s_10bit_medium` | 146 Mpx/s | 328 Mpx/s | 2.25× |
 
-1. **Reference windows read directly** (largest gain, +20–48%). Every MC
-   filter tap used to go through a helper that clamps both coordinates and
-   bounds-checks the index: 8 clamps per output sample for the 8-tap luma
-   filter. `ref_window` now checks once per block whether the filter window
-   lies inside the reference picture. Interior blocks read the plane
-   directly; edge blocks read a padded copy built with the same clamping
-   helper, so results are unchanged.
-2. **MC scratch buffers reused** (+11–21% over the version before it). The
-   MC path zero-filled its intermediates on every prediction block, about
-   100 KB per bi-predicted block once 4:4:4 support had enlarged the
-   chroma buffers. They now live in a per-picture `McScratch` that every
-   block reuses.
+In order of landing, with each step's gain over the one before it:
+
+1. **MC scratch buffers reused** (+11–21%). The MC path zero-filled its
+   intermediates on every prediction block, about 100 KB per bi-predicted
+   block once 4:4:4 support had enlarged the chroma buffers. They now live
+   in a per-picture `McScratch` that every block reuses.
+2. **Reference windows read directly** (+20–48%). Every MC filter tap used
+   to go through a helper that clamps both coordinates and bounds-checks
+   the index: 8 clamps per output sample for the 8-tap luma filter.
+   `ref_window` now checks once per block whether the filter window lies
+   inside the reference picture. Interior blocks read the plane directly;
+   edge blocks read a padded copy built with the same clamping helper, so
+   results are unchanged.
 3. **Z-scan table built once** (+2–4%). `PictureState::new` rebuilt the
    min-TB Z-scan table, about 130,000 entries at 1080p, for every picture.
    It depends only on picture geometry, so it is now built once and shared.
+4. **Vectorisable MC kernels** (+19–48%). The four filter entry points
+   share one core, `mc_block` / `interp_block`, whose inner loops are
+   tap-major multiply-accumulates over contiguous row slices. LLVM compiles
+   them to NEON (SSE/AVX on x86) with no `unsafe`. The bi-prediction and
+   weighted-prediction loops write whole rows instead of indexing the
+   plane per pixel.
+5. **i16 accumulation for 8-bit** (+2–4% on 8-bit). One filter pass over
+   8-bit samples is bounded by 112 × 255, so it fits in i16, doubling the
+   lanes per instruction. 10-bit keeps i32.
+6. **No row copy for intermediates** (+3–9%). Intermediate rows are written
+   straight into their destination instead of through a staging buffer.
 
 ### Comparison with libde265
 
 libde265 (the decoder libheif uses for HEIC) was measured separately with
 a small harness against its C API, Homebrew build 1.1.3. On this machine
-that build has no NEON kernels, so it is scalar C against scalar Rust.
-Before the changes above libde265 was 1.3–1.6× faster than `rust_h265`
-single-threaded; afterwards `rust_h265` matched it on 8-bit 1080p content
-(146 vs 147 fps on `bbb_1080p_5s_safe`, 116 vs 115 fps on `medium`) and was
-faster on 10-bit. The harness is not in-tree, so treat these as a spot
-check rather than a maintained benchmark.
+that build has no NEON kernels, so its MC is scalar C. Before the changes
+above libde265 was 1.3–1.6× faster than `rust_h265` single-threaded. With
+them, `rust_h265` is about 1.6× faster on `bbb_1080p_5s_safe` (239 vs 147
+fps in `bench_decode`) and 1.55× faster on `medium` (182 vs 117 fps). The
+harness is not in-tree, so treat these as a spot check rather than a
+maintained benchmark.
 
 ### Compatibility
 
@@ -233,24 +246,25 @@ quantum" rather than as meaningful ratios.
 ## Current profile: `bbb_1080p_5s_safe`
 
 Collected with macOS `sample` on the current code (release build with debug
-info), grouped by decoder stage. Self time, so each sample counts once.
+info), grouped by decoder stage. Self time, so each sample counts once;
+memory copies are charged to the function that called them.
 
 | Stage | Self time |
 |---|---:|
-| Motion compensation | 62.4% |
-| Deblocking incl. boundary strength | 10.9% |
-| Inverse transform | 10.1% |
-| CU/PU/TU syntax + MV derivation | 6.7% |
-| Residual coding + CABAC | 4.3% |
-| Picture setup + allocation | 3.7% |
-| Intra prediction | 1.8% |
+| Motion compensation | 37.6% |
+| Deblocking incl. boundary strength | 16.7% |
+| Inverse transform | 16.6% |
+| CU/PU/TU syntax + MV derivation | 11.8% |
+| Residual coding + CABAC | 7.2% |
+| Picture setup, allocation and output copies | 5.4% |
+| Intra prediction | 3.4% |
 
-Top functions: `motion_compensation_pu` 22.3% (bi-pred combining and the
-inlined direct-output luma filter), `mc_luma_i32` 18.1%, `mc_chroma_i32`
-13.1%, `mc_chroma` 8.8%, `apply_inverse_transform` 5.8%,
-`inter_boundary_strength` 4.0%. Motion compensation is still scalar; the
-per-tap clamping and per-block zeroing that used to sit on top of the
-arithmetic are gone.
+Top functions: `motion_compensation_pu` 19.9% (the inlined direct-output
+luma filter and the bi-prediction average), `mc_luma_i32` 10.9%,
+`apply_inverse_transform` 9.9%, `mc_chroma` 6.6%, `decode_residual_coding`
+5.6%, `inter_boundary_strength` 5.6%, `filter_luma_edge` 5.3%. MC is now
+compiler-vectorised. Deblocking and the inverse transform have not had the
+same treatment yet and are still scalar.
 
 ## Historical profile: `bbb_1080p_5s_safe` (before the changes above)
 
@@ -329,12 +343,16 @@ the per-pixel filter computation.
 
 ## Interpretation
 
-### 8-bit gap (about 4×)
+### 8-bit gap (about 2.5×)
 
 The single-threaded gap on 8-bit 1080p content is dominated by:
 
-1. **Scalar filter kernels.** Motion compensation is 62% of decode time,
-   nearly all of it per-pixel filter and combining arithmetic.
+1. **Kernel quality.** Motion compensation is 38% of decode time. Its
+   loops are now compiler-vectorised, but FFmpeg's hand-written NEON still
+   does far more per instruction: it uses the Armv8.6 `usdot` dot-product
+   instruction for its filters and a separately unrolled kernel per block
+   width. Deblocking and the inverse transform, another third of our time,
+   are still scalar here and NEON in FFmpeg.
    FFmpeg's arm64 build uses NEON intrinsics — processing 8 u8 pixels per
    128-bit register vs our 1 pixel at a time.
 
@@ -342,7 +360,7 @@ The single-threaded gap on 8-bit 1080p content is dominated by:
    all cores. `rust_h265` is single-threaded by design. The `ff-t1 → ff-tN`
    delta is roughly 3–4× on workloads big enough to keep 10 cores busy.
 
-### 10-bit gap (1.25–1.6×)
+### 10-bit gap (about 1×)
 
 The 10-bit gap is notably smaller because:
 
@@ -350,10 +368,10 @@ The 10-bit gap is notably smaller because:
    processes 4 samples per 64-bit lane instead of 8. FFmpeg's NEON kernels
    exist for 10-bit but their throughput advantage is ~2× (not ~4×).
 
-2. **Our scalar code scales linearly.** The same `i32` arithmetic runs
-   regardless of the storage type; the `Pixel` trait abstraction adds
-   negligible overhead. Our 10-bit safe preset runs at 96% of 8-bit speed
-   (293/304), while FFmpeg drops to 38% (463/1232).
+2. **Our code scales nearly linearly.** 8-bit filters accumulate in i16
+   and 10-bit filters in i32, and everything outside MC uses the same
+   arithmetic for both. Our 10-bit safe preset runs at 85% of 8-bit speed
+   (414/486), while FFmpeg drops to 40% (487/1220).
 
 ### Allocation and bounds-check overhead
 
@@ -366,20 +384,24 @@ bottleneck per the profile.
 ## Priorities
 
 All six real-world fixtures decode byte-exact. Remaining focus is
-performance, ordered by profile-informed impact:
+performance, ordered by expected return:
 
-1. **NEON SIMD for MC filters** (62% of 8-bit decode time). `mc_luma_i32`
-   and the direct-output luma filter first, then `mc_chroma_i32` /
-   `mc_chroma`, then the bi-pred combining loop. Needs both u8 and u16
-   kernel variants. Now that interior blocks read the reference plane
-   directly, the filter loops are straightforward to vectorise.
+1. **Vectorise deblocking** (~17%). The luma edge filter and the boundary
+   strength derivation are scalar. The same approach that worked for MC
+   (row-slice loops LLVM can vectorise, no `unsafe`) is the cheap first
+   step; BS derivation could also batch per 8x8 block instead of per 4x4
+   edge.
 
-2. **Deblocking** (~11%). BS derivation could batch per-8x8 block instead
-   of per-4x4 edge; `filter_luma_edge` is a SIMD candidate.
+2. **Vectorise the inverse transform** (~17%). `tr_32` and `tr_16` first.
+   Same approach: try compiler vectorisation before intrinsics.
 
-3. **NEON SIMD for IDCT** (~10%). tr_32 first, then tr_16.
+3. **Hand-written NEON for MC** (~38%, already vectorised). Closing the
+   remaining gap to FFmpeg likely needs explicit intrinsics: the `usdot`
+   dot-product filters with runtime CPU detection and a plain-NEON
+   fallback, and per-width kernels. This brings `unsafe` into the crate,
+   which the README reserves for SIMD paths.
 
-4. **Pool picture buffers** (~4%). Reuse Y/U/V planes and bookkeeping
+4. **Pool picture buffers** (~5%). Reuse Y/U/V planes and bookkeeping
    arrays across frames instead of allocating fresh each time.
 
 ## Appendix: tool usage
