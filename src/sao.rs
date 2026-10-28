@@ -351,7 +351,14 @@ fn sao_skip_slice_boundary<P: Pixel>(state: &PictureState<P>, rs_a: usize, rs_b:
     if state.tab_slice_addr_rs[rs_a] == state.tab_slice_addr_rs[rs_b] {
         return false;
     }
-    !state.filter_slice_edges[rs_a] || !state.filter_slice_edges[rs_b]
+    // Across a slice boundary the flag of the slice that is later in
+    // decoding order applies (spec 8.7.3.2).
+    let later = if state.tab_ctb_ts[rs_a] > state.tab_ctb_ts[rs_b] {
+        rs_a
+    } else {
+        rs_b
+    };
+    !state.filter_slice_edges[later]
 }
 
 /// Apply SAO to the entire reconstructed picture, after deblocking.

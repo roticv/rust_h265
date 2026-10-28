@@ -1134,6 +1134,7 @@ impl Decoder {
                 let rx = (x_ctb >> sps.ctb_log2_size_y) as usize;
                 let ry = (y_ctb >> sps.ctb_log2_size_y) as usize;
                 state.tab_slice_addr_rs[ctb_addr_rs as usize] = recorded_slice_addr;
+                state.tab_ctb_ts[ctb_addr_rs as usize] = ctb_addr_ts;
                 state.tab_deblock_offsets[ctb_addr_rs as usize] = (
                     (sh.slice_beta_offset_div2 * 2) as i8,
                     (sh.slice_tc_offset_div2 * 2) as i8,

@@ -266,6 +266,9 @@ pub struct PictureState<P: Pixel> {
     /// Consulted by `compute_luma_avail` to treat cross-tile neighbor
     /// samples as unavailable for intra prediction (spec 6.4.4 / 8.4.2).
     pub tab_tile_id: Vec<u32>,
+    /// Per CTB (raster index): its tile-scan address, i.e. its position in
+    /// decoding order. SAO uses it to tell which of two slices is later.
+    pub tab_ctb_ts: Vec<u32>,
     /// Per CTB: the deblocking (beta_offset, tc_offset) of the slice that
     /// contains it, i.e. slice_beta_offset_div2 * 2 and slice_tc_offset_div2
     /// * 2. Edges use the values of the slice containing their Q side.
@@ -419,6 +422,10 @@ impl<P: Pixel> PictureState<P> {
                 vec![0u32; pw * ph]
             },
             filter_across_tiles: true,
+            tab_ctb_ts: {
+                let ctb_size = 1u32 << log2_ctb_size;
+                vec![0; (w.div_ceil(ctb_size) * h.div_ceil(ctb_size)) as usize]
+            },
             tab_deblock_offsets: {
                 let ctb_size = 1u32 << log2_ctb_size;
                 vec![(0, 0); (w.div_ceil(ctb_size) * h.div_ceil(ctb_size)) as usize]

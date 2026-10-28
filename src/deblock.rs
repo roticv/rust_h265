@@ -434,7 +434,9 @@ fn skip_vertical_slice_boundary<P: Pixel>(state: &PictureState<P>, x: usize, y: 
     if state.tab_slice_addr_rs[left_rs] == state.tab_slice_addr_rs[right_rs] {
         return false; // same slice
     }
-    !state.filter_slice_edges[left_rs] || !state.filter_slice_edges[right_rs]
+    // The left edge of a slice is filtered unless the slice containing the
+    // Q sample (the current block) disables it (spec 8.7.2.3).
+    !state.filter_slice_edges[right_rs]
 }
 
 /// Check whether a horizontal edge at luma y crosses a slice or tile
@@ -457,7 +459,8 @@ fn skip_horizontal_slice_boundary<P: Pixel>(state: &PictureState<P>, x: usize, y
     if state.tab_slice_addr_rs[top_rs] == state.tab_slice_addr_rs[bot_rs] {
         return false; // same slice
     }
-    !state.filter_slice_edges[top_rs] || !state.filter_slice_edges[bot_rs]
+    // As above: the Q (lower) side's slice decides.
+    !state.filter_slice_edges[bot_rs]
 }
 
 /// Apply the deblocking filter to the entire reconstructed picture.
