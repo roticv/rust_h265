@@ -1,8 +1,8 @@
 [package]
 name = "rust_h265"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Pure Rust H.265/HEVC video decoder (Main and Main 10 profile, 8-bit and 10-bit 4:2:0)"
+description = "Pure Rust H.265/HEVC video decoder: Main and Main 10 profile, 8-bit and 10-bit, 4:2:0 and 4:4:4"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/roticv/rust_h265"
 readme = "README.md"

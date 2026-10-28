@@ -43,7 +43,11 @@ use crate::vps::{Vps, parse_vps};
 /// Pixel data is stored in a `PixelData` enum that can be either 8-bit (`U8`)
 /// or 10/12-bit (`U16`). Use `bit_depth` to distinguish; call
 /// `y.as_u8()` / `y.as_u16()` to access the underlying slices.
+///
+/// Non-exhaustive: fields may be added in minor releases. Read fields
+/// directly or destructure with `..`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Frame {
     pub y: PixelData,
     pub u: PixelData,

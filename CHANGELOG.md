@@ -5,6 +5,97 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-10-28
+
+Adds 4:4:4 decoding, fixes open-GOP streams, hardens the decoder against
+malformed input, and decodes real-world 1080p content 2.1–2.4× faster than
+0.1.0. All in-tree fixtures and the real-world Big Buck Bunny fixtures
+remain byte-exact against FFmpeg.
+
+### Breaking changes
+
+- `Frame` has a new public field, `chroma_format_idc`, and is now
+  `#[non_exhaustive]`. Code that builds a `Frame` literally or destructures
+  it without `..` must be updated. Future fields will not be breaking.
+- `DecodeError` has a new variant, `ResourceLimit`, and is now
+  `#[non_exhaustive]`. Exhaustive `match`es need a wildcard arm. Future
+  variants will not be breaking.
+- The decoder now enforces resource limits by default. An SPS whose
+  picture exceeds 35,651,584 luma samples (the Level 6.2 maximum) or an
+  estimated 512 MB of per-picture state is rejected with
+  `DecodeError::ResourceLimit`. Use `Decoder::with_limits` to change either
+  bound.
+- A conformance window larger than the coded picture is rejected at SPS
+  parse with `DecodeError::InvalidSyntax`. 0.1.0 produced empty frames.
+- When decoding starts at a CRA picture (the first picture of the
+  bitstream, or the first after an end-of-sequence NAL), its RASL pictures
+  are now skipped, as the spec requires and as FFmpeg does. 0.1.0 failed on
+  them.
+
+### Added
+
+- **4:4:4 decoding** (`ChromaArrayType` 3), 8-bit and 10-bit, intra and
+  inter, including PCM blocks, as used by HEIF/HEIC still images. Intra
+  support was contributed by Jens Walter
+  ([#1](https://github.com/roticv/rust_h265/pull/1)). 4:2:2 and monochrome
+  are still rejected with `DecodeError::Unsupported`.
+- `Frame::chroma_format_idc` (1 = 4:2:0, 3 = 4:4:4) for sizing the chroma
+  planes.
+- `parse_hvcc` for length-prefixed NAL units from MP4/MKV containers, and
+  `parse_nal` for a single raw NAL unit.
+- `DecodeLimits` and `Decoder::with_limits`, contributed by Stephen
+  Judkins ([#2](https://github.com/roticv/rust_h265/pull/2)).
+- `NalUnitType::is_cra`.
+- End-of-sequence NAL handling: the next picture starts a new coded video
+  sequence.
+
+### Fixed
+
+- Open-GOP streams with a mid-stream CRA picture, which x265 produces by
+  default for long encodes, failed with "reference picture POC not present
+  in DPB". prevTid0Pic was reset to 0 after every IRAP picture instead of
+  taking the IRAP picture's POC (spec 8.3.1).
+- A CRA that starts decoding now gets POC MSB 0 (NoRaslOutputFlag, spec
+  8.1.3), so decoding from a CRA with a large POC LSB, for example after a
+  seek, no longer derives a negative POC.
+- Inter prediction was wrong for picture widths that are not a multiple of
+  the CTB size: reference planes were read with the picture width as their
+  stride instead of the CTU-aligned stride.
+- About 35 crashes, panics, integer overflows and out-of-memory conditions
+  found by fuzzing, across SPS/PPS parameter validation, slice header entry
+  points, tile scan tables, scaling lists, prediction weight tables, CABAC
+  re-initialisation, coefficient and MVD decoding, motion compensation
+  reference reads, dequantisation, SAO and the inverse transform. Each has
+  a regression test.
+- Conformance window cropping uses checked arithmetic and bounds-checked
+  slicing (#2).
+
+### Performance
+
+Single-threaded, real-world 1080p content, Apple M4:
+
+| Fixture | 0.1.0 | 0.2.0 | Speedup |
+|---|---:|---:|---:|
+| 1080p `safe` preset | 113 fps | 253 fps | 2.24× |
+| 720p `safe` preset | 216 fps | 450 fps | 2.09× |
+| 1080p `medium` preset | 80 fps | 189 fps | 2.36× |
+| 1080p `slow` preset | 82 fps | 187 fps | 2.27× |
+| 1080p 10-bit `safe` | 99 fps | 208 fps | 2.10× |
+| 1080p 10-bit `medium` | 76 fps | 162 fps | 2.14× |
+
+- Motion compensation filters are written so that the compiler vectorises
+  them (NEON on aarch64, SSE/AVX on x86), with no `unsafe`. Interior blocks
+  read reference samples directly instead of through a clamping helper, and
+  8-bit filter passes accumulate in 16 bits.
+- Motion compensation scratch buffers are allocated once per picture
+  instead of being zero-filled per block.
+- The min-TB Z-scan table is built once per picture geometry instead of
+  per picture.
+- Deblocking boundary strength skips the full comparison between identical
+  motion fields.
+
+See `BENCHMARK.md` for comparisons with FFmpeg and libde265.
+
 ## [0.1.0] - 2026-04-21
 
 Initial release. Feature-complete HEVC decoder for Main and Main 10 profile.

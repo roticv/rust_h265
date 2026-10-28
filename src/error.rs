@@ -1,7 +1,11 @@
 use std::fmt;
 
 /// Errors produced by the H.265 decoder.
+///
+/// Non-exhaustive: new variants may be added in minor releases, so match
+/// with a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum DecodeError {
     /// Bitstream ended unexpectedly during parsing.
     UnexpectedEof,
