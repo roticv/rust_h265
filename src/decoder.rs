@@ -4682,6 +4682,19 @@ mod tests {
         )));
     }
 
+    /// SPS with MinTbLog2SizeY (5) >= MinCbLog2SizeY (3) inside 16x16 CTBs,
+    /// which spec 7.4.3.2.1 forbids. A 16-wide picture then has zero min-TB
+    /// columns, so `tab_cbf_luma` was empty and boundary-strength derivation
+    /// indexed past it. Found by the `decode_hvcc` fuzz target; it also
+    /// crashed 0.2.0 and earlier.
+    #[test]
+    fn test_fuzz_min_tb_ge_min_cb() {
+        fuzz_hvcc(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/fuzz_min_tb_ge_min_cb.bin"
+        )));
+    }
+
     #[test]
     fn test_fuzz_parallel_merge_level_overflow() {
         fuzz_hvcc(include_bytes!(concat!(

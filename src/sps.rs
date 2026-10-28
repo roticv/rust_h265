@@ -490,6 +490,46 @@ fn validate_conformance_window(
     Ok(())
 }
 
+/// Cross-field transform block size constraints (spec 7.4.3.2.1), which
+/// FFmpeg also enforces: MinTbLog2SizeY < MinCbLog2SizeY and
+/// MaxTbLog2SizeY <= Min(CtbLog2SizeY, 5). A min TB larger than the CTB
+/// leaves per-min-TB tables with zero columns for small pictures.
+fn validate_transform_block_sizes(
+    min_cb_log2: u8,
+    ctb_log2: u8,
+    min_tb_log2: u8,
+    max_tb_log2: u8,
+) -> Result<(), DecodeError> {
+    if min_tb_log2 >= min_cb_log2 {
+        return Err(DecodeError::InvalidSyntax(
+            "MinTbLog2SizeY must be less than MinCbLog2SizeY",
+        ));
+    }
+    if max_tb_log2 > ctb_log2.min(5) {
+        return Err(DecodeError::InvalidSyntax(
+            "MaxTbLog2SizeY exceeds Min(CtbLog2SizeY, 5)",
+        ));
+    }
+    Ok(())
+}
+
+/// `max_transform_hierarchy_depth_inter` / `_intra` must each lie in
+/// 0..=CtbLog2SizeY - MinTbLog2SizeY (spec 7.4.3.2.1, enforced by FFmpeg).
+fn validate_transform_hierarchy_depths(
+    ctb_log2: u8,
+    min_tb_log2: u8,
+    depth_inter: u32,
+    depth_intra: u32,
+) -> Result<(), DecodeError> {
+    let max_depth = u32::from(ctb_log2.saturating_sub(min_tb_log2));
+    if depth_inter > max_depth || depth_intra > max_depth {
+        return Err(DecodeError::InvalidSyntax(
+            "max_transform_hierarchy_depth out of range",
+        ));
+    }
+    Ok(())
+}
+
 pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     let mut r = BitstreamReader::new(rbsp);
 
@@ -636,9 +676,21 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     }
     let min_tb_log2_size_y = (log2_min_luma_transform_block_size_minus2 + 2) as u8;
     let max_tb_log2_size_y = min_tb_log2_size_y + log2_diff_max_min_luma_transform_block_size as u8;
+    validate_transform_block_sizes(
+        min_cb_log2_size_y,
+        ctb_log2_size_y,
+        min_tb_log2_size_y,
+        max_tb_log2_size_y,
+    )?;
 
     let max_transform_hierarchy_depth_inter = r.read_ue()?;
     let max_transform_hierarchy_depth_intra = r.read_ue()?;
+    validate_transform_hierarchy_depths(
+        ctb_log2_size_y,
+        min_tb_log2_size_y,
+        max_transform_hierarchy_depth_inter,
+        max_transform_hierarchy_depth_intra,
+    )?;
 
     let scaling_list_enabled_flag = r.read_bit()? == 1;
     let scaling_list = if scaling_list_enabled_flag {
@@ -809,6 +861,27 @@ mod tests {
     fn conformance_window_scales_by_chroma_subsampling() {
         assert!(validate_conformance_window(16, 16, 1, 1, 5, 5, 0, 0).is_ok());
         assert!(validate_conformance_window(16, 16, 2, 2, 5, 5, 0, 0).is_err());
+    }
+
+    #[test]
+    fn transform_block_size_constraints() {
+        // Common case: min CB 8, CTB 64, TB 4..32.
+        assert!(validate_transform_block_sizes(3, 6, 2, 5).is_ok());
+        // Min TB must be strictly smaller than min CB (the fuzz crash: 32 vs 8).
+        assert!(validate_transform_block_sizes(3, 4, 5, 5).is_err());
+        assert!(validate_transform_block_sizes(3, 6, 3, 5).is_err());
+        // Max TB may not exceed the CTB, nor 32 samples.
+        assert!(validate_transform_block_sizes(3, 4, 2, 5).is_err());
+        assert!(validate_transform_block_sizes(3, 4, 2, 4).is_ok());
+        assert!(validate_transform_block_sizes(4, 6, 3, 6).is_err());
+    }
+
+    #[test]
+    fn transform_hierarchy_depth_constraints() {
+        // CTB 64, min TB 4: depths up to 4 are legal.
+        assert!(validate_transform_hierarchy_depths(6, 2, 4, 4).is_ok());
+        assert!(validate_transform_hierarchy_depths(6, 2, 5, 0).is_err());
+        assert!(validate_transform_hierarchy_depths(6, 2, 0, 5).is_err());
     }
 
     #[test]

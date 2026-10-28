@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Crash on malformed SPS transform sizes** (found by fuzzing; present in
+  0.1.0 and 0.2.0). An SPS whose minimum transform block was not smaller
+  than its minimum coding block, as in 32-sample transforms inside 16-sample
+  CTBs, made a per-transform-block table empty for small pictures, and
+  deblocking then panicked on an out-of-bounds index. The SPS parser now
+  enforces the spec 7.4.3.2.1 limits that FFmpeg also enforces:
+  MinTbLog2SizeY < MinCbLog2SizeY, MaxTbLog2SizeY <= Min(CtbLog2SizeY, 5),
+  and both `max_transform_hierarchy_depth` values within
+  CtbLog2SizeY - MinTbLog2SizeY.
 - **Tiled streams with real content decoded incorrectly.** Several
   derivations that must treat a neighbour in another tile as unavailable
   (spec 6.4.1) checked only the slice, or nothing: the `split_cu_flag` and
