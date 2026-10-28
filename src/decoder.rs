@@ -3049,7 +3049,7 @@ mod tests {
             crate::pixel::PixelData::U8(v) => hasher.update(v),
             crate::pixel::PixelData::U16(v) => {
                 for &sample in v {
-                    hasher.update(&sample.to_le_bytes());
+                    hasher.update(sample.to_le_bytes());
                 }
             }
         }

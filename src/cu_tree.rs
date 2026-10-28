@@ -4751,7 +4751,8 @@ mod tests {
         assert_eq!(qp_c_from_qp_i(qp_i), 40); // qp_i > 43 → qp_c = qp_i - 6
 
         // Case 5: Clamping at boundaries.
-        let qp_i = (-5i32 + 2 + 0).clamp(0, 57); // 0 (clamped)
+        // qp_y = -5, pps offset = 2, slice offset = 0.
+        let qp_i = (-5i32 + 2).clamp(0, 57); // 0 (clamped)
         assert_eq!(qp_c_from_qp_i(qp_i), 0);
         let qp_i = (51 + 5 + 3).clamp(0, 57); // 57 (clamped)
         assert_eq!(qp_c_from_qp_i(qp_i), 51); // 57 - 6

@@ -278,11 +278,11 @@ fn run_ours(path: &Path, warmup: u32, repeat: u32) -> OursTiming {
 /// Read `rtime=<secs>` out of ffmpeg's `-benchmark` stderr line.
 fn parse_rtime(stderr: &str) -> Option<Duration> {
     for line in stderr.lines() {
-        if let Some(after) = line.strip_prefix("bench:") {
-            if let Some(rt) = after.split("rtime=").nth(1) {
-                let t: f64 = rt.trim_end_matches('s').trim().parse().ok()?;
-                return Some(Duration::from_secs_f64(t));
-            }
+        if let Some(after) = line.strip_prefix("bench:")
+            && let Some(rt) = after.split("rtime=").nth(1)
+        {
+            let t: f64 = rt.trim_end_matches('s').trim().parse().ok()?;
+            return Some(Duration::from_secs_f64(t));
         }
     }
     None
@@ -381,10 +381,10 @@ fn main() -> std::io::Result<()> {
     eprintln!("bench_realworld: checking/generating fixtures");
     let mut paths: Vec<(&Fixture, PathBuf)> = Vec::new();
     for f in FIXTURES {
-        if let Some(n) = &only {
-            if n != f.name {
-                continue;
-            }
+        if let Some(n) = &only
+            && n != f.name
+        {
+            continue;
         }
         let p = cache_dir().join(format!("{}.h265", f.name));
         if !p.exists() {
@@ -468,10 +468,8 @@ fn main() -> std::io::Result<()> {
             ffn_ms,
             mpx_n
         ));
-        if !ours_ok {
-            if let Some(e) = &ours.error {
-                eprintln!("    ours failed: {e}");
-            }
+        if !ours_ok && let Some(e) = &ours.error {
+            eprintln!("    ours failed: {e}");
         }
     }
     std::fs::write(raw_path, raw)?;

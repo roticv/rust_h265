@@ -16,7 +16,7 @@ in-tree fixtures plus 6 real-world Big Buck Bunny 1080p transcodes (8-bit and
 - **Build release:** `cargo build --release`
 - **Test all:** `cargo test --release`
 - **Run single test:** `cargo test --release <test_name>`
-- **Lint:** `cargo clippy`
+- **Lint:** `cargo clippy --release --all-targets -- -D warnings` (what CI runs)
 - **Format:** `cargo fmt`
 - **Play a file:** `cargo run --release --example play -- input.h265 [--fps 30] [--loop]`
 - **Dump YUV:** `cargo run --release --example dump_frames -- input.h265 out.yuv`
