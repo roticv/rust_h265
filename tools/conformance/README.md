@@ -33,3 +33,4 @@ is updated as failures are fixed.
 |---|---:|---|
 | 2026-10-28 | 95 / 147 | First run. |
 | 2026-10-28 | 100 / 147 | Slice header extension skipped; per-slice reference lists; RASL skipped after BLA; reserved VCL NAL types ignored; LSB-only long-term references resolved; long-term MV prediction rules. |
+| 2026-10-28 | 121 / 147 | pic_output_flag; weighted bi-prediction and 10-bit offsets; 10-bit QP range; lossless/PCM loop-filter protection and PCM CU edges; per-slice deblocking offsets and disable; raster slice addresses with tiles; tile-start context/QP resets; spec slice-boundary rules for mixed across-slice flags. |
