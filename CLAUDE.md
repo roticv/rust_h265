@@ -64,7 +64,7 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 - **`Pixel` trait generics:** All pixel-processing functions are `<P: Pixel>`. `PictureState<P>` stores `Vec<P>` planes. The decoder dispatches at runtime via `PictureStateEnum { U8(...), U16(...) }` with a `with_picture_state!` macro.
 - **`SliceParams`** bundles per-slice state (ref lists, merge candidates, QP offsets, weight tables) passed to CU decode functions. Separate from `PictureState` which is per-picture mutable state.
 - **Bit-depth parameterization:** `pixel::mc_shift(bit_depth)` = `14 - bit_depth`, `pixel::bipred_shift(bit_depth)` = `15 - bit_depth`. Dequant uses `qp + 6*(bit_depth-8)`. Deblock scales beta/tc by `1 << (bit_depth-8)`.
-- **Stack-allocated MC scratch buffers:** `[i32; MAX_PB_LUMA]` instead of `Vec`, sized for 64×64 max PU.
+- **Reused MC scratch buffers:** `inter_pred::McScratch` (owned by `PictureState`, lent to each PU by `motion_compensation_cu`) holds the bi-pred / weighted intermediates and the separable-filter temporary, sized for 64×64 luma and 64×64 chroma (4:4:4). Do not reintroduce per-call zero-initialised stack arrays in the MC path: zero-filling ~100 KB per bi-predicted block cost 7-10% of total decode time on 1080p content.
 
 ## Testing Strategy
 

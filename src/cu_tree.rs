@@ -280,6 +280,9 @@ pub struct PictureState<P: Pixel> {
     /// tb_mask = (1 << (ctb_log2 - min_tb_log2)) * pic_width_in_ctbs - 1
     /// Actually, the number of min-TBs across the picture width.
     pub min_tb_width: usize,
+    /// Motion compensation scratch buffers, reused by every inter block of
+    /// this picture (see `inter_pred::McScratch`).
+    pub mc_scratch: crate::inter_pred::McScratch,
 }
 
 impl<P: Pixel> PictureState<P> {
@@ -448,6 +451,7 @@ impl<P: Pixel> PictureState<P> {
                 let pic_w_in_ctbs = w.div_ceil(ctb_size);
                 (pic_w_in_ctbs * tb_per_ctb) as usize
             },
+            mc_scratch: crate::inter_pred::McScratch::new(),
         }
     }
 

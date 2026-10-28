@@ -63,6 +63,50 @@ const MAX_PB_LUMA: usize = MAX_PB_SIZE * MAX_PB_SIZE;
 /// Max chroma PU area: 64×64 for 4:4:4 (32×32 would suffice for 4:2:0).
 const MAX_PB_CHROMA: usize = MAX_PB_SIZE * MAX_PB_SIZE;
 
+/// Length of the separable-filter intermediate buffer: enough rows for a
+/// 64-row block plus the 8-tap luma filter margin (the 4-tap chroma margin
+/// is smaller), at a fixed `MAX_PB_SIZE` stride.
+pub(crate) const MC_TMP_LEN: usize = QPEL_TMP_ROWS * MAX_PB_SIZE;
+
+/// Reusable motion compensation scratch space. `PictureState` owns one and
+/// lends it to every prediction block, so no per-block buffer is
+/// zero-filled. That zero-filling used to dominate the cost of small
+/// blocks: a bi-predicted block cleared six 16 KB stack arrays plus a filter
+/// temporary on every call. Every region is fully written before it is
+/// read, so stale contents left by earlier blocks are never observed.
+#[derive(Default)]
+pub struct McScratch {
+    /// L0 luma intermediate (bi-pred), or the weighted uni-pred luma.
+    luma0: Vec<i32>,
+    /// L1 luma intermediate (bi-pred).
+    luma1: Vec<i32>,
+    /// L0 Cb / Cr intermediates (bi-pred), or the weighted uni-pred chroma.
+    cb0: Vec<i32>,
+    cr0: Vec<i32>,
+    /// L1 Cb / Cr intermediates (bi-pred).
+    cb1: Vec<i32>,
+    cr1: Vec<i32>,
+    /// Separable 2-D filter intermediate, shared by luma and chroma.
+    tmp: Vec<i32>,
+}
+
+impl McScratch {
+    /// Allocate buffers sized for the largest prediction block (64×64, and
+    /// 64×64 chroma for 4:4:4). `Default` gives empty buffers instead, which
+    /// is only used as the placeholder while the scratch is lent out.
+    pub fn new() -> Self {
+        Self {
+            luma0: vec![0; MAX_PB_LUMA],
+            luma1: vec![0; MAX_PB_LUMA],
+            cb0: vec![0; MAX_PB_CHROMA],
+            cr0: vec![0; MAX_PB_CHROMA],
+            cb1: vec![0; MAX_PB_CHROMA],
+            cr1: vec![0; MAX_PB_CHROMA],
+            tmp: vec![0; MC_TMP_LEN],
+        }
+    }
+}
+
 /// Chroma motion vector component (spec 8.5.3.2.10): `mvLX * 2 / SubWidthC`
 /// (or `SubHeightC`), in units of 1/8 chroma sample. `shift` is
 /// `log2(SubWidthC)` — 1 for 4:2:0 (chroma MV equals the luma MV, now in
@@ -112,6 +156,7 @@ pub fn mc_luma<P: Pixel>(
     mv_x: i16,
     mv_y: i16,
     bit_depth: u8,
+    tmp: &mut [i32],
 ) {
     let x_frac = (mv_x & 3) as usize;
     let y_frac = (mv_y & 3) as usize;
@@ -186,7 +231,7 @@ pub fn mc_luma<P: Pixel>(
         // malloc/free overhead (this was ~23% of decode time on 1080p).
         // Using i32 for 10-bit safety (8-tap on 1023-max samples can exceed i16 range).
         let tmp_h = n_pb_h + (QPEL_EXTRA_BEFORE + QPEL_EXTRA_AFTER) as usize;
-        let mut tmp = [0i32; QPEL_TMP_ROWS * MAX_PB_SIZE];
+        debug_assert!(tmp.len() >= MC_TMP_LEN);
 
         // Horizontal pass: produce (n_pb_h + 7) rows of i32 values.
         let y_start = y_int - QPEL_EXTRA_BEFORE;
@@ -248,6 +293,7 @@ pub fn mc_luma_i32<P: Pixel>(
     mv_x: i16,
     mv_y: i16,
     bit_depth: u8,
+    tmp: &mut [i32],
 ) {
     let x_frac = (mv_x & 3) as usize;
     let y_frac = (mv_y & 3) as usize;
@@ -303,7 +349,7 @@ pub fn mc_luma_i32<P: Pixel>(
         let h_filter = &QPEL_FILTER[x_frac];
         let v_filter = &QPEL_FILTER[y_frac];
         let tmp_h = n_pb_h + (QPEL_EXTRA_BEFORE + QPEL_EXTRA_AFTER) as usize;
-        let mut tmp = [0i32; QPEL_TMP_ROWS * MAX_PB_SIZE];
+        debug_assert!(tmp.len() >= MC_TMP_LEN);
         let y_start = y_int - QPEL_EXTRA_BEFORE;
         for j in 0..tmp_h {
             let ry = y_start + j as i32;
@@ -348,6 +394,7 @@ pub fn mc_chroma_i32<P: Pixel>(
     mv_x: i32,
     mv_y: i32,
     bit_depth: u8,
+    tmp: &mut [i32],
 ) {
     // Chroma MV in eighth-chroma-sample units (see `chroma_mv`).
     let x_frac = (mv_x & 7) as usize;
@@ -402,7 +449,7 @@ pub fn mc_chroma_i32<P: Pixel>(
         let h_filter = &EPEL_FILTER[x_frac];
         let v_filter = &EPEL_FILTER[y_frac];
         let tmp_h = n_pb_h + (EPEL_EXTRA_BEFORE + EPEL_EXTRA_AFTER) as usize;
-        let mut tmp = [0i32; EPEL_TMP_ROWS * MAX_PB_SIZE];
+        debug_assert!(tmp.len() >= MC_TMP_LEN);
         let y_start = y_int - EPEL_EXTRA_BEFORE;
         for j in 0..tmp_h {
             let ry = y_start + j as i32;
@@ -451,6 +498,7 @@ pub fn mc_chroma<P: Pixel>(
     mv_x_c: i32,
     mv_y_c: i32,
     bit_depth: u8,
+    tmp: &mut [i32],
 ) {
     // Chroma MV in eighth-chroma-sample units (see `chroma_mv`).
     let x_frac = (mv_x_c & 7) as usize;
@@ -513,7 +561,7 @@ pub fn mc_chroma<P: Pixel>(
         let v_filter = &EPEL_FILTER[y_frac];
 
         let tmp_h = n_pb_h_c + (EPEL_EXTRA_BEFORE + EPEL_EXTRA_AFTER) as usize;
-        let mut tmp = [0i32; EPEL_TMP_ROWS * MAX_PB_SIZE];
+        debug_assert!(tmp.len() >= MC_TMP_LEN);
 
         let y_start = y_int - EPEL_EXTRA_BEFORE;
         for j in 0..tmp_h {
@@ -554,6 +602,7 @@ pub fn mc_chroma<P: Pixel>(
 #[allow(clippy::too_many_arguments)]
 pub fn motion_compensation_pu<P: Pixel>(
     state: &mut PictureState<P>,
+    scratch: &mut McScratch,
     ref_frames_l0: &[Rc<DecodedPicture>],
     ref_frames_l1: &[Rc<DecodedPicture>],
     x0: u32,
@@ -567,6 +616,15 @@ pub fn motion_compensation_pu<P: Pixel>(
     let x_pu = (x0 >> state.log2_min_pu_size) as usize;
     let y_pu = (y0 >> state.log2_min_pu_size) as usize;
     let mvf = state.tab_mvf[y_pu * state.min_pu_width + x_pu];
+    let McScratch {
+        luma0,
+        luma1,
+        cb0,
+        cr0,
+        cb1,
+        cr1,
+        tmp,
+    } = scratch;
 
     if mvf.pred_flag == 0 {
         // Intra PU in an inter slice — MC is not applicable. The intra
@@ -603,12 +661,12 @@ pub fn motion_compensation_pu<P: Pixel>(
         // (before the final clip), then combine as specified by the HEVC spec:
         //   output = clip((L0 + L1 + bipred_offset) >> bipred_shift)
         // For 8-bit: shift = 7, offset = 64. For 10-bit: shift = 5, offset = 16.
-        let mut pred_l0_y = [0i32; MAX_PB_LUMA];
-        let mut pred_l1_y = [0i32; MAX_PB_LUMA];
-        let mut pred_l0_u = [0i32; MAX_PB_CHROMA];
-        let mut pred_l0_v = [0i32; MAX_PB_CHROMA];
-        let mut pred_l1_u = [0i32; MAX_PB_CHROMA];
-        let mut pred_l1_v = [0i32; MAX_PB_CHROMA];
+        let pred_l0_y = &mut luma0[..];
+        let pred_l1_y = &mut luma1[..];
+        let pred_l0_u = &mut cb0[..];
+        let pred_l0_v = &mut cr0[..];
+        let pred_l1_u = &mut cb1[..];
+        let pred_l1_v = &mut cr1[..];
 
         // L0
         let l0_idx = mvf.ref_idx[0] as usize;
@@ -621,7 +679,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             let rh = ref_pic_l0.height as i32;
             let rs = ref_pic_l0.y_stride;
             mc_luma_i32::<P>(
-                &mut pred_l0_y,
+                pred_l0_y,
                 w,
                 P::extract_slice(&ref_pic_l0.y),
                 rs,
@@ -634,6 +692,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mvf.mv[0].x,
                 mvf.mv[0].y,
                 bit_depth,
+                &mut tmp[..],
             );
             let rw_c = (ref_pic_l0.width >> csw) as i32;
             let rh_c = (ref_pic_l0.height >> csh) as i32;
@@ -641,7 +700,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             let mv_x_c = chroma_mv(mvf.mv[0].x, csw);
             let mv_y_c = chroma_mv(mvf.mv[0].y, csh);
             mc_chroma_i32::<P>(
-                &mut pred_l0_u,
+                pred_l0_u,
                 w_c,
                 P::extract_slice(&ref_pic_l0.u),
                 rs_c,
@@ -654,9 +713,10 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_x_c,
                 mv_y_c,
                 bit_depth,
+                &mut tmp[..],
             );
             mc_chroma_i32::<P>(
-                &mut pred_l0_v,
+                pred_l0_v,
                 w_c,
                 P::extract_slice(&ref_pic_l0.v),
                 rs_c,
@@ -669,6 +729,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_x_c,
                 mv_y_c,
                 bit_depth,
+                &mut tmp[..],
             );
         }
 
@@ -683,7 +744,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             let rh = ref_pic_l1.height as i32;
             let rs = ref_pic_l1.y_stride;
             mc_luma_i32::<P>(
-                &mut pred_l1_y,
+                pred_l1_y,
                 w,
                 P::extract_slice(&ref_pic_l1.y),
                 rs,
@@ -696,6 +757,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mvf.mv[1].x,
                 mvf.mv[1].y,
                 bit_depth,
+                &mut tmp[..],
             );
             let rw_c = (ref_pic_l1.width >> csw) as i32;
             let rh_c = (ref_pic_l1.height >> csh) as i32;
@@ -703,7 +765,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             let mv_x_c = chroma_mv(mvf.mv[1].x, csw);
             let mv_y_c = chroma_mv(mvf.mv[1].y, csh);
             mc_chroma_i32::<P>(
-                &mut pred_l1_u,
+                pred_l1_u,
                 w_c,
                 P::extract_slice(&ref_pic_l1.u),
                 rs_c,
@@ -716,9 +778,10 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_x_c,
                 mv_y_c,
                 bit_depth,
+                &mut tmp[..],
             );
             mc_chroma_i32::<P>(
-                &mut pred_l1_v,
+                pred_l1_v,
                 w_c,
                 P::extract_slice(&ref_pic_l1.v),
                 rs_c,
@@ -731,6 +794,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_x_c,
                 mv_y_c,
                 bit_depth,
+                &mut tmp[..],
             );
         }
 
@@ -804,6 +868,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv.x,
                 mv.y,
                 bit_depth,
+                &mut tmp[..],
             );
 
             let ref_w_c = (ref_list.width >> csw) as i32;
@@ -826,6 +891,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_x_c,
                 mv_y_c,
                 bit_depth,
+                &mut tmp[..],
             );
             mc_chroma::<P>(
                 &mut state.v_plane[c_off..],
@@ -841,6 +907,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_x_c,
                 mv_y_c,
                 bit_depth,
+                &mut tmp[..],
             );
         } else {
             // Weighted uni-prediction: compute MC at i16 precision, then apply
@@ -867,9 +934,9 @@ pub fn motion_compensation_pu<P: Pixel>(
             };
 
             // Luma: MC into i32 intermediate, then apply weight.
-            let mut pred_y = [0i32; MAX_PB_LUMA];
+            let pred_y = &mut luma0[..];
             mc_luma_i32::<P>(
-                &mut pred_y,
+                pred_y,
                 w,
                 P::extract_slice(&ref_list.y),
                 ref_list.y_stride,
@@ -882,6 +949,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv.x,
                 mv.y,
                 bit_depth,
+                &mut tmp[..],
             );
             // Apply weighted prediction: spec 8.5.3.3.4.1
             // For uni-pred weighted: log2WD = luma_log2_weight_denom + (bit_depth - 8)
@@ -919,10 +987,10 @@ pub fn motion_compensation_pu<P: Pixel>(
                 0
             };
 
-            let mut pred_u = [0i32; MAX_PB_CHROMA];
-            let mut pred_v = [0i32; MAX_PB_CHROMA];
+            let pred_u = &mut cb0[..];
+            let pred_v = &mut cr0[..];
             mc_chroma_i32::<P>(
-                &mut pred_u,
+                pred_u,
                 w_c,
                 P::extract_slice(&ref_list.u),
                 ref_uv_stride,
@@ -935,9 +1003,10 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_x_c,
                 mv_y_c,
                 bit_depth,
+                &mut tmp[..],
             );
             mc_chroma_i32::<P>(
-                &mut pred_v,
+                pred_v,
                 w_c,
                 P::extract_slice(&ref_list.v),
                 ref_uv_stride,
@@ -950,6 +1019,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_x_c,
                 mv_y_c,
                 bit_depth,
+                &mut tmp[..],
             );
 
             for j in 0..h_c {
@@ -992,11 +1062,17 @@ pub fn motion_compensation_cu<P: Pixel>(
 ) {
     use crate::cu_tree::PartMode;
 
+    // Lend the picture's scratch buffers to every PU of this CU. The empty
+    // placeholder left behind is never used: no other code touches
+    // `mc_scratch` while it is out, and it is restored below.
+    let mut scratch = std::mem::take(&mut state.mc_scratch);
+
     // Local helper to reduce repetition when threading weight params.
     macro_rules! mc_pu {
         ($x:expr, $y:expr, $w:expr, $h:expr) => {
             motion_compensation_pu(
                 state,
+                &mut scratch,
                 ref_frames_l0,
                 ref_frames_l1,
                 $x,
@@ -1052,6 +1128,7 @@ pub fn motion_compensation_cu<P: Pixel>(
             }
         }
     }
+    state.mc_scratch = scratch;
 }
 
 #[cfg(test)]
@@ -1090,6 +1167,7 @@ mod tests {
             0,
             0,
             8,
+            &mut vec![0i32; MC_TMP_LEN],
         );
 
         for j in 0..h {
@@ -1122,6 +1200,7 @@ mod tests {
             2,
             0,
             8,
+            &mut vec![0i32; MC_TMP_LEN],
         );
 
         // With uniform reference, all outputs should be 128.
@@ -1152,6 +1231,7 @@ mod tests {
             1,
             3,
             8,
+            &mut vec![0i32; MC_TMP_LEN],
         );
 
         for &v in &dst {
@@ -1189,6 +1269,7 @@ mod tests {
             0,
             0,
             8,
+            &mut vec![0i32; MC_TMP_LEN],
         );
 
         for j in 0..h {
@@ -1220,6 +1301,7 @@ mod tests {
             3,
             5,
             8,
+            &mut vec![0i32; MC_TMP_LEN],
         );
 
         for &v in &dst {
