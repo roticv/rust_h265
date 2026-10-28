@@ -31,6 +31,9 @@ use crate::pixel::{Pixel, PixelData};
 use crate::pps::{Pps, parse_pps};
 use crate::slice::{SliceHeader, SliceType, parse_slice_segment_header};
 use crate::sps::{ShortTermRps, Sps, parse_sps};
+
+/// Reference picture lists L0 and L1 of one slice.
+type RefPicLists = (Vec<Rc<DecodedPicture>>, Vec<Rc<DecodedPicture>>);
 use crate::vps::{Vps, parse_vps};
 
 /// A reconstructed video frame in YUV420 planar layout.
@@ -1562,7 +1565,7 @@ impl Decoder {
         rps: &ReferencePictureSets,
         dpb: &DecodedPictureBuffer,
         sh: &SliceHeader,
-    ) -> Result<(Vec<Rc<DecodedPicture>>, Vec<Rc<DecodedPicture>>), DecodeError> {
+    ) -> Result<RefPicLists, DecodeError> {
         let num_poc_total_curr = rps.num_poc_total_curr();
         let active_l0 = sh.num_ref_idx_l0_active_minus1 as usize + 1;
         let num_rps_curr_temp_list0 = active_l0.max(num_poc_total_curr);
