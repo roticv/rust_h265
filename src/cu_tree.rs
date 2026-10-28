@@ -236,7 +236,8 @@ pub struct PictureState<P: Pixel> {
     pub last_luma_residual: Option<ResidualBlock>,
 
     /// Phase 3b-1 deblocking: per-min-CB QP for deblock filter strength.
-    pub tab_qp_y: Vec<u8>,
+    /// Luma QP per min-CB. Signed: QpY ranges over -QpBdOffsetY..=51.
+    pub tab_qp_y: Vec<i8>,
     /// Phase 3b-1 deblocking: per-4×4 boundary strength for vertical edges.
     /// Indexed by `(y/4) * (width/4) + (x/4)` (matches FFmpeg's `vertical_bs`).
     pub bs_vertical: Vec<u8>,
@@ -374,7 +375,7 @@ impl<P: Pixel> PictureState<P> {
             qpy_pred: 0,
             first_qp_group: false,
             last_luma_residual: None,
-            tab_qp_y: vec![0u8; min_cb_width * min_cb_height],
+            tab_qp_y: vec![0i8; min_cb_width * min_cb_height],
             bs_vertical: vec![0u8; ((w_aligned / 4) * (h_aligned / 4)) as usize],
             bs_horizontal: vec![0u8; ((w_aligned / 4) * (h_aligned / 4)) as usize],
             tab_cbf_luma: vec![0u8; min_tb_width * min_tb_height],
@@ -3297,7 +3298,9 @@ fn decode_transform_unit<P: Pixel>(
                 0
             };
             state.last_cu_qp_delta = signed;
-            if !(-26..=25).contains(&signed) {
+            // CuQpDeltaVal range: -(26 + QpBdOffsetY/2) ..= 25 + QpBdOffsetY/2.
+            let half_bd = 3 * (sps.bit_depth_luma as i32 - 8);
+            if !(-(26 + half_bd)..=25 + half_bd).contains(&signed) {
                 return Err(DecodeError::InvalidSyntax("cu_qp_delta out of range"));
             }
             state.is_cu_qp_delta_coded = true;
@@ -3642,8 +3645,7 @@ fn get_qpy_pred<P: Pixel>(
 /// HEVC spec 8.6.1 `set_qPy`. Computes the effective luma QP for a CU as
 /// `qPy_pred + cu_qp_delta` with modular wrap into `[-qp_bd_offset, 51]`,
 /// then stashes the result in `state.last_qp_y`. Mirrors FFmpeg
-/// `filter.c:ff_hevc_set_qPy`. We only support 8-bit (`qp_bd_offset = 0`),
-/// so the modular wrap reduces to mod-52.
+/// `filter.c:ff_hevc_set_qPy`; `qp_bd_offset = 6 * (BitDepthY - 8)`.
 fn set_qpy<P: Pixel>(
     state: &mut PictureState<P>,
     sps: &Sps,
@@ -3655,8 +3657,9 @@ fn set_qpy<P: Pixel>(
     let qp_pred = get_qpy_pred(state, sps, pps, slice_qp, x_base, y_base);
     let delta = state.last_cu_qp_delta;
     state.last_qp_y = if delta != 0 {
-        // 8-bit: qp_bd_offset = 0, so modulo is plain mod-52.
-        let off = 0i32;
+        // QpY = ((qPY_PRED + CuQpDeltaVal + 52 + 2*QpBdOffsetY) %
+        //        (52 + QpBdOffsetY)) - QpBdOffsetY   (spec eq. 8-283)
+        let off = 6 * (sps.bit_depth_luma as i32 - 8);
         (qp_pred + delta + 52 + 2 * off).rem_euclid(52 + off) - off
     } else {
         qp_pred
@@ -3697,7 +3700,8 @@ fn write_qp_y_table<P: Pixel>(
     let length = ((1u32 << log2_size) >> state.log2_min_cb_size).max(1) as usize;
     let x_cb = (x0 >> state.log2_min_cb_size) as usize;
     let y_cb = (y0 >> state.log2_min_cb_size) as usize;
-    let v = qp_y.clamp(0, 51) as u8;
+    let qp_bd_offset = 6 * (state.bit_depth as i32 - 8);
+    let v = qp_y.clamp(-qp_bd_offset, 51) as i8;
     for j in 0..length {
         let row = (y_cb + j) * state.min_cb_width;
         for i in 0..length {
@@ -3743,7 +3747,8 @@ fn decode_chroma_residuals<P: Pixel>(
         } else {
             pps.pps_cr_qp_offset + slice_cr_qp_offset + state.cu_qp_offset_cr
         };
-        let qp_i = (qp_y + qp_offset).clamp(0, 57);
+        // qPiCb/Cr = Clip3(-QpBdOffsetC, 57, QpY + offsets) (spec 8.6.1).
+        let qp_i = (qp_y + qp_offset).clamp(-6 * (sps.bit_depth_chroma as i32 - 8), 57);
         // ChromaArrayType 1 (4:2:0) maps qPi → QpC via table 8-10; 4:2:2 and
         // 4:4:4 use `Min(qPi, 51)` directly.
         let qp_c = if state.chroma_array_type == 1 {

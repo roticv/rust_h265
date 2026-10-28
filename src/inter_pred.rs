@@ -953,16 +953,56 @@ pub fn motion_compensation_pu<P: Pixel>(
 
         // Combine at i32 precision: (L0 + L1 + bipred_offset) >> bipred_shift, then clip.
         let y_off = (y0 as usize) * y_stride + (x0 as usize);
-        let bi = |plane: &mut [P], off, stride, a: &[i32], b: &[i32], w, h| {
-            put_rows(plane, off, stride, w, h, |d, j| {
-                let (a, b) = (&a[j * w..][..w], &b[j * w..][..w]);
-                for ((o, &x), &y) in d.iter_mut().zip(a).zip(b) {
-                    *o = P::from_i32_clamped((x + y + bi_offset) >> bi_shift, bit_depth);
-                }
-            })
+        // Explicit weighted bi-prediction (spec 8.5.3.3.4.3) uses per-list
+        // weights and offsets for each plane; otherwise the default average.
+        let wt = pred_weight_table;
+        let ofs = 1i32 << (bit_depth as i32 - 8);
+        let mc_sh = crate::pixel::mc_shift(bit_depth) as i32;
+        let plane_weights = |c: usize| -> (i32, i32, i32, i32, i32) {
+            if c == 0 {
+                (
+                    wt.luma_weight_l0[l0_idx] as i32,
+                    wt.luma_weight_l1[l1_idx] as i32,
+                    wt.luma_offset_l0[l0_idx] as i32 * ofs,
+                    wt.luma_offset_l1[l1_idx] as i32 * ofs,
+                    wt.luma_log2_weight_denom as i32 + mc_sh,
+                )
+            } else {
+                let k = c - 1;
+                (
+                    wt.chroma_weight_l0[l0_idx][k] as i32,
+                    wt.chroma_weight_l1[l1_idx][k] as i32,
+                    wt.chroma_offset_l0[l0_idx][k] as i32 * ofs,
+                    wt.chroma_offset_l1[l1_idx][k] as i32 * ofs,
+                    wt.chroma_log2_weight_denom as i32 + mc_sh,
+                )
+            }
+        };
+        let bi = |plane: &mut [P], c: usize, off, stride, a: &[i32], b: &[i32], w, h| {
+            if weighted_pred_flag {
+                let (w0, w1, o0, o1, log2wd) = plane_weights(c);
+                let round = (o0 + o1 + 1) << log2wd;
+                put_rows(plane, off, stride, w, h, |d, j| {
+                    let (a, b) = (&a[j * w..][..w], &b[j * w..][..w]);
+                    for ((o, &x), &y) in d.iter_mut().zip(a).zip(b) {
+                        *o = P::from_i32_clamped(
+                            (x * w0 + y * w1 + round) >> (log2wd + 1),
+                            bit_depth,
+                        );
+                    }
+                })
+            } else {
+                put_rows(plane, off, stride, w, h, |d, j| {
+                    let (a, b) = (&a[j * w..][..w], &b[j * w..][..w]);
+                    for ((o, &x), &y) in d.iter_mut().zip(a).zip(b) {
+                        *o = P::from_i32_clamped((x + y + bi_offset) >> bi_shift, bit_depth);
+                    }
+                })
+            }
         };
         bi(
             &mut state.y_plane,
+            0,
             y_off,
             y_stride,
             pred_l0_y,
@@ -972,6 +1012,7 @@ pub fn motion_compensation_pu<P: Pixel>(
         );
         bi(
             &mut state.u_plane,
+            1,
             c_off,
             uv_stride,
             pred_l0_u,
@@ -981,6 +1022,7 @@ pub fn motion_compensation_pu<P: Pixel>(
         );
         bi(
             &mut state.v_plane,
+            2,
             c_off,
             uv_stride,
             pred_l0_v,
@@ -1078,6 +1120,9 @@ pub fn motion_compensation_pu<P: Pixel>(
             // Weighted uni-prediction: compute MC at i16 precision, then apply
             // weight/offset per HEVC spec 8.5.3.3.4.1 / FFmpeg put_hevc_qpel_uni_w.
             let wt = pred_weight_table;
+            // Offsets are coded at 8-bit precision and scaled by
+            // 1 << (BitDepth - 8) (spec 7.4.7.3, high_precision_offsets off).
+            let ofs = 1i32 << (bit_depth as i32 - 8);
             let (luma_w, luma_o, chroma_w, chroma_o, luma_denom, chroma_denom) = if use_l0 {
                 (
                     wt.luma_weight_l0[ref_idx] as i32,
@@ -1135,7 +1180,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 y_stride,
                 pred_y,
                 (w, h),
-                (luma_w, round, shift, luma_o),
+                (luma_w, round, shift, luma_o * ofs),
                 bit_depth,
             );
 
@@ -1199,7 +1244,12 @@ pub fn motion_compensation_pu<P: Pixel>(
                     uv_stride,
                     pred,
                     (w_c, h_c),
-                    (chroma_w[c] as i32, c_round, c_shift, chroma_o[c] as i32),
+                    (
+                        chroma_w[c] as i32,
+                        c_round,
+                        c_shift,
+                        chroma_o[c] as i32 * ofs,
+                    ),
                     bit_depth,
                 );
             }
