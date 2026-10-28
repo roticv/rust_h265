@@ -140,6 +140,10 @@ struct PictureInProgress {
     ctbs_decoded: u32,
     /// Total CTBs in the picture = `pic_width_in_ctbs * pic_height_in_ctbs`.
     total_ctbs: u32,
+    /// Reference POC lists of each independent slice, keyed by its slice
+    /// address (the value `tab_slice_addr_rs` holds for its CTBs). Stored in
+    /// the decoded picture for temporal MV prediction by later pictures.
+    slice_ref_pocs: Vec<(i32, crate::dpb::SliceRefLists)>,
 }
 
 /// Tile scan derivation tables for a given (SPS, PPS) pair (spec 6.5.1).
@@ -699,7 +703,10 @@ impl Decoder {
             let no_rasl_output_flag =
                 nut.is_irap() && (!nut.is_cra() || !self.seen_picture || self.after_eos);
             if nut.is_irap() {
-                self.skip_rasl = nut.is_cra() && no_rasl_output_flag;
+                // RASL pictures are skipped after any IRAP with NoRaslOutputFlag
+                // = 1: a BLA always, a CRA that starts decoding (spec 8.1.3).
+                // IDR pictures have no associated RASL pictures.
+                self.skip_rasl = no_rasl_output_flag;
             }
             self.seen_picture = true;
             self.after_eos = false;
@@ -830,20 +837,20 @@ impl Decoder {
             // (before the CTB loop) so that motion compensation can access
             // the reference frame pixel data. Previously these were built at
             // picture completion (too late for MC).
-            self.current_ref_list_l0.clear();
-            self.current_ref_list_l1.clear();
-            if sh.slice_type != SliceType::I {
+            // Reference picture set and marking (spec 8.3.2) once per
+            // picture, before decoding it, whatever the first slice's type:
+            // an intra first slice can be followed by P/B slices, and an
+            // intra picture's RPS still decides which pictures stay
+            // referenced. Lists are built per slice below.
+            {
                 let sps_for_rps = self.sps.as_ref().expect("sps present");
                 let sps_st_rps = sps_for_rps.st_ref_pic_sets.clone();
                 let log2_max_poc_lsb = sps_for_rps.log2_max_pic_order_cnt_lsb;
                 self.dpb.configure_from_sps(sps_for_rps);
-                let rps =
+                let mut rps =
                     Self::derive_rps_from_slice_header_parts(&sh, &sps_st_rps, log2_max_poc_lsb);
-                Self::apply_rps_marking(&rps, &self.dpb, log2_max_poc_lsb);
+                Self::apply_rps_marking(&mut rps, &self.dpb, log2_max_poc_lsb);
                 self.current_rps = rps;
-                let (l0, l1) = Self::build_ref_pic_lists(&self.current_rps, &self.dpb, &sh)?;
-                self.current_ref_list_l0 = l0;
-                self.current_ref_list_l1 = l1;
             }
 
             // Populate `tab_tile_id` on the fresh picture state so intra
@@ -897,6 +904,7 @@ impl Decoder {
                 saved_wpp_cabac_state: None,
                 ctbs_decoded: 0,
                 total_ctbs,
+                slice_ref_pocs: Vec::new(),
             });
         } else {
             let pic = self
@@ -914,6 +922,26 @@ impl Decoder {
             // starts at `sh.slice_segment_address` regardless. This handles
             // streams where slices don't arrive in strict tile-scan order
             // or where there are gaps between slice segments.
+        }
+
+        // Reference picture lists are per slice (spec 8.3.4): every
+        // independent slice segment builds its own from its header; a
+        // dependent segment keeps its parent's.
+        if !sh.dependent_slice_segment_flag {
+            self.current_ref_list_l0.clear();
+            self.current_ref_list_l1.clear();
+            if sh.slice_type != SliceType::I {
+                let (l0, l1) = Self::build_ref_pic_lists(&self.current_rps, &self.dpb, &sh)?;
+                self.current_ref_list_l0 = l0;
+                self.current_ref_list_l1 = l1;
+            }
+            let entry = (
+                sh.slice_segment_address as i32,
+                Self::slice_ref_lists(&self.current_ref_list_l0, &self.current_ref_list_l1),
+            );
+            if let Some(pic) = self.current_picture.as_mut() {
+                pic.slice_ref_pocs.push(entry);
+            }
         }
 
         // Borrow the in-flight picture mutably for the rest of decode.
@@ -985,6 +1013,11 @@ impl Decoder {
             log2_parallel_merge_level: (pps.log2_parallel_merge_level_minus2 + 2) as u8,
             poc: sh.poc,
             ref_pic_list_pocs: [ref_list_l0_pocs, ref_list_l1_pocs],
+            ref_pic_list_is_lt: Self::slice_ref_lists(
+                &self.current_ref_list_l0,
+                &self.current_ref_list_l1,
+            )
+            .is_long_term,
             ref_frames_l0: self.current_ref_list_l0.clone(),
             ref_frames_l1: self.current_ref_list_l1.clone(),
             collocated_ref,
@@ -1142,8 +1175,6 @@ impl Decoder {
         // completed slice header so we can release the outstanding borrows.
         let pic_width = sps.pic_width_in_luma_samples;
         let pic_height = sps.pic_height_in_luma_samples;
-        let log2_max_poc_lsb = sps.log2_max_pic_order_cnt_lsb;
-        let sps_st_ref_pic_sets = sps.st_ref_pic_sets.clone();
         let last_sh_cloned = last_sh.clone();
         let picture_poc = last_sh_cloned.poc;
         let cropped_w = sps.cropped_width();
@@ -1180,22 +1211,6 @@ impl Decoder {
         {
             let sps_for_dpb = self.sps.as_ref().expect("sps still present after decode");
             self.dpb.configure_from_sps(sps_for_dpb);
-        }
-
-        self.current_rps = Self::derive_rps_from_slice_header_parts(
-            &last_sh_cloned,
-            &sps_st_ref_pic_sets,
-            log2_max_poc_lsb,
-        );
-        Self::apply_rps_marking(&self.current_rps, &self.dpb, log2_max_poc_lsb);
-
-        self.current_ref_list_l0.clear();
-        self.current_ref_list_l1.clear();
-        if last_sh_cloned.slice_type != SliceType::I {
-            let (l0, l1) =
-                Self::build_ref_pic_lists(&self.current_rps, &self.dpb, &last_sh_cloned)?;
-            self.current_ref_list_l0 = l0;
-            self.current_ref_list_l1 = l1;
         }
 
         let nut_for_tid0 = last_sh_cloned.nal_unit_type;
@@ -1251,6 +1266,8 @@ impl Decoder {
             dp.uv_stride = uv_stride;
             dp.chroma_shift_w = chroma_shift_w;
             dp.chroma_shift_h = chroma_shift_h;
+            dp.slice_ref_pic_list_pocs = std::mem::take(&mut pic.slice_ref_pocs);
+            dp.ctb_slice_addr = std::mem::take(&mut state.tab_slice_addr_rs);
             Rc::new(dp)
         });
         decoded_pic.mark(PictureReferenceStatus::ShortTerm);
@@ -1419,6 +1436,23 @@ impl Decoder {
     /// exactly `num_ref_idx_l{0,1}_active_minus1 + 1` entries and every
     /// entry points to a picture already in the DPB.
     #[allow(clippy::type_complexity)]
+    /// POCs and long-term flags of the current slice's reference lists.
+    fn slice_ref_lists(
+        l0: &[Rc<DecodedPicture>],
+        l1: &[Rc<DecodedPicture>],
+    ) -> crate::dpb::SliceRefLists {
+        let pocs = |l: &[Rc<DecodedPicture>]| l.iter().map(|p| p.poc).collect::<Vec<i32>>();
+        let lt = |l: &[Rc<DecodedPicture>]| {
+            l.iter()
+                .map(|p| p.reference_status() == PictureReferenceStatus::LongTerm)
+                .collect::<Vec<bool>>()
+        };
+        crate::dpb::SliceRefLists {
+            pocs: [pocs(l0), pocs(l1)],
+            is_long_term: [lt(l0), lt(l1)],
+        }
+    }
+
     fn build_ref_pic_lists(
         rps: &ReferencePictureSets,
         dpb: &DecodedPictureBuffer,
@@ -1465,7 +1499,7 @@ impl Decoder {
     /// placeholder picture — we log a warning and skip, which is correct
     /// for conformant streams.
     pub(crate) fn apply_rps_marking(
-        rps: &ReferencePictureSets,
+        rps: &mut ReferencePictureSets,
         dpb: &DecodedPictureBuffer,
         log2_max_pic_order_cnt_lsb: u8,
     ) {
@@ -1493,6 +1527,10 @@ impl Decoder {
         // for an entry, match by full POC (the entry already contains the
         // resolved absolute POC). When false, match by POC LSB (spec 8.3.2 /
         // FFmpeg find_ref_idx: `mask = use_msb ? ~0 : (1 << log2) - 1`).
+        // A matched LSB-only entry is rewritten to the picture's full POC, so
+        // that reference list construction (which looks pictures up by POC)
+        // resolves it.
+        let n_curr = rps.lt_curr.len();
         let lt_all: Vec<i32> = rps.lt_curr.iter().chain(&rps.lt_foll).copied().collect();
         for (idx, &poc_or_lsb) in lt_all.iter().enumerate() {
             let use_msb = rps.lt_poc_msb_present.get(idx).copied().unwrap_or(false);
@@ -1507,6 +1545,11 @@ impl Decoder {
                 };
                 if matches {
                     pic.mark(PictureReferenceStatus::LongTerm);
+                    if idx < n_curr {
+                        rps.lt_curr[idx] = pic.poc;
+                    } else {
+                        rps.lt_foll[idx - n_curr] = pic.poc;
+                    }
                     break;
                 }
             }

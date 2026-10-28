@@ -71,7 +71,9 @@ impl NalUnitType {
             | NalUnitType::IdrWRadl
             | NalUnitType::IdrNLp
             | NalUnitType::Cra => true,
-            NalUnitType::Other(v) => v < 32,
+            // Reserved VCL types (RSV_VCL_N10..RSV_VCL31) are not decodable;
+            // decoders shall ignore them (spec 7.4.2.2).
+            NalUnitType::Other(_) => false,
             _ => false,
         }
     }

@@ -32,3 +32,4 @@ is updated as failures are fixed.
 | Date | Pass | Notes |
 |---|---:|---|
 | 2026-10-28 | 95 / 147 | First run. |
+| 2026-10-28 | 100 / 147 | Slice header extension skipped; per-slice reference lists; RASL skipped after BLA; reserved VCL NAL types ignored; LSB-only long-term references resolved; long-term MV prediction rules. |

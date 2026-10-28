@@ -35,6 +35,15 @@ pub enum PictureReferenceStatus {
     LongTerm,
 }
 
+/// One slice's reference picture lists as seen by temporal MV prediction:
+/// the POC of every entry and whether it was a long-term reference when the
+/// slice was decoded (spec 8.5.3.2.8 compares long-term status).
+#[derive(Debug, Clone, Default)]
+pub struct SliceRefLists {
+    pub pocs: [Vec<i32>; 2],
+    pub is_long_term: [Vec<bool>; 2],
+}
+
 /// One decoded picture's planes + metadata.
 #[derive(Debug)]
 pub struct DecodedPicture {
@@ -81,6 +90,14 @@ pub struct DecodedPicture {
     pub chroma_shift_w: u32,
     /// log2(SubHeightC): 1 for 4:2:0, 0 for 4:4:4.
     pub chroma_shift_h: u32,
+    /// Reference POC lists of each independent slice of this picture, keyed
+    /// by slice address. Temporal MV prediction needs the lists of the slice
+    /// that contains the collocated block (spec 8.5.3.2.9), which differ
+    /// between slices when they use different reference list setups.
+    pub slice_ref_pic_list_pocs: Vec<(i32, SliceRefLists)>,
+    /// Slice address of every CTB in raster order (`tab_slice_addr_rs` of
+    /// the decoded picture).
+    pub ctb_slice_addr: Vec<i32>,
 }
 
 impl DecodedPicture {
@@ -110,6 +127,8 @@ impl DecodedPicture {
             uv_stride: (width / 2) as usize,
             chroma_shift_w: 1,
             chroma_shift_h: 1,
+            slice_ref_pic_list_pocs: Vec::new(),
+            ctb_slice_addr: Vec::new(),
         }
     }
 
@@ -147,7 +166,22 @@ impl DecodedPicture {
             uv_stride: (width / 2) as usize,
             chroma_shift_w: 1,
             chroma_shift_h: 1,
+            slice_ref_pic_list_pocs: Vec::new(),
+            ctb_slice_addr: Vec::new(),
         }
+    }
+
+    /// Reference lists in effect at luma position `(x, y)`: those of the
+    /// slice containing that CTB, or `None` without per-slice information.
+    pub fn ref_lists_at(&self, x: u32, y: u32) -> Option<&SliceRefLists> {
+        let ctb = 1u32 << self.log2_ctb_size;
+        let w_ctbs = self.width.div_ceil(ctb);
+        let rs = ((y / ctb) * w_ctbs + x / ctb) as usize;
+        let addr = self.ctb_slice_addr.get(rs)?;
+        self.slice_ref_pic_list_pocs
+            .iter()
+            .find(|(a, _)| a == addr)
+            .map(|(_, l)| l)
     }
 
     pub fn mark(&self, status: PictureReferenceStatus) {
@@ -755,7 +789,7 @@ mod tests {
         dpb.insert(p8.clone());
 
         // RPS: only POC 0 and 8 are ST refs. POC 4 is not referenced.
-        let rps = ReferencePictureSets {
+        let mut rps = ReferencePictureSets {
             st_curr_before: vec![0],
             st_curr_after: vec![8],
             st_foll: vec![],
@@ -763,7 +797,7 @@ mod tests {
             lt_foll: vec![],
             lt_poc_msb_present: vec![],
         };
-        Decoder::apply_rps_marking(&rps, &dpb, 8);
+        Decoder::apply_rps_marking(&mut rps, &dpb, 8);
 
         assert_eq!(p0.reference_status(), PictureReferenceStatus::ShortTerm);
         assert_eq!(
@@ -799,7 +833,7 @@ mod tests {
         dpb.insert(p3.clone());
         dpb.insert(p19.clone());
 
-        let rps = ReferencePictureSets {
+        let mut rps = ReferencePictureSets {
             st_curr_before: vec![3],
             st_curr_after: vec![],
             st_foll: vec![],
@@ -808,7 +842,7 @@ mod tests {
             lt_poc_msb_present: vec![false, false], // LSB-based matching for both
         };
         // log2_max_poc_lsb=4 → max_poc_lsb=16
-        Decoder::apply_rps_marking(&rps, &dpb, 4);
+        Decoder::apply_rps_marking(&mut rps, &dpb, 4);
 
         // POC 3 should be ST (ST takes priority over LT).
         assert_eq!(p3.reference_status(), PictureReferenceStatus::ShortTerm);
@@ -845,7 +879,7 @@ mod tests {
 
         // LT ref with poc_msb_present=true and full POC=19 → should match
         // only POC 19, not POC 3 (even though both have LSB=3).
-        let rps = ReferencePictureSets {
+        let mut rps = ReferencePictureSets {
             st_curr_before: vec![],
             st_curr_after: vec![],
             st_foll: vec![],
@@ -853,7 +887,7 @@ mod tests {
             lt_foll: vec![],
             lt_poc_msb_present: vec![true],
         };
-        Decoder::apply_rps_marking(&rps, &dpb, 4);
+        Decoder::apply_rps_marking(&mut rps, &dpb, 4);
 
         assert_eq!(
             p3.reference_status(),
@@ -880,7 +914,7 @@ mod tests {
         dpb.insert(p19.clone());
 
         // LT ref with poc_msb_present=false and LSB=3 → matches POC 19
-        let rps = ReferencePictureSets {
+        let mut rps = ReferencePictureSets {
             st_curr_before: vec![],
             st_curr_after: vec![],
             st_foll: vec![],
@@ -888,7 +922,7 @@ mod tests {
             lt_foll: vec![],
             lt_poc_msb_present: vec![false],
         };
-        Decoder::apply_rps_marking(&rps, &dpb, 4);
+        Decoder::apply_rps_marking(&mut rps, &dpb, 4);
 
         assert_eq!(p19.reference_status(), PictureReferenceStatus::LongTerm);
     }

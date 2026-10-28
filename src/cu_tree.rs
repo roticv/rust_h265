@@ -130,6 +130,8 @@ pub struct SliceParams {
     /// POC values of RefPicList0 entries (one per active L0 reference).
     /// `ref_pic_list_pocs[0][i]` is the POC of the picture at L0 index `i`.
     pub ref_pic_list_pocs: [Vec<i32>; 2],
+    /// Whether each reference list entry is a long-term reference picture.
+    pub ref_pic_list_is_lt: [Vec<bool>; 2],
     /// Phase 3d-6: actual reference frame pixel data for L0 MC.
     pub ref_frames_l0: Vec<Rc<DecodedPicture>>,
     /// Phase 3d-6: actual reference frame pixel data for L1 MC.
@@ -1204,24 +1206,35 @@ fn mv_scale(mv: Mv, td: i32, tb: i32) -> Mv {
 /// `curr_ref_poc` = POC of the current picture's reference at `ref_idx_lx` on list `x`.
 ///
 /// Returns `Some(scaled_mv)` if valid, `None` if long-term mismatch etc.
+#[allow(clippy::too_many_arguments)]
 fn check_mvset(
     col_mv: Mv,
     col_ref_idx: i8,
     col_pic_poc: i32,
     col_ref_pocs: &[i32],
+    col_ref_lt: &[bool],
     curr_poc: i32,
     curr_ref_poc: i32,
+    curr_ref_lt: bool,
 ) -> Option<Mv> {
-    // We don't have long-term ref tracking per-entry; treat all as short-term.
     // If the collocated ref_idx is out of range, bail.
     if col_ref_idx < 0 || (col_ref_idx as usize) >= col_ref_pocs.len() {
         return None;
     }
     let col_ref_poc = col_ref_pocs[col_ref_idx as usize];
+    // Spec 8.5.3.2.8: no candidate when exactly one of the two references
+    // is long-term; long-term MVs are never scaled.
+    let col_lt = col_ref_lt
+        .get(col_ref_idx as usize)
+        .copied()
+        .unwrap_or(false);
+    if col_lt != curr_ref_lt {
+        return None;
+    }
     let col_poc_diff = col_pic_poc - col_ref_poc;
     let cur_poc_diff = curr_poc - curr_ref_poc;
 
-    if col_poc_diff == cur_poc_diff || col_poc_diff == 0 {
+    if curr_ref_lt || col_poc_diff == cur_poc_diff || col_poc_diff == 0 {
         Some(col_mv)
     } else {
         Some(mv_scale(col_mv, col_poc_diff, cur_poc_diff))
@@ -1245,15 +1258,18 @@ fn derive_temporal_colocated_mvs(
     ref_idx_lx: i8,
     x: usize,
     col_pic_poc: i32,
-    col_ref_pocs: &[Vec<i32>; 2],
+    col_lists: &crate::dpb::SliceRefLists,
     slice_params: &SliceParams,
 ) -> Option<Mv> {
     let curr_poc = slice_params.poc;
-    let curr_ref_poc = if !slice_params.ref_pic_list_pocs[x].is_empty() {
-        slice_params.ref_pic_list_pocs[x][ref_idx_lx as usize]
-    } else {
-        return None;
-    };
+    // A ref_idx beyond the list can only come from a malformed stream;
+    // treat the candidate as unavailable rather than panicking.
+    let ri = usize::try_from(ref_idx_lx).ok()?;
+    let curr_ref_poc = *slice_params.ref_pic_list_pocs[x].get(ri)?;
+    let curr_ref_lt = slice_params.ref_pic_list_is_lt[x]
+        .get(ri)
+        .copied()
+        .unwrap_or(false);
 
     if temp_col.pred_flag == 0 {
         return None;
@@ -1265,9 +1281,11 @@ fn derive_temporal_colocated_mvs(
             temp_col.mv[1],
             temp_col.ref_idx[1],
             col_pic_poc,
-            &col_ref_pocs[1],
+            &col_lists.pocs[1],
+            &col_lists.is_long_term[1],
             curr_poc,
             curr_ref_poc,
+            curr_ref_lt,
         );
     } else if temp_col.pred_flag == 1 {
         // L0 only.
@@ -1275,9 +1293,11 @@ fn derive_temporal_colocated_mvs(
             temp_col.mv[0],
             temp_col.ref_idx[0],
             col_pic_poc,
-            &col_ref_pocs[0],
+            &col_lists.pocs[0],
+            &col_lists.is_long_term[0],
             curr_poc,
             curr_ref_poc,
+            curr_ref_lt,
         );
     }
 
@@ -1300,18 +1320,22 @@ fn derive_temporal_colocated_mvs(
                 temp_col.mv[0],
                 temp_col.ref_idx[0],
                 col_pic_poc,
-                &col_ref_pocs[0],
+                &col_lists.pocs[0],
+                &col_lists.is_long_term[0],
                 curr_poc,
                 curr_ref_poc,
+                curr_ref_lt,
             )
         } else {
             check_mvset(
                 temp_col.mv[1],
                 temp_col.ref_idx[1],
                 col_pic_poc,
-                &col_ref_pocs[1],
+                &col_lists.pocs[1],
+                &col_lists.is_long_term[1],
                 curr_poc,
                 curr_ref_poc,
+                curr_ref_lt,
             )
         }
     } else {
@@ -1330,9 +1354,11 @@ fn derive_temporal_colocated_mvs(
                 temp_col.mv[0],
                 temp_col.ref_idx[0],
                 col_pic_poc,
-                &col_ref_pocs[0],
+                &col_lists.pocs[0],
+                &col_lists.is_long_term[0],
                 curr_poc,
                 curr_ref_poc,
+                curr_ref_lt,
             )
         } else {
             // Collocated from L0 → use L1 MV of the collocated PU.
@@ -1340,9 +1366,11 @@ fn derive_temporal_colocated_mvs(
                 temp_col.mv[1],
                 temp_col.ref_idx[1],
                 col_pic_poc,
-                &col_ref_pocs[1],
+                &col_lists.pocs[1],
+                &col_lists.is_long_term[1],
                 curr_poc,
                 curr_ref_poc,
+                curr_ref_lt,
             )
         }
     }
@@ -1397,7 +1425,7 @@ fn temporal_luma_motion_vector<P: Pixel>(
                 ref_idx_lx,
                 x,
                 col_pic_poc,
-                &col_ref.ref_pic_list_pocs,
+                col_ref.ref_lists_at(xc as u32, yc as u32)?,
                 slice_params,
             );
         }
@@ -1416,7 +1444,7 @@ fn temporal_luma_motion_vector<P: Pixel>(
                 ref_idx_lx,
                 x,
                 col_pic_poc,
-                &col_ref.ref_pic_list_pocs,
+                col_ref.ref_lists_at(xc as u32, yc as u32)?,
                 slice_params,
             );
         }
@@ -1480,7 +1508,21 @@ fn amvp_scaled_ref_mv<P: Pixel>(
         .get(ref_idx as usize)
         .copied()?;
     let neighbor_mv = mvf.mv[pred_flag_idx];
-    if neighbor_ref_poc == curr_ref_poc {
+    // Spec 8.5.3.2.7: only a neighbour whose reference has the same
+    // long-term status as the target qualifies, and long-term MVs are not
+    // scaled.
+    let lt = |list: usize, idx: usize| {
+        slice_params.ref_pic_list_is_lt[list]
+            .get(idx)
+            .copied()
+            .unwrap_or(false)
+    };
+    let neighbor_lt = lt(pred_flag_idx, neighbor_ref_idx);
+    let curr_lt = lt(ref_idx_curr, ref_idx as usize);
+    if neighbor_lt != curr_lt {
+        return None;
+    }
+    if curr_lt || neighbor_ref_poc == curr_ref_poc {
         // Same ref → no scaling needed (but this path is the "lt" fallback,
         // FFmpeg still returns the MV here).
         Some(neighbor_mv)
@@ -4576,6 +4618,7 @@ mod tests {
             log2_parallel_merge_level: 2,
             poc: 0,
             ref_pic_list_pocs: [vec![], vec![]],
+            ref_pic_list_is_lt: [Vec::new(), Vec::new()],
             ref_frames_l0: vec![],
             ref_frames_l1: vec![],
             collocated_ref: None,
