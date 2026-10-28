@@ -3,11 +3,12 @@
 A pure Rust H.265 / HEVC video decoder.
 
 > **Status:** functional. Main and Main 10 profile HEVC (8-bit and 10-bit
-> 4:2:0) decodes end-to-end with CTU 16/32/64, I/P/B slices (including
+> 4:2:0) plus 4:4:4 (8-bit and 10-bit, as used by HEIF/HEIC still images)
+> decodes end-to-end with CTU 16/32/64, I/P/B slices (including
 > hierarchical B), WPP, tiles, dependent slice segments, SAO, deblocking,
 > AQ (`cu_qp_delta`), scaling lists, sign-data hiding, weighted prediction,
 > transform skip, transquant bypass, constrained intra prediction, and PCM.
-> 127 tests pass. Byte-exact against FFmpeg on every in-tree fixture plus
+> Byte-exact against FFmpeg on every in-tree fixture plus
 > real 1080p Big Buck Bunny at x265 presets `ultrafast` / `medium` / `slow`
 > in both 8-bit and 10-bit. No threading or SIMD yet — ~5× slower than
 > single-threaded FFmpeg on 8-bit content, ~2.5× on 10-bit; see
@@ -23,6 +24,8 @@ A pure Rust H.264 decoder ([`rust_h264`](https://github.com/roticv/rust_h264)) a
 - **Streaming:** `Decoder::decode_nal(&[u8]) -> Result<Option<Frame>, DecodeError>` plus `flush()`. NAL units are fed incrementally and decoded frames are emitted as they become available, in **decode order** (callers re-sort by POC for display).
 - **Performance:** The decoder aims to be fast, with FFmpeg's software HEVC decoder as the target benchmark. Current gap vs single-threaded FFmpeg: ~5× on 8-bit, ~2.5× on 10-bit real 1080p content. No NEON / SSE kernels yet.
 - **Multi-bit-depth:** 8-bit and 10-bit (Main / Main 10 profile) via a generic `Pixel` trait. 12-bit infrastructure is in place but untested. Pixel planes are `PixelData::U8(Vec<u8>)` or `PixelData::U16(Vec<u16>)` — check `frame.bit_depth` to determine which.
+- **Chroma formats:** 4:2:0 and 4:4:4, intra and inter. Check `frame.chroma_format_idc` (1 = 4:2:0, 3 = 4:4:4) to size the `u`/`v` planes: half width and height for 4:2:0, full size for 4:4:4. 4:2:2 and monochrome streams are rejected with `DecodeError::Unsupported`.
+- **Resource limits:** `Decoder::new()` rejects any SPS whose picture exceeds 35,651,584 luma samples (the Level 6.2 maximum) or an estimated 512 MB of per-picture state, returning `DecodeError::ResourceLimit`. Use `Decoder::with_limits(DecodeLimits { .. })` to change either bound.
 - **Pure Rust, no `unsafe`** in the current codebase. `unsafe` will be reserved for SIMD paths once they land.
 
 ## Usage
@@ -39,10 +42,11 @@ let mut decoder = Decoder::new();
 for nal in &nals {
     match decoder.decode_nal(nal) {
         Ok(Some(frame)) => {
-            // `frame` is a decoded YUV420 picture:
+            // `frame` is a decoded YUV picture:
             //   frame.y, frame.u, frame.v  — PixelData (U8 or U16)
-            //   frame.width, frame.height  — dimensions
+            //   frame.width, frame.height  — luma dimensions
             //   frame.bit_depth            — 8 or 10
+            //   frame.chroma_format_idc    — 1 = 4:2:0, 3 = 4:4:4
             //   frame.pic_order_cnt        — display order index
             //
             // Access pixels:
@@ -179,9 +183,10 @@ cargo run --release --example bench_realworld
 cargo test --release
 ```
 
-127 tests covering the full feature matrix — 8-bit and 10-bit, CTU 16/32/64,
-I/P/B slices, WPP, tiles, dependent slices, SAO, deblocking, transform skip,
-transquant bypass, constrained intra, PCM, multi-slice, and more. All
+The test suite covers the full feature matrix — 8-bit and 10-bit, 4:2:0 and
+4:4:4, CTU 16/32/64, I/P/B slices, open-GOP CRA streams, WPP, tiles,
+dependent slices, SAO, deblocking, transform skip, transquant bypass,
+constrained intra, PCM, multi-slice, and more. All
 in-tree fixtures are byte-exact against FFmpeg; tests that need >1 MB of
 reference output (e.g. 1080p) use a SHA-256 hash of the decoded planes. The
 `bench_realworld` example covers real 1080p Big Buck Bunny in both 8-bit
