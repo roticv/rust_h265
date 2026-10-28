@@ -36,7 +36,7 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 - `parse_nal(&[u8])` — parse a single raw NAL (no framing)
 - `Frame` has `y: PixelData`, `u: PixelData`, `v: PixelData`, `width`, `height`, `bit_depth`, `pic_order_cnt`
 - `PixelData::U8(Vec<u8>)` for 8-bit, `PixelData::U16(Vec<u16>)` for 10-bit
-- Frames emitted in **decode order** — callers sort by POC for display
+- Frames emitted in **decode order** by default — callers sort by POC within each CVS. `Decoder::new().with_display_order()` runs the spec C.5.2 output process instead (`output.rs`): `decode_nal` returns `Ok(None)`, frames come from `next_output()` and, at the end, `flush()` until `None`. `dump_frames` uses display order (`--decode-order` for the old path)
 
 ### Module layout
 
@@ -52,6 +52,7 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 | `residual_coding.rs` | CABAC coefficient decode, dequantization (with `qp_bd_offset`), transform_skip |
 | `deblock.rs` | 8×8-grid deblocking, beta/tc scaling by `1 << (bit_depth - 8)` |
 | `sao.rs` | Band offset + edge offset, per-CTB SAO params, slice boundary handling |
+| `output.rs` | Display-order output process (spec C.5.2 bumping, NoOutputOfPriorPicsFlag), used by `with_display_order` |
 | `dpb.rs` | `DecodedPicture` (with `PixelData` planes), DPB, RPS, ref list construction |
 | `cabac.rs` | CABAC arithmetic engine (renorm, bypass, terminate) |
 | `cabac_tables.rs` | LPS range, state transition, context init values |

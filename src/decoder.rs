@@ -58,7 +58,9 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub pic_order_cnt: i32,
-    /// Bit depth of the luma (and chroma) samples: 8, 10, or 12.
+    /// Bit depth of the luma samples: 8, 10, or 12. Chroma samples
+    /// normally have the same depth; a stream may code them at a different
+    /// one (BitDepthC), and they are stored at that depth.
     pub bit_depth: u8,
     /// `chroma_format_idc`: 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4. Determines the
     /// dimensions of the `u`/`v` planes relative to `width`/`height`
@@ -346,6 +348,12 @@ pub struct Decoder {
     /// keyed by (width, height, log2 CTB size, log2 min TB size). Building
     /// it per picture was a measurable share of decode time.
     zscan_cache: Option<(ZscanKey, Rc<Vec<i32>>)>,
+
+    /// Set by `with_display_order`: frames are released in output order by
+    /// the spec C.5.2 output process and taken with `next_output`, instead
+    /// of being returned by `decode_nal` in decoding order.
+    display_order: bool,
+    output_queue: crate::output::OutputQueue,
 }
 
 /// Crop a decoded picture's planes to the conformance window and build a Frame.
@@ -482,6 +490,44 @@ impl Decoder {
         }
     }
 
+    /// Output frames in display order, as the spec's output process does
+    /// (C.5.2, "bumping"), instead of in decoding order.
+    ///
+    /// In this mode `decode_nal` always returns `Ok(None)`. Take the frames
+    /// released so far with [`next_output`](Self::next_output) after each
+    /// call, and at the end of the stream call [`flush`](Self::flush) until
+    /// it returns `None`. The decoder applies the stream's reorder and DPB
+    /// size limits, and drops pictures the spec does not output: those with
+    /// `pic_output_flag = 0`, skipped RASL pictures, and pictures still
+    /// waiting when an IRAP picture with `NoOutputOfPriorPicsFlag = 1`
+    /// starts a new coded video sequence.
+    ///
+    /// ```no_run
+    /// # let data: Vec<u8> = Vec::new();
+    /// let mut dec = rust_h265::Decoder::new().with_display_order();
+    /// for nal in rust_h265::parse_annex_b(&data) {
+    ///     dec.decode_nal(&nal)?;
+    ///     while let Some(frame) = dec.next_output() {
+    ///         // display `frame`
+    ///     }
+    /// }
+    /// while let Some(frame) = dec.flush() {
+    ///     // display `frame`
+    /// }
+    /// # Ok::<(), rust_h265::DecodeError>(())
+    /// ```
+    pub fn with_display_order(mut self) -> Self {
+        self.display_order = true;
+        self
+    }
+
+    /// Next frame released for display, in display-order mode (see
+    /// [`with_display_order`](Self::with_display_order)). Always `None` in
+    /// the default decoding-order mode.
+    pub fn next_output(&mut self) -> Option<Frame> {
+        self.output_queue.pop()
+    }
+
     fn validate_picture_limits(&self, sps: &Sps) -> Result<(), DecodeError> {
         let pixels = u64::from(sps.pic_width_in_luma_samples)
             .checked_mul(u64::from(sps.pic_height_in_luma_samples))
@@ -586,7 +632,25 @@ impl Decoder {
     /// finalized — shouldn't happen in normal operation), this drains
     /// it as a best-effort measure. Future phases will add proper DPB
     /// bumping for reorder delay.
+    ///
+    /// In display-order mode this ends the stream: every frame still
+    /// waiting is released, and each call returns the next one in display
+    /// order until `None`.
     pub fn flush(&mut self) -> Option<Frame> {
+        let pending = self.take_completed_picture();
+        if !self.display_order {
+            return pending;
+        }
+        if let Some(sps) = self.sps.as_ref() {
+            let limits = crate::output::OutputLimits::from_sps(sps);
+            self.output_queue.after_picture(&limits, pending);
+        }
+        self.output_queue.output_all();
+        self.output_queue.pop()
+    }
+
+    /// A fully decoded picture still in `current_picture`, as a frame.
+    fn take_completed_picture(&mut self) -> Option<Frame> {
         // If there's a completed (all CTBs decoded) picture still sitting
         // in current_picture, emit it. This is a defensive fallback — in
         // normal operation the picture is emitted at the end of decode_slice.
@@ -714,6 +778,7 @@ impl Decoder {
         // segments inherit the POC from the parent independent segment
         // (populated above) — we only compute it once per picture (on the
         // first, independent slice).
+        let mut starts_new_sequence = false;
         if sh.first_slice_segment_in_pic_flag {
             // Spec 8.1.3: an IRAP picture has NoRaslOutputFlag = 1 when it
             // is IDR, BLA, the first picture in the bitstream, or the first
@@ -722,6 +787,9 @@ impl Decoder {
             // associated RASL pictures are not decoded (8.1.3).
             let no_rasl_output_flag =
                 nut.is_irap() && (!nut.is_cra() || !self.seen_picture || self.after_eos);
+            // C.5.2.2: an IRAP with NoRaslOutputFlag = 1 other than the
+            // first picture ends output of the previous sequence.
+            starts_new_sequence = no_rasl_output_flag && self.seen_picture;
             if nut.is_irap() {
                 // RASL pictures are skipped after any IRAP with NoRaslOutputFlag
                 // = 1: a BLA always, a CRA that starts decoding (spec 8.1.3).
@@ -890,6 +958,27 @@ impl Decoder {
                     Self::derive_rps_from_slice_header_parts(&sh, &sps_st_rps, log2_max_poc_lsb);
                 Self::apply_rps_marking(&mut rps, &self.dpb, log2_max_poc_lsb);
                 self.current_rps = rps;
+
+                // Output process before decoding the picture (C.5.2.2).
+                if self.display_order {
+                    if starts_new_sequence {
+                        // A CRA here follows an EOS: NoOutputOfPriorPicsFlag
+                        // is 1 whatever the slice header says.
+                        let no_output = nut.is_cra() || sh.no_output_of_prior_pics_flag;
+                        self.output_queue.start_new_sequence(no_output);
+                    } else {
+                        let limits = crate::output::OutputLimits::from_sps(sps_for_rps);
+                        let refs: Vec<i32> = self
+                            .dpb
+                            .pictures()
+                            .iter()
+                            .filter(|p| p.is_reference())
+                            .map(|p| p.poc)
+                            .collect();
+                        self.output_queue
+                            .before_picture(&limits, refs.len(), |poc| refs.contains(&poc));
+                    }
+                }
             }
 
             // Populate `tab_tile_id` on the fresh picture state so intra
@@ -1331,10 +1420,18 @@ impl Decoder {
         // PicOutputFlag (spec 8.1.3): a picture with pic_output_flag = 0 is
         // decoded and kept for reference but never output. (Skipped RASL
         // pictures never reach this point.)
-        if last_sh_cloned.pic_output_flag {
-            Ok(Some(emitted_frame))
-        } else {
+        let frame = last_sh_cloned.pic_output_flag.then_some(emitted_frame);
+        if self.display_order {
+            // Output process once the picture is decoded (C.5.2.3).
+            let sps = self
+                .sps
+                .as_ref()
+                .expect("sps present for a decoded picture");
+            let limits = crate::output::OutputLimits::from_sps(sps);
+            self.output_queue.after_picture(&limits, frame);
             Ok(None)
+        } else {
+            Ok(frame)
         }
     }
 
@@ -4115,6 +4212,86 @@ mod tests {
         let hash = decode_and_hash("delta_qp_groups_hm_416x240.h265", 4);
         let expected = "8e0729fae2ac52d719064fe0c94bfc20ad62a0fa075f903b09d9101c13307240";
         assert_eq!(hash, expected, "delta_qp_groups hash mismatch");
+    }
+
+    /// Frames of `name` from display-order mode, and from decoding-order
+    /// mode sorted by POC (one coded video sequence, every picture output).
+    fn display_vs_sorted(name: &str) -> (Vec<Frame>, Vec<Frame>) {
+        let data =
+            std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/").to_string() + name)
+                .unwrap();
+        let nals = parse_annex_b(&data);
+        let mut dec = Decoder::new().with_display_order();
+        let mut display = Vec::new();
+        for nal in &nals {
+            assert!(dec.decode_nal(nal).unwrap().is_none());
+            display.extend(std::iter::from_fn(|| dec.next_output()));
+        }
+        display.extend(std::iter::from_fn(|| dec.flush()));
+        let mut dec = Decoder::new();
+        let mut sorted: Vec<Frame> = nals
+            .iter()
+            .filter_map(|n| dec.decode_nal(n).unwrap())
+            .collect();
+        sorted.extend(std::iter::from_fn(|| dec.flush()));
+        sorted.sort_by_key(|f| f.pic_order_cnt);
+        (display, sorted)
+    }
+
+    fn same_plane(a: &PixelData, b: &PixelData) -> bool {
+        match (a, b) {
+            (PixelData::U8(x), PixelData::U8(y)) => x == y,
+            (PixelData::U16(x), PixelData::U16(y)) => x == y,
+            _ => false,
+        }
+    }
+
+    fn same_frames(a: &[Frame], b: &[Frame]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                x.pic_order_cnt == y.pic_order_cnt
+                    && same_plane(&x.y, &y.y)
+                    && same_plane(&x.u, &y.u)
+                    && same_plane(&x.v, &y.v)
+            })
+    }
+
+    /// Display-order mode on B-frame streams outputs every picture in POC
+    /// order, the same frames as sorting decoding-order output, and releases
+    /// some before the end of the stream (the reorder limit bounds the delay).
+    #[test]
+    fn test_display_order_matches_sorted_decode_order() {
+        for name in [
+            "bframes3_128x128.h265",
+            "open_gop_cra.h265",
+            "inter444_b_96x96.h265",
+        ] {
+            let (display, sorted) = display_vs_sorted(name);
+            assert!(!display.is_empty(), "{name}: no frames");
+            assert!(
+                same_frames(&display, &sorted),
+                "{name}: display order differs"
+            );
+        }
+    }
+
+    /// Frames are released while decoding, not only at flush.
+    #[test]
+    fn test_display_order_releases_before_flush() {
+        let data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/bframes3_128x128.h265"
+        ))
+        .unwrap();
+        let mut dec = Decoder::new().with_display_order();
+        let mut early = 0;
+        for nal in parse_annex_b(&data) {
+            dec.decode_nal(&nal).unwrap();
+            early += std::iter::from_fn(|| dec.next_output()).count();
+        }
+        let late = std::iter::from_fn(|| dec.flush()).count();
+        assert!(early > 0, "nothing released before flush");
+        assert!(late > 0, "flush released nothing");
     }
 
     #[test]

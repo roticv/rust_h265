@@ -1,18 +1,21 @@
 //! Dump decoded frames to a raw YUV file in display order.
 //!
-//! Display order is POC order within each coded video sequence (CVS), with
-//! sequences in bitstream order. POC restarts at every CVS, so sorting the
-//! whole stream by POC would interleave frames of different sequences.
+//! By default the decoder's display-order mode (`Decoder::with_display_order`,
+//! the spec C.5.2 output process) decides which frames are output and in
+//! what order. With `--decode-order` the decoder returns every picture in
+//! decoding order and this tool sorts them by POC within each coded video
+//! sequence (CVS) instead; that keeps pictures the output process would
+//! discard.
 //!
 //! Usage:
-//!   cargo run --release --example dump_frames -- <in.h265> <out.yuv>
+//!   cargo run --release --example dump_frames -- <in.h265> <out.yuv> [--decode-order]
 //!
 //! Intended for byte-exact verification against FFmpeg's HEVC decoder:
 //!   ffmpeg -i <in.h265> -f rawvideo -pix_fmt yuv420p ref.yuv      # 8-bit
 //!   ffmpeg -i <in.h265> -f rawvideo -pix_fmt yuv420p10le ref.yuv  # 10-bit
 //!   cmp ref.yuv out.yuv
 
-use rust_h265::{NalUnitType, PixelData};
+use rust_h265::{Frame, NalUnitType, PixelData};
 use std::io::Write;
 
 /// Write a pixel plane to the output. 8-bit writes raw bytes; 10-bit writes
@@ -30,13 +33,20 @@ fn write_plane(out: &mut impl Write, plane: &PixelData) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("usage: dump_frames <in.h265> <out.yuv>");
+    let decode_order = args.len() == 4 && args[3] == "--decode-order";
+    if args.len() != 3 && !decode_order {
+        eprintln!("usage: dump_frames <in.h265> <out.yuv> [--decode-order]");
         std::process::exit(2);
     }
     let data = std::fs::read(&args[1]).unwrap_or_else(|e| panic!("read {}: {e}", args[1]));
     let out = std::fs::File::create(&args[2]).unwrap_or_else(|e| panic!("create {}: {e}", args[2]));
     let mut out = std::io::BufWriter::new(out);
+
+    if !decode_order {
+        let frames = decode_display_order(&data);
+        write_frames(&mut out, &frames, &args[2]);
+        return;
+    }
 
     let mut dec = rust_h265::decoder::Decoder::new();
     // (coded video sequence index, frame). The decoder returns a frame while
@@ -79,17 +89,39 @@ fn main() {
     // Display order: by sequence, then by POC within the sequence.
     frames.sort_by_key(|(cvs, f)| (*cvs, f.pic_order_cnt));
     let frames: Vec<_> = frames.into_iter().map(|(_, f)| f).collect();
+    write_frames(&mut out, &frames, &args[2]);
+}
 
-    for f in &frames {
-        write_plane(&mut out, &f.y);
-        write_plane(&mut out, &f.u);
-        write_plane(&mut out, &f.v);
+/// Decode with the decoder's own output process.
+fn decode_display_order(data: &[u8]) -> Vec<Frame> {
+    let mut dec = rust_h265::decoder::Decoder::new().with_display_order();
+    let mut frames = Vec::new();
+    for nal in rust_h265::nal::parse_annex_b(data) {
+        if let Err(e) = dec.decode_nal(&nal) {
+            eprintln!("decode error after {} frames: {e:?}", frames.len());
+            std::process::exit(1);
+        }
+        while let Some(f) = dec.next_output() {
+            frames.push(f);
+        }
+    }
+    while let Some(f) = dec.flush() {
+        frames.push(f);
+    }
+    frames
+}
+
+fn write_frames(out: &mut impl Write, frames: &[Frame], path: &str) {
+    for f in frames {
+        write_plane(out, &f.y);
+        write_plane(out, &f.u);
+        write_plane(out, &f.v);
     }
     eprintln!(
         "wrote {} frames ({}x{}) to {}",
         frames.len(),
         frames.first().map(|f| f.width).unwrap_or(0),
         frames.first().map(|f| f.height).unwrap_or(0),
-        args[2]
+        path
     );
 }

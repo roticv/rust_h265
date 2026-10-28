@@ -7,10 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Display-order output:** `Decoder::new().with_display_order()` runs the
+  spec C.5.2 output process ("bumping") inside the decoder. Frames are
+  released in display order through the new `Decoder::next_output()` as
+  soon as the stream's reorder and DPB limits allow, and `flush()` returns
+  the remaining ones one per call. Pictures the spec does not output are
+  dropped, including those still waiting when an IRAP picture with
+  `NoOutputOfPriorPicsFlag = 1` starts a new sequence. The default mode is
+  unchanged (decoding order). `dump_frames` and `play` now use display
+  order; `dump_frames --decode-order` keeps the old path.
+
 ### Fixed
 
-- **JCT-VC HEVC_v1 conformance: 143 of 147 vectors now decode bit-exact**
-  (95 at the first run). New harness in `tools/conformance/`. Fixes found
+- **JCT-VC HEVC_v1 conformance: all 147 vectors now decode bit-exact**
+  (95 at the first run; the 4 output-order vectors need display-order mode). New harness in `tools/conformance/`. Fixes found
   with it:
   - SPS and PPS are stored by ID and activated per picture, so streams
     that switch between several parameter sets decode.

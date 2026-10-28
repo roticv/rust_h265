@@ -19,7 +19,7 @@ python3 -I tools/conformance/run_suite.py JCT-VC-HEVC_V1.json \
 
 The runner downloads each vector's ZIP into `workdir/zips/` (checked against
 the suite's checksum), extracts only the named bitstream, decodes it with
-`dump_frames` (display order: POC order within each coded video sequence),
+`dump_frames` (display order from the decoder's spec output process),
 and compares the MD5 of the YUV output. Results go to
 `workdir/results-<suite>.json`. Outputs of failing vectors are kept in
 `workdir/out/` for analysis.
@@ -35,9 +35,4 @@ is updated as failures are fixed.
 | 2026-10-28 | 100 / 147 | Slice header extension skipped; per-slice reference lists; RASL skipped after BLA; reserved VCL NAL types ignored; LSB-only long-term references resolved; long-term MV prediction rules. |
 | 2026-10-28 | 121 / 147 | pic_output_flag; weighted bi-prediction and 10-bit offsets; 10-bit QP range; lossless/PCM loop-filter protection and PCM CU edges; per-slice deblocking offsets and disable; raster slice addresses with tiles; tile-start context/QP resets; spec slice-boundary rules for mixed across-slice flags. |
 | 2026-10-28 | 143 / 147 | SPS/PPS stored by ID and activated per picture; per-sample constrained intra prediction; single merge candidate list at the CU origin; SAO diagonal-CTB availability; MV sum wraps modulo 2^16; cu_qp_delta predicted from the CU origin (also fixed WPP_A/D/E/F); deblocking compares references through each slice's own lists; different luma and chroma bit depths. |
-
-The 4 remaining failures (BUMPING_A, NoOutPrior_A, NoOutPrior_B, RAP_B)
-test the output process: which pictures are output, and when, under the
-C.5.2 bumping process and `NoOutputOfPriorPicsFlag`. The decoder returns
-every decoded picture in decoding order and leaves display ordering to the
-caller, so pictures that the spec discards without output still appear.
+| 2026-10-28 | 147 / 147 | Display-order output (`Decoder::with_display_order`, spec C.5.2 bumping and NoOutputOfPriorPicsFlag), used by `dump_frames`: BUMPING_A, NoOutPrior_A/B, RAP_B. |

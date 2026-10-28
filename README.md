@@ -22,7 +22,7 @@ A pure Rust H.264 decoder ([`rust_h264`](https://github.com/roticv/rust_h264)) a
 ## Design
 
 - **Input:** Both **Annex B** (start-code delimited, `.h265` raw files) and **HVCC** (length-prefixed, MP4/MKV containers) formats via `parse_annex_b()` and `parse_hvcc()`.
-- **Streaming:** `Decoder::decode_nal(&[u8]) -> Result<Option<Frame>, DecodeError>` plus `flush()`. NAL units are fed incrementally and decoded frames are emitted as they become available, in **decode order** (callers re-sort by POC for display).
+- **Streaming:** `Decoder::decode_nal(&NalUnit) -> Result<Option<Frame>, DecodeError>` plus `flush()`. NAL units are fed incrementally. Frames come out in **decoding order** by default, or in **display order** with `Decoder::new().with_display_order()` and `next_output()` (see [frame ordering](#important-frame-ordering)).
 - **Performance:** The decoder aims to be fast, with FFmpeg's software HEVC decoder as the target benchmark. Current gap vs single-threaded FFmpeg: ~2.5× on 8-bit, roughly parity on 10-bit real 1080p content. Motion compensation is compiler-vectorised; there are no hand-written NEON / SSE kernels yet.
 - **Multi-bit-depth:** 8-bit and 10-bit (Main / Main 10 profile) via a generic `Pixel` trait. 12-bit infrastructure is in place but untested. Pixel planes are `PixelData::U8(Vec<u8>)` or `PixelData::U16(Vec<u16>)` — check `frame.bit_depth` to determine which.
 - **Chroma formats:** 4:2:0 and 4:4:4, intra and inter. Check `frame.chroma_format_idc` (1 = 4:2:0, 3 = 4:4:4) to size the `u`/`v` planes: half width and height for 4:2:0, full size for 4:4:4. 4:2:2 and monochrome streams are rejected with `DecodeError::Unsupported`.
@@ -86,66 +86,43 @@ for packet in demuxer.video_packets() {
 
 ### Important: frame ordering
 
-**`decode_nal` returns frames in decode order, not display order.** With B-frames, the decoder must buffer reference frames before it can decode the B-frames that depend on them. The output order differs from the intended display order.
+**By default `decode_nal` returns frames in decoding order, not display
+order.** With B-frames, pictures are decoded before earlier pictures they
+are shown after.
 
-To display frames correctly, sort by `pic_order_cnt` (POC). If the stream has multiple IDR boundaries (GOPs), also track IDR boundaries to avoid mixing frames from different GOPs:
+For display order, create the decoder with `with_display_order()`. It runs
+the spec's output process (C.5.2, "bumping"): frames are released in display
+order as soon as the stream's reorder and DPB limits allow, and pictures the
+spec never outputs are dropped. In this mode `decode_nal` always returns
+`Ok(None)`; take frames with `next_output()`, and call `flush()` until it
+returns `None` at the end of the stream:
 
 ```rust
-use rust_h265::NalUnitType;
+use rust_h265::{Decoder, parse_annex_b};
 
-let mut idr_count: u32 = 0;
-let mut frames = Vec::new();
-
-for nal in &nals {
-    // HEVC IDR pictures are nal_unit_type 19 (IDR_W_RADL) or 20 (IDR_N_LP).
-    let is_idr = matches!(
-        nal.nal_unit_type,
-        NalUnitType::IdrWRadl | NalUnitType::IdrNLp,
-    );
-
-    if let Ok(Some(frame)) = decoder.decode_nal(nal) {
-        // Push with the CURRENT idr_count — this frame belongs to the
-        // previous picture, before the IDR boundary.
-        frames.push((idr_count, frame));
-    }
-
-    // Increment AFTER decode_nal, because decode_nal returns the
-    // PREVIOUS frame when it sees a new picture header. Incrementing
-    // first would tag the last B-frame of the old GOP with the new
-    // GOP's count and sort it incorrectly.
-    if is_idr {
-        idr_count += 1;
+let mut decoder = Decoder::new().with_display_order();
+for nal in parse_annex_b(&h265_data) {
+    decoder.decode_nal(&nal)?;
+    while let Some(frame) = decoder.next_output() {
+        // display `frame`
     }
 }
-if let Some(frame) = decoder.flush() {
-    frames.push((idr_count, frame));
-}
-
-// Sort by (GOP, POC) for display order.
-frames.sort_by_key(|(idr, f)| (*idr, f.pic_order_cnt));
-```
-
-### Common pitfall: IDR count timing
-
-The most common mistake is incrementing `idr_count` **before** calling `decode_nal`. This causes the last frame of each GOP to be placed after the next IDR in display order, producing a visible glitch at every scene cut.
-
-**Wrong:**
-```rust
-if is_idr {
-    idr_count += 1;  // BUG: too early
-}
-let frame = decoder.decode_nal(nal)?;
-// frame belongs to the OLD GOP but gets the NEW idr_count
-```
-
-**Correct:**
-```rust
-let frame = decoder.decode_nal(nal)?;
-// Push frame with current idr_count first
-if is_idr {
-    idr_count += 1;  // After the previous frame is handled
+while let Some(frame) = decoder.flush() {
+    // display `frame`
 }
 ```
+
+The dropped pictures are those with `pic_output_flag = 0`, skipped RASL
+pictures, and pictures still waiting when an IRAP picture with
+`NoOutputOfPriorPicsFlag = 1` starts a new coded video sequence. This mode
+passes all 147 JCT-VC HEVC_v1 conformance vectors, including the ones that
+test output order.
+
+In the default decoding-order mode every decoded picture is returned, and
+the caller sorts by `pic_order_cnt` within each coded video sequence (POC
+restarts at every IDR or BLA picture, and at a CRA after an end-of-sequence
+NAL). `examples/dump_frames.rs --decode-order` shows how. That mode suits
+callers that pair each frame with the container packet it came from.
 
 ## Differences from H.264
 
