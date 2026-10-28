@@ -234,6 +234,10 @@ pub struct PictureState<P: Pixel> {
     /// row starts. Forces `get_qPy_pred` to fall back to `slice_qp` for
     /// the first QP group of the reset region (spec 8.6.1).
     pub first_qp_group: bool,
+    /// Origin of the coding unit being decoded. cu_qp_delta inside its
+    /// transform tree derives the QP prediction from the CU origin (spec
+    /// 8.6.1 xCb / yCb), not from the transform block.
+    pub cu_origin: (u32, u32),
 
     /// Phase 2c-3 sentinel — most recently decoded luma residual block.
     pub last_luma_residual: Option<ResidualBlock>,
@@ -391,6 +395,7 @@ impl<P: Pixel> PictureState<P> {
             last_qp_y: 0,
             qpy_pred: 0,
             first_qp_group: false,
+            cu_origin: (0, 0),
             last_luma_residual: None,
             tab_qp_y: vec![0i8; min_cb_width * min_cb_height],
             bs_vertical: vec![0u8; ((w_aligned / 4) * (h_aligned / 4)) as usize],
@@ -2808,6 +2813,7 @@ fn decode_coding_unit<P: Pixel>(
                 && pred_mode != PredMode::Intra
                 && part_mode != PartMode::Part2Nx2N;
 
+            state.cu_origin = (x0, y0);
             decode_transform_tree(
                 cabac,
                 contexts,
@@ -3376,13 +3382,14 @@ fn decode_transform_unit<P: Pixel>(
                 return Err(DecodeError::InvalidSyntax("cu_qp_delta out of range"));
             }
             state.is_cu_qp_delta_coded = true;
-            // Spec 8.6.1: apply the delta to the spatial prediction and
-            // update `last_qp_y`. Mirrors FFmpeg
-            // hls_transform_unit:1345-1346. We pass the parent-TU origin
-            // (`x_base`, `y_base`) rather than the CU root because the
-            // derivation only depends on the QP-group-aligned coordinates,
-            // which are the same for any position inside the same QP group.
-            set_qpy(state, sps, pps, slice_qp_y, x_base, y_base);
+            // Spec 8.6.1: apply the delta to the prediction derived at the
+            // CU origin (xCb, yCb), as FFmpeg hls_transform_unit passes
+            // cb_xBase / cb_yBase. A TU origin is not equivalent: in a CU
+            // larger than the QP group, a TU away from the CU origin falls
+            // in a different group and would read neighbour QPs from inside
+            // its own, not yet decoded, CU.
+            let (cu_x, cu_y) = state.cu_origin;
+            set_qpy(state, sps, pps, slice_qp_y, cu_x, cu_y);
         }
 
         // cu_chroma_qp_offset (spec 7.3.8.11 / FFmpeg hevcdec.c:1349-1366).

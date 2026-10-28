@@ -4098,6 +4098,23 @@ mod tests {
         assert_eq!(hash, expected, "pmerge_level3 hash mismatch");
     }
 
+    /// 416×240, 4 frames (IPPP), HM reference encoder with 64×64 CTBs,
+    /// `MaxCuDQPDepth 2` (16×16 quantization groups) and adaptive QP. A
+    /// cu_qp_delta coded in a TU away from the origin of a CU larger than
+    /// the quantization group must still take its QP prediction from the CU
+    /// origin (spec 8.6.1). Byte-exact against FFmpeg.
+    ///
+    /// Fixture generated with HM `TAppEncoder` (testsrc2 input), cfg as for
+    /// `pmerge_level3_hm_416x240.h265` but with `Log2ParallelMergeLevel 2`,
+    /// AMP 1, TMVPMode 1, QP 22, `MaxCuDQPDepth 2`, `AdaptiveQP 1`,
+    /// `MaxQPAdaptationRange 12`.
+    #[test]
+    fn test_decode_delta_qp_groups_hash() {
+        let hash = decode_and_hash("delta_qp_groups_hm_416x240.h265", 4);
+        let expected = "8e0729fae2ac52d719064fe0c94bfc20ad62a0fa075f903b09d9101c13307240";
+        assert_eq!(hash, expected, "delta_qp_groups hash mismatch");
+    }
+
     #[test]
     fn test_decode_10bit_hash() {
         let hash = decode_and_hash("10bit_128x128.h265", 3);
