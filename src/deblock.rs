@@ -206,6 +206,7 @@ fn loop_filter_chroma_weak<P: Pixel>(
     ystride: isize,
     tc: i32,
     bit_depth: u8,
+    [no_p, no_q]: [bool; 2],
 ) {
     for d in 0..4 {
         let line_off = d * ystride;
@@ -214,10 +215,14 @@ fn loop_filter_chroma_weak<P: Pixel>(
         let q0 = plane[(base as isize + line_off + 0 * xstride) as usize].to_i32();
         let q1 = plane[(base as isize + line_off + 1 * xstride) as usize].to_i32();
         let delta0 = ((((q0 - p0) * 4) + p1 - q1 + 4) >> 3).clamp(-tc, tc);
-        plane[(base as isize + line_off + (-1) * xstride) as usize] =
-            P::from_i32_clamped(p0 + delta0, bit_depth);
-        plane[(base as isize + line_off + 0 * xstride) as usize] =
-            P::from_i32_clamped(q0 - delta0, bit_depth);
+        if !no_p {
+            plane[(base as isize + line_off + (-1) * xstride) as usize] =
+                P::from_i32_clamped(p0 + delta0, bit_depth);
+        }
+        if !no_q {
+            plane[(base as isize + line_off + 0 * xstride) as usize] =
+                P::from_i32_clamped(q0 - delta0, bit_depth);
+        }
     }
 }
 
@@ -240,6 +245,7 @@ fn filter_luma_edge<P: Pixel>(
     beta_offset: i32,
     tc_offset: i32,
     bit_depth: u8,
+    no_filter: [[bool; 2]; 2],
 ) {
     let beta = beta_lookup(qp_avg, beta_offset, bit_depth);
     let tcs = [
@@ -283,13 +289,25 @@ fn filter_luma_edge<P: Pixel>(
         };
         if strong_line(0, d0) && strong_line(3, d3) {
             luma_strong_seg(&mut seg, tc << 1);
-            store_luma_seg(plane, j_base, xstride, ystride, &seg, 1..7, bit_depth);
+            // P/Q samples of a lossless or PCM-protected block stay unchanged.
+            if !no_filter[j][0] {
+                store_luma_seg(plane, j_base, xstride, ystride, &seg, 1..4, bit_depth);
+            }
+            if !no_filter[j][1] {
+                store_luma_seg(plane, j_base, xstride, ystride, &seg, 4..7, bit_depth);
+            }
         } else {
             let side = (beta + (beta >> 1)) >> 3;
             let nd_p = if d0_p + d3_p < side { 2 } else { 1 };
             let nd_q = if d0_q + d3_q < side { 2 } else { 1 };
             luma_weak_seg(&mut seg, tc, nd_p, nd_q);
-            store_luma_seg(plane, j_base, xstride, ystride, &seg, 2..6, bit_depth);
+            // P/Q samples of a lossless or PCM-protected block stay unchanged.
+            if !no_filter[j][0] {
+                store_luma_seg(plane, j_base, xstride, ystride, &seg, 2..4, bit_depth);
+            }
+            if !no_filter[j][1] {
+                store_luma_seg(plane, j_base, xstride, ystride, &seg, 4..6, bit_depth);
+            }
         }
     }
 }
@@ -310,6 +328,7 @@ fn filter_chroma_edge<P: Pixel>(
     bs1: i32,
     bit_depth: u8,
     chroma_array_type: u32,
+    no_filter: [[bool; 2]; 2],
 ) {
     let tcs = [
         if bs0 == 2 {
@@ -328,13 +347,50 @@ fn filter_chroma_edge<P: Pixel>(
             continue;
         }
         let j_base = (pix_base as isize + (j as isize * 4) * ystride) as usize;
-        loop_filter_chroma_weak(plane, j_base, xstride, ystride, tcs[j], bit_depth);
+        loop_filter_chroma_weak(
+            plane,
+            j_base,
+            xstride,
+            ystride,
+            tcs[j],
+            bit_depth,
+            no_filter[j],
+        );
     }
 }
 
 // ---- Top-level dispatch ----
 
 /// Get the per-min-CB QP at luma sample position `(x, y)`.
+/// Whether the luma sample at `(x, y)` belongs to a block that the loop
+/// filters must not modify (see `PictureState::tab_no_filter`).
+#[inline]
+fn no_filter_at<P: Pixel>(state: &PictureState<P>, x: usize, y: usize) -> bool {
+    state.any_no_filter
+        && state
+            .tab_no_filter
+            .get((y >> 2) * state.min_pu_width + (x >> 2))
+            .is_some_and(|&v| v != 0)
+}
+
+/// `[segment][side]` no-filter flags for the two 4-line segments of an
+/// 8-sample edge: side 0 is P (before the edge), side 1 is Q. `p0` / `q0`
+/// are the luma positions of segment 0's P and Q samples; `step` moves to
+/// segment 1 along the edge.
+#[inline]
+fn edge_no_filter<P: Pixel>(
+    state: &PictureState<P>,
+    p0: (usize, usize),
+    q0: (usize, usize),
+    step: (usize, usize),
+) -> [[bool; 2]; 2] {
+    if !state.any_no_filter {
+        return [[false; 2]; 2];
+    }
+    let at = |(x, y): (usize, usize), k: usize| no_filter_at(state, x + k * step.0, y + k * step.1);
+    [[at(p0, 0), at(q0, 0)], [at(p0, 1), at(q0, 1)]]
+}
+
 fn get_qp_y<P: Pixel>(state: &PictureState<P>, x: i32, y: i32) -> i32 {
     let xc = (x.max(0) >> state.log2_min_cb_size) as usize;
     let yc = (y.max(0) >> state.log2_min_cb_size) as usize;
@@ -431,6 +487,7 @@ pub fn deblock_picture<P: Pixel>(
                     + 1)
                     >> 1;
                 let pix_base = y * stride_y + x;
+                let nf = edge_no_filter(state, (x - 1, y), (x, y), (0, 4));
                 filter_luma_edge::<P>(
                     &mut state.y_plane,
                     pix_base,
@@ -442,6 +499,7 @@ pub fn deblock_picture<P: Pixel>(
                     beta_offset,
                     tc_offset,
                     bit_depth_luma,
+                    nf,
                 );
             }
             x += 8;
@@ -466,6 +524,7 @@ pub fn deblock_picture<P: Pixel>(
                     + 1)
                     >> 1;
                 let pix_base = y * stride_y + x;
+                let nf = edge_no_filter(state, (x, y - 1), (x, y), (4, 0));
                 filter_luma_edge::<P>(
                     &mut state.y_plane,
                     pix_base,
@@ -477,6 +536,7 @@ pub fn deblock_picture<P: Pixel>(
                     beta_offset,
                     tc_offset,
                     bit_depth_luma,
+                    nf,
                 );
             }
             x += 8;
@@ -510,6 +570,7 @@ pub fn deblock_picture<P: Pixel>(
             qp1_avg: i32,
             bs0: i32,
             bs1: i32,
+            no_filter: [[bool; 2]; 2],
         }
         let mut edges: Vec<ChromaEdge> = Vec::new();
 
@@ -543,6 +604,7 @@ pub fn deblock_picture<P: Pixel>(
                         qp1_avg,
                         bs0,
                         bs1,
+                        no_filter: edge_no_filter(state, (x_l - 1, y_l), (x_l, y_l), (0, bs_dy)),
                     });
                 }
                 x_l += step_x;
@@ -579,6 +641,7 @@ pub fn deblock_picture<P: Pixel>(
                         qp1_avg,
                         bs0,
                         bs1,
+                        no_filter: edge_no_filter(state, (x_l, y_l - 1), (x_l, y_l), (bs_dx, 0)),
                     });
                 }
                 x_l += step_x;
@@ -612,6 +675,7 @@ pub fn deblock_picture<P: Pixel>(
                     e.bs1,
                     bit_depth_chroma,
                     chroma_array_type,
+                    e.no_filter,
                 );
             }
         }

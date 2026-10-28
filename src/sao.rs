@@ -489,4 +489,41 @@ pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &
             }
         }
     }
+    // Samples of lossless or PCM-protected blocks keep their deblocked
+    // values (spec 8.7.3): copy them back from the SAO input snapshot.
+    if state.any_no_filter {
+        let (csw, csh) = (state.chroma_shift_w as usize, state.chroma_shift_h as usize);
+        let (ys, uvs) = (state.y_stride, state.uv_stride);
+        let rows = state.tab_no_filter.len() / state.min_pu_width.max(1);
+        for by in 0..rows {
+            for bx in 0..state.min_pu_width {
+                if state.tab_no_filter[by * state.min_pu_width + bx] == 0 {
+                    continue;
+                }
+                let (x, y) = (bx * 4, by * 4);
+                for r in y..y + 4 {
+                    let o = r * ys + x;
+                    if let (Some(d), Some(sr)) =
+                        (state.y_plane.get_mut(o..o + 4), y_src.get(o..o + 4))
+                    {
+                        d.copy_from_slice(sr);
+                    }
+                }
+                let (cx, cy, cw, ch) = (x >> csw, y >> csh, 4 >> csw, 4 >> csh);
+                for r in cy..cy + ch {
+                    let o = r * uvs + cx;
+                    if let (Some(d), Some(sr)) =
+                        (state.u_plane.get_mut(o..o + cw), u_src.get(o..o + cw))
+                    {
+                        d.copy_from_slice(sr);
+                    }
+                    if let (Some(d), Some(sr)) =
+                        (state.v_plane.get_mut(o..o + cw), v_src.get(o..o + cw))
+                    {
+                        d.copy_from_slice(sr);
+                    }
+                }
+            }
+        }
+    }
 }

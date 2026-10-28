@@ -263,6 +263,13 @@ pub struct PictureState<P: Pixel> {
     /// Consulted by `compute_luma_avail` to treat cross-tile neighbor
     /// samples as unavailable for intra prediction (spec 6.4.4 / 8.4.2).
     pub tab_tile_id: Vec<u32>,
+    /// Per 4x4 luma block: 1 where deblocking and SAO must leave samples
+    /// unchanged (a cu_transquant_bypass CU, or a PCM CU when
+    /// pcm_loop_filter_disabled_flag is set; spec 8.7.2.5.7, 8.7.3).
+    pub tab_no_filter: Vec<u8>,
+    /// True once any block of this picture is marked in `tab_no_filter`, so
+    /// the loop filters can skip the lookups for ordinary pictures.
+    pub any_no_filter: bool,
     /// PPS `loop_filter_across_tiles_enabled_flag`: when false, deblocking
     /// and SAO must not use samples across a tile boundary.
     pub filter_across_tiles: bool,
@@ -405,6 +412,8 @@ impl<P: Pixel> PictureState<P> {
                 vec![0u32; pw * ph]
             },
             filter_across_tiles: true,
+            tab_no_filter: vec![0u8; min_pu_width * min_pu_height],
+            any_no_filter: false,
             tab_mvf: vec![MvField::default(); min_pu_width * min_pu_height],
             tab_skip_flag: vec![0u8; min_cb_width * min_cb_height],
             min_tb_addr_zs: zscan,
@@ -2366,6 +2375,9 @@ fn decode_coding_unit<P: Pixel>(
     } else {
         false
     };
+    if cu_transquant_bypass {
+        mark_no_filter(state, x0, y0, log2_cb_size);
+    }
 
     // Reset per-CU chroma QP offset state (FFmpeg hls_coding_unit:2633-2634).
     if slice_params.cu_chroma_qp_offset_enabled_flag && !cu_transquant_bypass {
@@ -2483,7 +2495,14 @@ fn decode_coding_unit<P: Pixel>(
             && log2_cb_size <= sps.log2_max_pcm_cb_size;
         if pcm_allowed && cabac.decode_terminate() != 0 {
             decode_pcm_block(cabac, state, sps, x0, y0, log2_cb_size)?;
-            state.cu_count += 1;
+            if sps.pcm_loop_filter_disabled_flag {
+                mark_no_filter(state, x0, y0, log2_cb_size);
+            }
+            // A PCM CU has no transform tree, but its edges still need
+            // boundary strengths (intra: bS = 2) and its QP must still be
+            // recorded for deblocking and QP prediction.
+            compute_deblocking_boundary_strengths(state, slice_params, x0, y0, log2_cb_size);
+            finish_coding_unit(state, sps, pps, slice_qp_y, x0, y0, log2_cb_size);
             return Ok(());
         }
         decode_intra_mode_signaling(cabac, contexts, state, x0, y0, log2_cb_size, part_mode)?;
@@ -2796,6 +2815,21 @@ fn decode_coding_unit<P: Pixel>(
         }
     }
 
+    finish_coding_unit(state, sps, pps, slice_qp_y, x0, y0, log2_cb_size);
+    Ok(())
+}
+
+/// End-of-CU bookkeeping shared by every CU, PCM included.
+#[allow(clippy::too_many_arguments)]
+fn finish_coding_unit<P: Pixel>(
+    state: &mut PictureState<P>,
+    sps: &Sps,
+    pps: &Pps,
+    slice_qp_y: i32,
+    x0: u32,
+    y0: u32,
+    log2_cb_size: u8,
+) {
     // Spec 8.6.1 / FFmpeg hls_coding_unit:2588-2589: at the end of every
     // CU, if `cu_qp_delta` has not yet been coded for the current QP
     // group, invoke `set_qPy` with delta=0 to refresh `last_qp_y` from
@@ -2816,7 +2850,21 @@ fn decode_coding_unit<P: Pixel>(
     maybe_save_qpy_pred(state, sps, pps, x0, y0, log2_cb_size);
 
     state.cu_count += 1;
-    Ok(())
+}
+
+/// Mark a CU's 4x4 blocks as protected from deblocking and SAO.
+fn mark_no_filter<P: Pixel>(state: &mut PictureState<P>, x0: u32, y0: u32, log2_size: u8) {
+    let n = ((1usize << log2_size) >> 2).max(1);
+    let (bx, by) = ((x0 >> 2) as usize, (y0 >> 2) as usize);
+    for j in 0..n {
+        for i in 0..n {
+            let idx = (by + j) * state.min_pu_width + bx + i;
+            if let Some(v) = state.tab_no_filter.get_mut(idx) {
+                *v = 1;
+            }
+        }
+    }
+    state.any_no_filter = true;
 }
 
 /// Decode a PCM (raw pixel) CU (HEVC spec 7.3.8.6 / FFmpeg `hls_pcm_sample`).
