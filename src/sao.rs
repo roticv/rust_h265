@@ -105,6 +105,7 @@ pub fn decode_sao_param<P: Pixel>(
     contexts: &mut CabacContexts,
     state: &mut PictureState<P>,
     sps: &Sps,
+    pps: &crate::pps::Pps,
     sh: &SliceHeader,
     rx: usize,
     ry: usize,
@@ -178,6 +179,12 @@ pub fn decode_sao_param<P: Pixel>(
                 *v = decode_sao_offset_abs(cabac, bd);
             }
 
+            // SaoOffsetVal = offset << log2OffsetScale (spec 7.4.9.3.2).
+            let log2_offset_scale = if c_idx == 0 {
+                pps.log2_sao_offset_scale_luma
+            } else {
+                pps.log2_sao_offset_scale_chroma
+            };
             if sao.type_idx[c_idx] == SaoType::Band {
                 let mut offset_sign = [0u32; 4];
                 for (i, &abs) in offset_abs.iter().enumerate() {
@@ -192,7 +199,7 @@ pub fn decode_sao_param<P: Pixel>(
                     if offset_sign[i] != 0 {
                         v = -v;
                     }
-                    sao.offset_val[c_idx][i + 1] = v;
+                    sao.offset_val[c_idx][i + 1] = v << log2_offset_scale;
                 }
             } else {
                 // Edge offset path. Cb/Cr inherits eo_class but each plane
@@ -206,7 +213,7 @@ pub fn decode_sao_param<P: Pixel>(
                     if i > 1 {
                         v = -v;
                     }
-                    sao.offset_val[c_idx][i + 1] = v;
+                    sao.offset_val[c_idx][i + 1] = v << log2_offset_scale;
                 }
             }
         }

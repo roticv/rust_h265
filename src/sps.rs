@@ -391,6 +391,39 @@ pub struct Sps {
     pub sps_max_dec_pic_buffering_minus1: u32,
     pub sps_max_num_reorder_pics: u32,
     pub sps_max_latency_increase_plus1: u32,
+    /// `sps_range_extension()` flags (spec 7.3.2.2.2); all false when absent.
+    pub range: SpsRangeExtension,
+}
+
+/// Coding-tool flags of `sps_range_extension()` (spec 7.4.3.2.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpsRangeExtension {
+    pub transform_skip_rotation_enabled_flag: bool,
+    pub transform_skip_context_enabled_flag: bool,
+    pub implicit_rdpcm_enabled_flag: bool,
+    pub explicit_rdpcm_enabled_flag: bool,
+    pub extended_precision_processing_flag: bool,
+    pub intra_smoothing_disabled_flag: bool,
+    pub high_precision_offsets_enabled_flag: bool,
+    pub persistent_rice_adaptation_enabled_flag: bool,
+    pub cabac_bypass_alignment_enabled_flag: bool,
+}
+
+/// The first enabled SPS range-extension tool this decoder does not
+/// implement yet, if any.
+fn unimplemented_sps_tool(r: &SpsRangeExtension) -> Option<&'static str> {
+    [
+        (
+            r.extended_precision_processing_flag,
+            "extended_precision_processing_flag",
+        ),
+        (
+            r.cabac_bypass_alignment_enabled_flag,
+            "cabac_bypass_alignment_enabled_flag",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(on, name)| on.then_some(name))
 }
 
 impl Sps {
@@ -550,18 +583,18 @@ pub fn peek_sps_id(rbsp: &[u8]) -> Option<u32> {
     r.read_ue().ok()
 }
 
-/// Skip `vui_parameters()` (spec E.2.1) and read the SPS extension flags.
-/// Returns the name of the first enabled coding tool that this decoder does
-/// not implement, if any.
+/// Skip `vui_parameters()` (spec E.2.1) and read `sps_range_extension()`.
+/// The screen content coding extension is rejected as `Unsupported`.
 fn parse_vui_and_extensions(
     r: &mut BitstreamReader,
     max_sub_layers_minus1: u8,
-) -> Result<Option<&'static str>, DecodeError> {
+) -> Result<SpsRangeExtension, DecodeError> {
     if r.read_bit()? == 1 {
         skip_vui(r, max_sub_layers_minus1)?;
     }
+    let mut ext = SpsRangeExtension::default();
     if r.read_bit()? == 0 {
-        return Ok(None); // sps_extension_present_flag
+        return Ok(ext); // sps_extension_present_flag
     }
     let range = r.read_bit()? == 1;
     let _multilayer = r.read_bit()?;
@@ -570,34 +603,24 @@ fn parse_vui_and_extensions(
     let _extension_4bits = r.read_bits(4)?;
     if range {
         // sps_range_extension() (spec 7.3.2.2.2), in syntax order.
-        const TOOLS: [&str; 9] = [
-            "transform_skip_rotation_enabled_flag",
-            "transform_skip_context_enabled_flag",
-            "implicit_rdpcm_enabled_flag",
-            "explicit_rdpcm_enabled_flag",
-            "extended_precision_processing_flag",
-            "intra_smoothing_disabled_flag",
-            "high_precision_offsets_enabled_flag",
-            "persistent_rice_adaptation_enabled_flag",
-            "cabac_bypass_alignment_enabled_flag",
-        ];
-        let mut first = None;
-        for tool in TOOLS {
-            if r.read_bit()? == 1 && first.is_none() {
-                first = Some(tool);
-            }
-        }
-        if first.is_some() {
-            return Ok(first);
-        }
+        let mut flag = || -> Result<bool, DecodeError> { Ok(r.read_bit()? == 1) };
+        ext.transform_skip_rotation_enabled_flag = flag()?;
+        ext.transform_skip_context_enabled_flag = flag()?;
+        ext.implicit_rdpcm_enabled_flag = flag()?;
+        ext.explicit_rdpcm_enabled_flag = flag()?;
+        ext.extended_precision_processing_flag = flag()?;
+        ext.intra_smoothing_disabled_flag = flag()?;
+        ext.high_precision_offsets_enabled_flag = flag()?;
+        ext.persistent_rice_adaptation_enabled_flag = flag()?;
+        ext.cabac_bypass_alignment_enabled_flag = flag()?;
     }
     // The multilayer and 3D extensions only carry constraints for layers
     // above the base layer, which is all this decoder decodes; their data
     // follows the range extension and needs no parsing.
     if scc {
-        return Ok(Some("screen content coding extension"));
+        return Err(DecodeError::Unsupported("screen content coding extension"));
     }
-    Ok(None)
+    Ok(ext)
 }
 
 /// Skip `vui_parameters()` (spec E.2.1).
@@ -982,19 +1005,22 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
     // VUI, then the SPS extensions (spec 7.3.2.2.1). Only the range
     // extension's tool flags matter: coding tools this decoder does not
     // implement are rejected instead of being silently ignored.
-    match parse_vui_and_extensions(&mut r, sps_max_sub_layers_minus1) {
-        Ok(None) => {}
-        Ok(Some(tool)) => return Err(DecodeError::Unsupported(tool)),
+    let range = match parse_vui_and_extensions(&mut r, sps_max_sub_layers_minus1) {
+        Ok(range) => range,
         // A Main, Main 10 or Main Still Picture SPS cannot enable extension
         // tools, so a VUI this parser cannot follow is harmless there. For
         // other profiles the tool flags are unknown: refuse rather than
         // risk decoding with tools ignored.
-        Err(_) if ptl.general_profile_idc <= 3 => {}
+        Err(_) if ptl.general_profile_idc <= 3 => SpsRangeExtension::default(),
+        Err(e @ DecodeError::Unsupported(_)) => return Err(e),
         Err(_) => {
             return Err(DecodeError::Unsupported(
                 "SPS VUI / extension data could not be parsed",
             ));
         }
+    };
+    if let Some(tool) = unimplemented_sps_tool(&range) {
+        return Err(DecodeError::Unsupported(tool));
     }
 
     Ok(Sps {
@@ -1042,6 +1068,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         sps_max_dec_pic_buffering_minus1,
         sps_max_num_reorder_pics,
         sps_max_latency_increase_plus1,
+        range,
     })
 }
 

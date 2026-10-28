@@ -83,6 +83,24 @@ pub struct Pps {
     pub cb_qp_offset_list: [i32; 6],
     /// Per-index Cr QP offset list (up to 6 entries).
     pub cr_qp_offset_list: [i32; 6],
+    /// `diff_cu_chroma_qp_offset_depth` (PPS range extension).
+    pub diff_cu_chroma_qp_offset_depth: u32,
+    /// Log2MaxTransformSkipSize: 2 unless the range extension raises it.
+    pub log2_max_transform_skip_block_size: u8,
+    /// `cross_component_prediction_enabled_flag` (PPS range extension).
+    pub cross_component_prediction_enabled_flag: bool,
+    /// `log2_sao_offset_scale_luma` / `_chroma` (PPS range extension).
+    pub log2_sao_offset_scale_luma: u8,
+    pub log2_sao_offset_scale_chroma: u8,
+}
+
+impl Pps {
+    /// The first enabled PPS range-extension tool this decoder does not
+    /// implement yet, if any.
+    fn unimplemented_tool(&self) -> Option<&'static str> {
+        // Every PPS range-extension tool is implemented.
+        None
+    }
 }
 
 impl Pps {
@@ -281,8 +299,15 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
     let log2_parallel_merge_level_minus2 = r.read_ue()?;
     let slice_segment_header_extension_present_flag = r.read_bit()? == 1;
 
-    // PPS extensions (spec 7.3.2.3.1). Range-extension tools this decoder
-    // does not implement are rejected instead of being silently ignored.
+    // PPS extensions (spec 7.3.2.3.1).
+    let mut log2_max_transform_skip_block_size = 2u8;
+    let mut cross_component_prediction_enabled_flag = false;
+    let mut chroma_qp_offset_list_enabled_flag = false;
+    let mut diff_cu_chroma_qp_offset_depth = 0u32;
+    let mut chroma_qp_offset_list_len_minus1 = 0u32;
+    let mut cb_qp_offset_list = [0i32; 6];
+    let mut cr_qp_offset_list = [0i32; 6];
+    let (mut log2_sao_offset_scale_luma, mut log2_sao_offset_scale_chroma) = (0u8, 0u8);
     if r.read_bit()? == 1 {
         let range = r.read_bit()? == 1;
         let _multilayer = r.read_bit()?;
@@ -291,31 +316,56 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
         let _extension_4bits = r.read_bits(4)?;
         if range {
             // pps_range_extension() (spec 7.3.2.3.2).
-            if transform_skip_enabled_flag && r.read_ue()? != 0 {
-                return Err(DecodeError::Unsupported(
-                    "log2_max_transform_skip_block_size_minus2 > 0",
+            if transform_skip_enabled_flag {
+                let minus2 = r.read_ue()?;
+                if minus2 > 3 {
+                    return Err(DecodeError::InvalidSyntax(
+                        "log2_max_transform_skip_block_size_minus2 > 3",
+                    ));
+                }
+                log2_max_transform_skip_block_size = minus2 as u8 + 2;
+            }
+            cross_component_prediction_enabled_flag = r.read_bit()? == 1;
+            chroma_qp_offset_list_enabled_flag = r.read_bit()? == 1;
+            if chroma_qp_offset_list_enabled_flag {
+                diff_cu_chroma_qp_offset_depth = r.read_ue()?;
+                if diff_cu_chroma_qp_offset_depth > 4 {
+                    return Err(DecodeError::InvalidSyntax(
+                        "diff_cu_chroma_qp_offset_depth out of range",
+                    ));
+                }
+                chroma_qp_offset_list_len_minus1 = r.read_ue()?;
+                if chroma_qp_offset_list_len_minus1 > 5 {
+                    return Err(DecodeError::InvalidSyntax(
+                        "chroma_qp_offset_list_len_minus1 > 5",
+                    ));
+                }
+                for i in 0..=chroma_qp_offset_list_len_minus1 as usize {
+                    cb_qp_offset_list[i] = r.read_se()?;
+                    cr_qp_offset_list[i] = r.read_se()?;
+                    if !(-12..=12).contains(&cb_qp_offset_list[i])
+                        || !(-12..=12).contains(&cr_qp_offset_list[i])
+                    {
+                        return Err(DecodeError::InvalidSyntax("chroma QP offset list entry"));
+                    }
+                }
+            }
+            // Range 0..=Max(0, BitDepth - 10), at most 2 for 12-bit.
+            let (luma, chroma) = (r.read_ue()?, r.read_ue()?);
+            if luma > 2 || chroma > 2 {
+                return Err(DecodeError::InvalidSyntax(
+                    "log2_sao_offset_scale out of range",
                 ));
             }
-            if r.read_bit()? == 1 {
-                return Err(DecodeError::Unsupported(
-                    "cross_component_prediction_enabled_flag",
-                ));
-            }
-            if r.read_bit()? == 1 {
-                return Err(DecodeError::Unsupported(
-                    "chroma_qp_offset_list_enabled_flag",
-                ));
-            }
-            if r.read_ue()? != 0 || r.read_ue()? != 0 {
-                return Err(DecodeError::Unsupported("log2_sao_offset_scale > 0"));
-            }
+            log2_sao_offset_scale_luma = luma as u8;
+            log2_sao_offset_scale_chroma = chroma as u8;
         }
         if scc {
             return Err(DecodeError::Unsupported("screen content coding extension"));
         }
     }
 
-    Ok(Pps {
+    let pps = Pps {
         pps_pic_parameter_set_id,
         pps_seq_parameter_set_id,
         dependent_slice_segments_enabled_flag,
@@ -357,9 +407,18 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
         lists_modification_present_flag,
         log2_parallel_merge_level_minus2,
         slice_segment_header_extension_present_flag,
-        chroma_qp_offset_list_enabled_flag: false,
-        chroma_qp_offset_list_len_minus1: 0,
-        cb_qp_offset_list: [0i32; 6],
-        cr_qp_offset_list: [0i32; 6],
-    })
+        chroma_qp_offset_list_enabled_flag,
+        chroma_qp_offset_list_len_minus1,
+        cb_qp_offset_list,
+        cr_qp_offset_list,
+        diff_cu_chroma_qp_offset_depth,
+        log2_max_transform_skip_block_size,
+        cross_component_prediction_enabled_flag,
+        log2_sao_offset_scale_luma,
+        log2_sao_offset_scale_chroma,
+    };
+    if let Some(tool) = pps.unimplemented_tool() {
+        return Err(DecodeError::Unsupported(tool));
+    }
+    Ok(pps)
 }

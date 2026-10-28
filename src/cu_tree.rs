@@ -245,6 +245,9 @@ pub struct PictureState<P: Pixel> {
     /// transform tree derives the QP prediction from the CU origin (spec
     /// 8.6.1 xCb / yCb), not from the transform block.
     pub cu_origin: (u32, u32),
+    /// Luma residual of the current transform unit after the inverse
+    /// transform, kept for cross-component prediction (spec 8.6.6).
+    pub ccp_luma_residual: Vec<i16>,
 
     /// Phase 2c-3 sentinel — most recently decoded luma residual block.
     pub last_luma_residual: Option<ResidualBlock>,
@@ -404,6 +407,7 @@ impl<P: Pixel> PictureState<P> {
             qpy_pred: 0,
             first_qp_group: false,
             cu_origin: (0, 0),
+            ccp_luma_residual: Vec::new(),
             last_luma_residual: None,
             tab_qp_y: vec![0i8; min_cb_width * min_cb_height],
             bs_vertical: vec![0u8; ((w_aligned / 4) * (h_aligned / 4)) as usize],
@@ -601,6 +605,17 @@ pub fn decode_coding_quadtree<P: Pixel>(
     {
         state.is_cu_qp_delta_coded = false;
         state.last_cu_qp_delta = 0;
+    }
+    // Chroma QP offset groups (spec 7.3.8.4): cu_chroma_qp_offset_flag is
+    // coded at most once per group of Log2MinCuChromaQpOffsetSize. The
+    // offsets themselves persist until coded again (reset per slice).
+    if slice_params.cu_chroma_qp_offset_enabled_flag
+        && log2_cb_size
+            >= sps
+                .ctb_log2_size_y
+                .saturating_sub(pps.diff_cu_chroma_qp_offset_depth as u8)
+    {
+        state.is_cu_chroma_qp_offset_coded = false;
     }
 
     // Implicit-no-split when we're at min CB size or when the CU would
@@ -2444,13 +2459,6 @@ fn decode_coding_unit<P: Pixel>(
         mark_no_filter(state, x0, y0, log2_cb_size);
     }
 
-    // Reset per-CU chroma QP offset state (FFmpeg hls_coding_unit:2633-2634).
-    if slice_params.cu_chroma_qp_offset_enabled_flag && !cu_transquant_bypass {
-        state.is_cu_chroma_qp_offset_coded = false;
-        state.cu_qp_offset_cb = 0;
-        state.cu_qp_offset_cr = 0;
-    }
-
     let cb_size = 1u32 << log2_cb_size;
     let x_cb = (x0 >> state.log2_min_cb_size) as usize;
     let y_cb = (y0 >> state.log2_min_cb_size) as usize;
@@ -3364,6 +3372,7 @@ fn decode_transform_unit<P: Pixel>(
             log2_trafo_size,
             luma_mode,
             pps.constrained_intra_pred_flag,
+            cu_transquant_bypass,
         )?;
     }
 
@@ -3462,13 +3471,20 @@ fn decode_transform_unit<P: Pixel>(
         }
 
         let qp_y = state.last_qp_y;
+        // Cross-component prediction (spec 7.3.8.12, 4:4:4 only): needs a
+        // coded luma residual in this transform unit.
+        let ccp_possible = pps.cross_component_prediction_enabled_flag && cbf_luma && do_chroma_444;
 
         // ---- Step 3: luma residual_coding + IDCT + reconstruction.
         if cbf_luma {
-            let scan_idx = if is_intra {
+            let luma_mode = if is_intra {
                 let x_pu = (x0 >> state.log2_min_pu_size) as usize;
                 let y_pu = (y0 >> state.log2_min_pu_size) as usize;
-                let luma_mode = state.tab_ipm[y_pu * state.min_pu_width + x_pu];
+                state.tab_ipm[y_pu * state.min_pu_width + x_pu]
+            } else {
+                0
+            };
+            let scan_idx = if is_intra {
                 pick_scan_order(log2_trafo_size, luma_mode)
             } else {
                 ScanOrder::Diag
@@ -3483,9 +3499,18 @@ fn decode_transform_unit<P: Pixel>(
                 qp_y,
                 scan_idx,
                 is_intra,
+                luma_mode,
                 cu_transquant_bypass,
             )?;
-            apply_residual_to_luma(state, x0, y0, log2_trafo_size, &block, is_intra);
+            apply_residual_to_luma(
+                state,
+                x0,
+                y0,
+                log2_trafo_size,
+                &block,
+                is_intra,
+                pps.cross_component_prediction_enabled_flag,
+            );
             state.last_luma_residual = Some(block);
         }
 
@@ -3511,6 +3536,10 @@ fn decode_transform_unit<P: Pixel>(
                 let y_pu = (y0 >> state.log2_min_pu_size) as usize;
                 let chroma_mode = state.tab_chroma_ipm[y_pu * state.min_pu_width + x_pu];
                 state.last_chroma_pred_mode = chroma_mode;
+                // intra_chroma_pred_mode 4 (DM) is exactly when the derived
+                // chroma mode equals the luma mode in 4:4:4.
+                let ccp_intra =
+                    ccp_possible && chroma_mode == state.tab_ipm[y_pu * state.min_pu_width + x_pu];
                 predict_intra_chroma(
                     state,
                     sps,
@@ -3537,6 +3566,7 @@ fn decode_transform_unit<P: Pixel>(
                     cu_transquant_bypass,
                     slice_params.slice_cb_qp_offset,
                     slice_params.slice_cr_qp_offset,
+                    ccp_intra,
                 )?;
             } else if do_chroma_inline {
                 let chroma_mode = state.last_chroma_pred_mode;
@@ -3566,6 +3596,7 @@ fn decode_transform_unit<P: Pixel>(
                     cu_transquant_bypass,
                     slice_params.slice_cb_qp_offset,
                     slice_params.slice_cr_qp_offset,
+                    false,
                 )?;
             } else if do_chroma_deferred {
                 let chroma_mode = state.last_chroma_pred_mode;
@@ -3595,6 +3626,7 @@ fn decode_transform_unit<P: Pixel>(
                     cu_transquant_bypass,
                     slice_params.slice_cb_qp_offset,
                     slice_params.slice_cr_qp_offset,
+                    false,
                 )?;
             }
         } else {
@@ -3609,7 +3641,12 @@ fn decode_transform_unit<P: Pixel>(
             //    (whether intra or inter); our previous code only handled
             //    the intra side, so inter CUs with 4×4 luma TUs were
             //    silently skipping the chroma residual_coding() calls.
-            if (do_chroma_inline || do_chroma_444) && (inherited.cbf_cb || inherited.cbf_cr) {
+            // With cross-component prediction a chroma residual exists
+            // even without a chroma cbf.
+            let ccp_inter = ccp_possible;
+            if (do_chroma_inline || do_chroma_444)
+                && (inherited.cbf_cb || inherited.cbf_cr || ccp_inter)
+            {
                 decode_chroma_residuals(
                     cabac,
                     contexts,
@@ -3627,6 +3664,7 @@ fn decode_transform_unit<P: Pixel>(
                     cu_transquant_bypass,
                     slice_params.slice_cb_qp_offset,
                     slice_params.slice_cr_qp_offset,
+                    ccp_inter,
                 )?;
             } else if do_chroma_deferred && (inherited.cbf_cb || inherited.cbf_cr) {
                 decode_chroma_residuals(
@@ -3646,6 +3684,7 @@ fn decode_transform_unit<P: Pixel>(
                     cu_transquant_bypass,
                     slice_params.slice_cb_qp_offset,
                     slice_params.slice_cr_qp_offset,
+                    false,
                 )?;
             }
         }
@@ -3830,6 +3869,24 @@ fn write_qp_y_table<P: Pixel>(
 /// Decode and apply chroma Cb/Cr residuals for a single TU. The chroma
 /// QP is derived from the luma QP via the HEVC spec table 8-9 mapping.
 /// `x0`/`y0` are in luma sample coordinates; chroma is at half that for 4:2:0.
+/// `cross_comp_pred(x0, y0, c)` (spec 7.3.8.12): returns ResScaleVal,
+/// `(1 << (log2_res_scale_abs_plus1 - 1)) * (1 - 2 * res_scale_sign_flag)`.
+/// `log2_res_scale_abs_plus1` is truncated unary with cMax 4, context
+/// `4 * c + binIdx`; the sign uses context `c`.
+fn decode_cross_comp_pred(cabac: &mut CabacReader, contexts: &mut CabacContexts, c: usize) -> i32 {
+    let mut abs_plus1 = 0usize;
+    while abs_plus1 < 4
+        && cabac.decode_bin(&mut contexts.state[ctx::LOG2_RES_SCALE_ABS + 4 * c + abs_plus1]) != 0
+    {
+        abs_plus1 += 1;
+    }
+    if abs_plus1 == 0 {
+        return 0;
+    }
+    let sign = cabac.decode_bin(&mut contexts.state[ctx::RES_SCALE_SIGN_FLAG + c]) as i32;
+    (1 << (abs_plus1 - 1)) * (1 - 2 * sign)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_chroma_residuals<P: Pixel>(
     cabac: &mut CabacReader,
@@ -3848,13 +3905,21 @@ fn decode_chroma_residuals<P: Pixel>(
     cu_transquant_bypass: bool,
     slice_cb_qp_offset: i32,
     slice_cr_qp_offset: i32,
+    ccp: bool,
 ) -> Result<(), DecodeError> {
     let x_c = (x0 >> state.chroma_shift_w) as usize;
     let y_c = (y0 >> state.chroma_shift_h) as usize;
 
     for c_idx in 1..=2u8 {
         let cbf = if c_idx == 1 { cbf_cb } else { cbf_cr };
-        if !cbf {
+        // cross_comp_pred(x0, y0, c) precedes the component's residual
+        // (spec 7.3.8.12): ResScaleVal for this chroma component.
+        let res_scale_val = if ccp {
+            decode_cross_comp_pred(cabac, contexts, (c_idx - 1) as usize)
+        } else {
+            0
+        };
+        if !cbf && res_scale_val == 0 {
             continue;
         }
         // Derive chroma QP per spec 8.6.1.
@@ -3895,31 +3960,45 @@ fn decode_chroma_residuals<P: Pixel>(
         } else {
             ScanOrder::Diag
         };
-        let block = decode_residual_coding(
-            cabac,
-            contexts,
-            sps,
-            pps,
-            log2_trafo_size_c,
-            plane,
-            qp_c,
-            scan_idx,
-            is_intra,
-            cu_transquant_bypass,
-        )?;
-
-        // Apply inverse transform + add to chroma plane.
         let size_c = 1usize << log2_trafo_size_c;
-        let mut residual = block.coeffs.clone();
-        if !block.transform_skip && !block.cu_transquant_bypass {
-            apply_inverse_transform(
-                &mut residual,
+        let mut residual = if cbf {
+            let block = decode_residual_coding(
+                cabac,
+                contexts,
+                sps,
+                pps,
                 log2_trafo_size_c,
-                block.last_sig_x,
-                block.last_sig_y,
-                sps.bit_depth_chroma as u32,
-                false, // chroma never uses DST
-            );
+                plane,
+                qp_c,
+                scan_idx,
+                is_intra,
+                state.last_chroma_pred_mode,
+                cu_transquant_bypass,
+            )?;
+            // Apply inverse transform + add to chroma plane.
+            let mut residual = block.coeffs;
+            if !block.transform_skip && !block.cu_transquant_bypass {
+                apply_inverse_transform(
+                    &mut residual,
+                    log2_trafo_size_c,
+                    block.last_sig_x,
+                    block.last_sig_y,
+                    sps.bit_depth_chroma as u32,
+                    false, // chroma never uses DST
+                );
+            }
+            residual
+        } else {
+            vec![0i16; size_c * size_c]
+        };
+        // Cross-component prediction (spec 8.6.6): add the scaled luma
+        // residual. Only in 4:4:4, where the blocks are the same size.
+        if res_scale_val != 0 && state.ccp_luma_residual.len() == residual.len() {
+            let (bd_y, bd_c) = (sps.bit_depth_luma as i32, sps.bit_depth_chroma as i32);
+            for (r, &y) in residual.iter_mut().zip(&state.ccp_luma_residual) {
+                let scaled = (res_scale_val * (((y as i32) << bd_c) >> bd_y)) >> 3;
+                *r = (*r as i32 + scaled) as i16;
+            }
         }
         let dst_stride = state.uv_stride;
         let dst_plane = if c_idx == 1 {
@@ -3975,6 +4054,7 @@ fn mark_intra_tu_boundaries<P: Pixel>(
 
 /// Build the reference samples and call PLANAR/DC/angular for a luma TU.
 /// Writes the prediction into `state.y_plane` at `(x0, y0)`.
+#[allow(clippy::too_many_arguments)]
 fn predict_intra_luma<P: Pixel>(
     state: &mut PictureState<P>,
     sps: &Sps,
@@ -3983,11 +4063,15 @@ fn predict_intra_luma<P: Pixel>(
     log2_size: u8,
     mode: u8,
     constrained_intra_pred_flag: bool,
+    cu_transquant_bypass: bool,
 ) -> Result<(), DecodeError> {
     let size = 1usize << log2_size;
     let pic_w = state.width as usize;
     let pic_h = state.height as usize;
     let avail = compute_luma_avail_inner(state, x0, y0, size as u32, constrained_intra_pred_flag);
+    // disableIntraBoundaryFilter (spec 8.4.4.2.6): the DC and horizontal /
+    // vertical edge filters are off for lossless CUs using implicit RDPCM.
+    let edge_filters = !(sps.range.implicit_rdpcm_enabled_flag && cu_transquant_bypass);
     let cip = constrained_intra_pred_flag
         .then(|| cip_masks(state, x0 as usize, y0 as usize, size, (0, 0)));
     let (mut top, mut left) = build_reference_samples(
@@ -4007,7 +4091,7 @@ fn predict_intra_luma<P: Pixel>(
     // modes at size > 4. The function handles the DC and size exclusions
     // internally. PLANAR (mode 0) IS filtered — this was a prior bug where
     // we only filtered modes 2..34.
-    if mode != 1 {
+    if mode != 1 && !sps.range.intra_smoothing_disabled_flag {
         filter_reference_samples(
             &mut top,
             &mut left,
@@ -4032,9 +4116,11 @@ fn predict_intra_luma<P: Pixel>(
             &top,
             &left,
             log2_size,
-            true,
+            edge_filters,
             state.bit_depth,
         ),
+        // The angular edge filters apply to component 0 only; passing a
+        // chroma index turns them off.
         2..=34 => predict_angular(
             dst,
             dst_stride,
@@ -4042,7 +4128,7 @@ fn predict_intra_luma<P: Pixel>(
             &left,
             log2_size,
             mode,
-            0,
+            if edge_filters { 0 } else { 1 },
             state.bit_depth,
         ),
         _ => {
@@ -4306,7 +4392,7 @@ fn predict_intra_chroma<P: Pixel>(
         // DC (mode 1) is not. `filter_reference_samples` no-ops for other chroma
         // formats and for the size-4 case. (Mirrors the luma path; using the
         // narrower `2..=34` here would skip PLANAR, a subtle reconstruction bug.)
-        if mode != 1 {
+        if mode != 1 && !sps.range.intra_smoothing_disabled_flag {
             filter_reference_samples(
                 &mut top,
                 &mut left,
@@ -4382,6 +4468,7 @@ fn apply_residual_to_luma<P: Pixel>(
     log2_size: u8,
     block: &ResidualBlock,
     is_intra: bool,
+    keep_for_ccp: bool,
 ) {
     let size = 1usize << log2_size;
     let mut residual_pixels = block.coeffs.clone();
@@ -4412,6 +4499,9 @@ fn apply_residual_to_luma<P: Pixel>(
         log2_size,
         state.bit_depth,
     );
+    if keep_for_ccp {
+        state.ccp_luma_residual = residual_pixels;
+    }
 }
 
 /// Pick `scan_idx` for residual_coding (spec 7.4.9.11). For intra TUs at

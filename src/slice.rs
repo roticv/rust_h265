@@ -83,6 +83,9 @@ pub struct PredWeightTable {
     pub luma_offset_l1: [i16; MAX_REFS],
     pub chroma_weight_l1: [[i16; 2]; MAX_REFS],
     pub chroma_offset_l1: [[i16; 2]; MAX_REFS],
+    /// high_precision_offsets_enabled_flag: offsets are at the sample bit
+    /// depth and are not scaled by `1 << (BitDepth - 8)` (spec 7.4.7.3).
+    pub high_precision_offsets: bool,
 }
 
 impl Default for PredWeightTable {
@@ -98,6 +101,7 @@ impl Default for PredWeightTable {
             luma_offset_l1: [0; MAX_REFS],
             chroma_weight_l1: [[0; 2]; MAX_REFS],
             chroma_offset_l1: [[0; 2]; MAX_REFS],
+            high_precision_offsets: false,
         }
     }
 }
@@ -524,6 +528,7 @@ pub fn parse_slice_segment_header(
                     num_ref_idx_l0_active_minus1 + 1,
                     num_ref_idx_l1_active_minus1 + 1,
                     sps.chroma_format_idc,
+                    sps,
                 )?;
             }
 
@@ -759,8 +764,19 @@ fn parse_pred_weight_table(
     nb_ref_l0: u32,
     nb_ref_l1: u32,
     chroma_format_idc: u32,
+    sps: &Sps,
 ) -> Result<PredWeightTable, DecodeError> {
-    let mut wt = PredWeightTable::default();
+    let mut wt = PredWeightTable {
+        high_precision_offsets: sps.range.high_precision_offsets_enabled_flag,
+        ..Default::default()
+    };
+    // WpOffsetHalfRangeC (spec 7.4.7.3): 1 << 7, or 1 << (BitDepthC - 1)
+    // with high-precision offsets.
+    let half_c: i64 = if wt.high_precision_offsets {
+        1 << (sps.bit_depth_chroma - 1)
+    } else {
+        128
+    };
 
     let luma_log2_weight_denom = r.read_ue()?;
     if luma_log2_weight_denom > 7 {
@@ -810,8 +826,9 @@ fn parse_pred_weight_table(
                 // Spec equation 7-59: effective offset includes the shift-back.
                 // Use i64 to avoid overflow from malformed read_se() values.
                 let w64 = wt.chroma_weight_l0[i][j] as i64;
-                let off = (delta_o as i64 - ((128i64 * w64) >> wt.chroma_log2_weight_denom) + 128)
-                    .clamp(-128, 127);
+                let off = (delta_o as i64 - ((half_c * w64) >> wt.chroma_log2_weight_denom)
+                    + half_c)
+                    .clamp(-half_c, half_c - 1);
                 wt.chroma_offset_l0[i][j] = off as i16;
             }
         } else {
@@ -848,9 +865,9 @@ fn parse_pred_weight_table(
                     wt.chroma_weight_l1[i][j] = chroma_denom.saturating_add(delta_w);
                     // Use i64 to avoid overflow from malformed read_se() values.
                     let w64 = wt.chroma_weight_l1[i][j] as i64;
-                    let off = (delta_o as i64 - ((128i64 * w64) >> wt.chroma_log2_weight_denom)
-                        + 128)
-                        .clamp(-128, 127);
+                    let off = (delta_o as i64 - ((half_c * w64) >> wt.chroma_log2_weight_denom)
+                        + half_c)
+                        .clamp(-half_c, half_c - 1);
                     wt.chroma_offset_l1[i][j] = off as i16;
                 }
             } else {
@@ -932,6 +949,11 @@ mod tests {
             chroma_qp_offset_list_len_minus1: 0,
             cb_qp_offset_list: [0i32; 6],
             cr_qp_offset_list: [0i32; 6],
+            diff_cu_chroma_qp_offset_depth: 0,
+            log2_max_transform_skip_block_size: 2,
+            cross_component_prediction_enabled_flag: false,
+            log2_sao_offset_scale_luma: 0,
+            log2_sao_offset_scale_chroma: 0,
         }
     }
 
@@ -987,6 +1009,7 @@ mod tests {
             sps_max_dec_pic_buffering_minus1: 0,
             sps_max_num_reorder_pics: 0,
             sps_max_latency_increase_plus1: 0,
+            range: Default::default(),
         }
     }
 

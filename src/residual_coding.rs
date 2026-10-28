@@ -448,17 +448,49 @@ pub fn decode_residual_coding(
     qp: i32,
     scan_idx: ScanOrder,
     is_intra: bool,
+    intra_mode: u8,
     cu_transquant_bypass: bool,
 ) -> Result<ResidualBlock, DecodeError> {
-    // Decode transform_skip_flag (HEVC spec 7.3.8.11 / 9.3.4.2.5).
-    // In Main Profile, transform_skip is only allowed for 4×4 TUs
-    // (log2_max_transform_skip_block_size defaults to 2 without range extensions).
-    // When cu_transquant_bypass is set, transform_skip_flag is not decoded (spec 7.3.8.11).
-    let transform_skip =
-        !cu_transquant_bypass && pps.transform_skip_enabled_flag && log2_trafo_size <= 2 && {
+    let rext = &sps.range;
+    // Decode transform_skip_flag (HEVC spec 7.3.8.11 / 9.3.4.2.5), allowed
+    // up to Log2MaxTransformSkipSize (4x4 unless the PPS range extension
+    // raises it). Not coded for transquant-bypass CUs.
+    let transform_skip = !cu_transquant_bypass
+        && pps.transform_skip_enabled_flag
+        && log2_trafo_size <= pps.log2_max_transform_skip_block_size
+        && {
             let inc = if plane == ResidualPlane::Luma { 0 } else { 1 };
             cabac.decode_bin(&mut contexts.state[ctx::TRANSFORM_SKIP_FLAG + inc]) != 0
         };
+    let ts_or_bypass = transform_skip || cu_transquant_bypass;
+
+    // Range extensions: residual DPCM for blocks without a transform.
+    // Explicit (inter): signalled flag and direction (spec 7.3.8.11).
+    // Implicit (intra): horizontal for intra mode 10, vertical for 26.
+    let chroma_inc = usize::from(plane != ResidualPlane::Luma);
+    let mut rdpcm_vertical = false;
+    let explicit_rdpcm = !is_intra
+        && rext.explicit_rdpcm_enabled_flag
+        && ts_or_bypass
+        && cabac.decode_bin(&mut contexts.state[ctx::EXPLICIT_RDPCM_FLAG + chroma_inc]) != 0;
+    if explicit_rdpcm {
+        rdpcm_vertical =
+            cabac.decode_bin(&mut contexts.state[ctx::EXPLICIT_RDPCM_DIR_FLAG + chroma_inc]) != 0;
+    }
+    let implicit_rdpcm = is_intra
+        && rext.implicit_rdpcm_enabled_flag
+        && ts_or_bypass
+        && (intra_mode == 10 || intra_mode == 26);
+    if implicit_rdpcm {
+        rdpcm_vertical = intra_mode == 26;
+    }
+    let rdpcm = explicit_rdpcm || implicit_rdpcm;
+    // transform_skip_context_enabled_flag: one sig_coeff_flag context per
+    // component for blocks without a transform (spec 9.3.4.2.5).
+    let single_sig_ctx = rext.transform_skip_context_enabled_flag && ts_or_bypass;
+    // persistent_rice_adaptation_enabled_flag: sbType selects a StatCoeff.
+    let persistent_rice = rext.persistent_rice_adaptation_enabled_flag;
+    let sb_type = 2 * usize::from(plane == ResidualPlane::Luma) + usize::from(ts_or_bypass);
 
     // Horizontal and vertical scan orders are used for angular intra modes
     // 6..14 (vert) and 22..30 (horiz) at log2_trafo_size <= 3.
@@ -558,9 +590,13 @@ pub fn decode_residual_coding(
     let qp_bd_offset = 6 * (bd as i32 - 8);
     let (shift, add, scale) = compute_dequant_scale(qp + qp_bd_offset, log2_trafo_size, bd);
 
-    // Resolve the active scaling matrix and DC scale value.
-    let (scale_matrix, dc_scale) =
-        resolve_scaling_matrix(sps, pps, log2_trafo_size, c_idx, is_intra);
+    // Resolve the active scaling matrix and DC scale value. Transform-skip
+    // blocks larger than 4x4 use the flat factor 16 (spec 8.6.4.2).
+    let (scale_matrix, dc_scale) = if transform_skip && log2_trafo_size > 2 {
+        (None, 16)
+    } else {
+        resolve_scaling_matrix(sps, pps, log2_trafo_size, c_idx, is_intra)
+    };
 
     // 8×8 grid of CG flags. The largest TU is 32×32 → 8×8 sub-blocks.
     let mut significant_coeff_group_flag = [[false; 8]; 8];
@@ -630,7 +666,11 @@ pub fn decode_residual_coding(
             if c_idx != 0 {
                 scf_offset = 27;
             }
-            if log2_trafo_size == 2 {
+            if single_sig_ctx {
+                // Every position maps to 2: contexts 42 (luma) / 43 (chroma).
+                ctx_idx_map_p = (&SIG_CTX_IDX_MAP[64..80]).try_into().unwrap();
+                scf_offset = if c_idx == 0 { 40 } else { 41 };
+            } else if log2_trafo_size == 2 {
                 ctx_idx_map_p = (&SIG_CTX_IDX_MAP[0..16]).try_into().unwrap();
             } else {
                 let map_idx = ((prev_sig + 1) << 4) as usize;
@@ -670,7 +710,9 @@ pub fn decode_residual_coding(
             // Position 0 (DC of the sub-block).
             if !implicit_non_zero_coeff {
                 // Re-derive scf_offset for position 0.
-                let scf_offset_0 = if i == 0 {
+                let scf_offset_0 = if single_sig_ctx {
+                    if c_idx == 0 { 42 } else { 43 }
+                } else if i == 0 {
                     if c_idx == 0 { 0 } else { 27 }
                 } else {
                     2 + scf_offset
@@ -741,6 +783,7 @@ pub fn decode_residual_coding(
         // See FFmpeg cabac.c:1348-1355 for the full gate.
         let sign_hidden = pps.sign_data_hiding_enabled_flag
             && !cu_transquant_bypass
+            && !rdpcm
             && (last_nz_pos_in_cg - first_nz_pos_in_cg >= 4);
 
         // Sign flags (bypass). When SDH is active on this sub-block, the
@@ -762,8 +805,35 @@ pub fn decode_residual_coding(
         let coeff_sign_flag = decode_coeff_sign_flag(cabac, sign_nb);
         let mut sign_bits: u32 = (coeff_sign_flag << (16 - sign_nb)) & 0xffff;
 
-        // Levels in reverse scan order, dequantize, and store.
-        let mut c_rice_param = 0u32;
+        // Levels in reverse scan order, dequantize, and store. With
+        // persistent Rice adaptation the Rice parameter starts from
+        // StatCoeff, which the first coeff_abs_level_remaining of the
+        // sub-block updates, and is not capped at 4 (spec 9.3.3.11).
+        let mut c_rice_param = if persistent_rice {
+            u32::from(contexts.stat_coeff[sb_type]) / 4
+        } else {
+            0
+        };
+        let mut rice_updated = false;
+        let mut update_rice = |c_rice_param: &mut u32, level: i64, remaining: i64| {
+            if level > (3i64 << *c_rice_param) {
+                *c_rice_param = if persistent_rice {
+                    *c_rice_param + 1
+                } else {
+                    (*c_rice_param + 1).min(4)
+                };
+            }
+            if persistent_rice && !rice_updated {
+                let stat = &mut contexts.stat_coeff[sb_type];
+                let init = u32::from(*stat) / 4;
+                if remaining >= (3i64 << init) {
+                    *stat = stat.saturating_add(1);
+                } else if 2 * remaining < (1i64 << init) && *stat > 0 {
+                    *stat -= 1;
+                }
+                rice_updated = true;
+            }
+        };
         let mut sum_abs: i64 = 0;
         for m in 0..n_end as usize {
             let n = significant_coeff_flag_idx[m] as usize;
@@ -777,16 +847,12 @@ pub fn decode_residual_coding(
                 if trans_coeff_level == needed_for_remaining {
                     let last = decode_coeff_abs_level_remaining(cabac, c_rice_param) as i64;
                     trans_coeff_level += last;
-                    if trans_coeff_level > (3 << c_rice_param) as i64 {
-                        c_rice_param = (c_rice_param + 1).min(4);
-                    }
+                    update_rice(&mut c_rice_param, trans_coeff_level, last);
                 }
             } else {
                 let last = decode_coeff_abs_level_remaining(cabac, c_rice_param) as i64;
                 trans_coeff_level = 1 + last;
-                if trans_coeff_level > (3 << c_rice_param) as i64 {
-                    c_rice_param = (c_rice_param + 1).min(4);
-                }
+                update_rice(&mut c_rice_param, trans_coeff_level, last);
             }
 
             // Sign data hiding: accumulate the absolute level, and at the
@@ -841,17 +907,41 @@ pub fn decode_residual_coding(
     // This is separate from the standard per-coefficient dequant already applied
     // above. Without this, the coefficients are ~32× too large for 8-bit 4×4
     // (shift=5), causing massive clipping artifacts.
-    if transform_skip && !cu_transquant_bypass {
-        let bd = if plane == ResidualPlane::Luma {
-            sps.bit_depth_luma
-        } else {
-            sps.bit_depth_chroma
-        } as i32;
-        let ts_shift = 15 - bd - log2_trafo_size as i32;
+    // transform_skip_rotation_enabled_flag: 4x4 intra blocks without a
+    // transform are rotated by 180 degrees (spec 8.6.2; HM applies it to
+    // transquant-bypass blocks as well as transform-skip ones).
+    if rext.transform_skip_rotation_enabled_flag && log2_trafo_size == 2 && is_intra && ts_or_bypass
+    {
+        coeffs.reverse();
+    }
+    if transform_skip {
+        // tsShift = 5 + Log2(nTbS) then bdShift = 20 - BitDepth (spec
+        // 8.6.4.2), folded into one shift; it is negative for large blocks
+        // at high bit depths.
+        let ts_shift = 15 - bd as i32 - log2_trafo_size as i32;
         if ts_shift > 0 {
             let ts_offset = 1i32 << (ts_shift - 1);
             for c in coeffs.iter_mut() {
                 *c = ((*c as i32 + ts_offset) >> ts_shift) as i16;
+            }
+        } else if ts_shift < 0 {
+            for c in coeffs.iter_mut() {
+                *c = ((*c as i32) << -ts_shift) as i16;
+            }
+        }
+    }
+    if rdpcm {
+        // Directional residual modification (spec 8.6.8): accumulate along
+        // the RDPCM direction.
+        if rdpcm_vertical {
+            for i in trafo_size..coeffs.len() {
+                coeffs[i] = coeffs[i].wrapping_add(coeffs[i - trafo_size]);
+            }
+        } else {
+            for row in coeffs.chunks_exact_mut(trafo_size) {
+                for x in 1..trafo_size {
+                    row[x] = row[x].wrapping_add(row[x - 1]);
+                }
             }
         }
     }
@@ -894,7 +984,13 @@ fn resolve_scaling_matrix(
 
     let intra_base = if is_intra { 0 } else { 3 };
     let matrix_id = intra_base + c_idx;
-    let size_id = (log2_trafo_size - 2) as usize;
+    // 32x32 chroma blocks exist only in 4:4:4; they use the 16x16 chroma
+    // lists and DC values (spec 7.4.5, ChromaArrayType == 3).
+    let size_id = if log2_trafo_size == 5 && c_idx != 0 {
+        2
+    } else {
+        (log2_trafo_size - 2) as usize
+    };
 
     let matrix = sl.sl[size_id][matrix_id];
     let dc_scale = if log2_trafo_size >= 4 {

@@ -958,7 +958,11 @@ pub fn motion_compensation_pu<P: Pixel>(
         let wt = pred_weight_table;
         let plane_weights = |c: usize| -> (i32, i32, i32, i32, i32) {
             let bd = if c == 0 { bit_depth } else { bit_depth_c };
-            let ofs = 1i32 << (bd as i32 - 8);
+            let ofs = if wt.high_precision_offsets {
+                1
+            } else {
+                1i32 << (bd as i32 - 8)
+            };
             let mc_sh = crate::pixel::mc_shift(bd) as i32;
             if c == 0 {
                 (
@@ -1126,8 +1130,16 @@ pub fn motion_compensation_pu<P: Pixel>(
             let wt = pred_weight_table;
             // Offsets are coded at 8-bit precision and scaled by
             // 1 << (BitDepth - 8) (spec 7.4.7.3, high_precision_offsets off).
-            let ofs = 1i32 << (bit_depth as i32 - 8);
-            let ofs_c = 1i32 << (bit_depth_c as i32 - 8);
+            // Offsets are coded at 8-bit precision and scaled up, unless
+            // high_precision_offsets_enabled_flag codes them at full depth.
+            let scale = |bd: u8| {
+                if wt.high_precision_offsets {
+                    1
+                } else {
+                    1i32 << (bd as i32 - 8)
+                }
+            };
+            let (ofs, ofs_c) = (scale(bit_depth), scale(bit_depth_c));
             let (luma_w, luma_o, chroma_w, chroma_o, luma_denom, chroma_denom) = if use_l0 {
                 (
                     wt.luma_weight_l0[ref_idx] as i32,

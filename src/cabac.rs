@@ -311,8 +311,13 @@ pub fn init_type_for_slice(slice_type: SliceType, cabac_init_flag: bool) -> usiz
 /// Full set of HEVC CABAC contexts for one slice. Layout matches FFmpeg's
 /// `cabac_state[HEVC_CONTEXTS]` exactly so the offsets in
 /// [`crate::cabac_tables::ctx`] index directly into [`Self::state`].
+#[derive(Clone, Copy)]
 pub struct CabacContexts {
     pub state: [u8; HEVC_CONTEXTS],
+    /// StatCoeff[sbType] for persistent Rice adaptation (spec 9.3.3.11).
+    /// Reset with the contexts and synchronised with them (WPP, dependent
+    /// slice segments).
+    pub stat_coeff: [u8; 4],
 }
 
 impl CabacContexts {
@@ -325,7 +330,10 @@ impl CabacContexts {
         for i in 0..HEVC_CONTEXTS {
             state[i] = init_state(row[i], slice_qp);
         }
-        Self { state }
+        Self {
+            state,
+            stat_coeff: [0; 4],
+        }
     }
 }
 

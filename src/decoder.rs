@@ -117,13 +117,13 @@ struct PictureInProgress {
     /// from this snapshot instead of re-initializing from the slice QP
     /// when the slice does NOT start on a WPP row boundary. `None`
     /// before any slice has finished.
-    saved_cabac_state: Option<[u8; crate::cabac_tables::HEVC_CONTEXTS]>,
+    saved_cabac_state: Option<CabacContexts>,
     /// Phase 3c-4: WPP context state snapshot (state after the 2nd CTB
     /// of a row). For WPP + dependent slice segments (one slice per row
     /// layout), the dependent slice at the start of a new row loads this
     /// state instead of `saved_cabac_state`. Mirrors FFmpeg's
     /// `common_cabac_state->state` save/load used by `load_states`.
-    saved_wpp_cabac_state: Option<[u8; crate::cabac_tables::HEVC_CONTEXTS]>,
+    saved_wpp_cabac_state: Option<CabacContexts>,
     /// Number of CTBs already decoded in this picture (sum across all
     /// slice segments seen so far).
     ctbs_decoded: u32,
@@ -1011,34 +1011,57 @@ impl Decoder {
         let slice_starts_tile = tiles_for_init
             && (slice_start_ts == 0
                 || tile_of_ts(slice_start_ts) != tile_of_ts(slice_start_ts - 1));
+        // First CTB column of the tile holding each picture column (0
+        // everywhere without tiles). With WPP, a CTB row of a tile is a
+        // substream and synchronises from the row above (spec 9.3.1).
+        let tile_col_start: Vec<u32> = {
+            let w = pic_width_in_ctbs_for_init as usize;
+            let mut starts = vec![0u32; w];
+            for c in 1..w {
+                starts[c] = if tile_tables.tile_id[c] != tile_tables.tile_id[c - 1] {
+                    c as u32
+                } else {
+                    starts[c - 1]
+                };
+            }
+            starts
+        };
         let mut contexts = if sh.dependent_slice_segment_flag && slice_starts_tile {
             // The first CTB of a tile always starts from initialised contexts
             // (spec 9.3.1), even in a dependent slice segment.
             CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag)
         } else if sh.dependent_slice_segment_flag {
             let pic = self.current_picture.as_ref().expect("checked above");
-            // Does the dependent slice's first CTB sit on a WPP row
-            // boundary? `slice_segment_address` is a raster address, so
-            // `% pic_width_in_ctbs` gives the column. WPP with tiles is
-            // only special-cased for the single-tile path.
-            let on_row_start = !tiles_for_init
-                && sh
-                    .slice_segment_address
-                    .is_multiple_of(pic_width_in_ctbs_for_init);
-            if wpp_for_init && on_row_start && !tiles_for_init {
-                if pic_width_in_ctbs_for_init == 1 {
-                    CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag)
-                } else {
-                    let saved = pic.saved_wpp_cabac_state.ok_or(DecodeError::InvalidSyntax(
+            // Does the dependent slice's first CTB start a CTB row of its
+            // tile? Then WPP synchronises from the row above when the CTB
+            // above-right is available (same tile and slice), and
+            // initialises otherwise (spec 9.3.1).
+            let w = pic_width_in_ctbs_for_init;
+            let addr = sh.slice_segment_address;
+            let col = addr % w;
+            let on_row_start = col == tile_col_start[col as usize];
+            if wpp_for_init && on_row_start {
+                let parent_addr = pic.last_independent_slice_header.slice_segment_address as i32;
+                let tr_available = addr >= w && col + 1 < w && {
+                    let tr = (addr - w + 1) as usize;
+                    let tr_slice = match &pic.state {
+                        PictureStateEnum::U8(st) => st.tab_slice_addr_rs[tr],
+                        PictureStateEnum::U16(st) => st.tab_slice_addr_rs[tr],
+                    };
+                    tile_tables.tile_id[tr] == tile_tables.tile_id[addr as usize]
+                        && tr_slice == parent_addr
+                };
+                if tr_available {
+                    pic.saved_wpp_cabac_state.ok_or(DecodeError::InvalidSyntax(
                         "dependent WPP slice at row start without a saved WPP context state",
-                    ))?;
-                    CabacContexts { state: saved }
+                    ))?
+                } else {
+                    CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag)
                 }
             } else {
-                let saved = pic.saved_cabac_state.ok_or(DecodeError::InvalidSyntax(
+                pic.saved_cabac_state.ok_or(DecodeError::InvalidSyntax(
                     "dependent slice segment without a saved CABAC state",
-                ))?;
-                CabacContexts { state: saved }
+                ))?
             }
         } else {
             CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag)
@@ -1218,10 +1241,12 @@ impl Decoder {
             if !sh.dependent_slice_segment_flag {
                 state.last_qp_y = sh.slice_qp_y;
             }
+            // CuQpOffsetCb / Cr start at 0 in every slice segment.
+            state.cu_qp_offset_cb = 0;
+            state.cu_qp_offset_cr = 0;
         });
 
         let wpp = pps.entropy_coding_sync_enabled_flag;
-        let tiles_on = pps.tiles_enabled_flag;
 
         // Phase 3c-3 (WPP): saved CABAC context state captured after the
         // second CTB of each row, to be loaded at the start of the next row.
@@ -1230,12 +1255,11 @@ impl Decoder {
         // from the picture-level `saved_wpp_cabac_state` so that the
         // first inner-row reinit inside the dependent slice can still find
         // a state from the previous slice's row.
-        let mut saved_state: Option<[u8; crate::cabac_tables::HEVC_CONTEXTS]> =
-            if sh.dependent_slice_segment_flag {
-                pic.saved_wpp_cabac_state
-            } else {
-                None
-            };
+        let mut saved_state: Option<CabacContexts> = if sh.dependent_slice_segment_flag {
+            pic.saved_wpp_cabac_state
+        } else {
+            None
+        };
 
         // Phase 3d-3/3d-5: construct SliceParams for the CU tree.
         // Include POC information so the AMVP candidate list builder can
@@ -1298,14 +1322,7 @@ impl Decoder {
         // The CTB loop, deblock, SAO, and DPB insertion all operate on a
         // generic PictureState<P>. Dispatch once via the enum variant and
         // execute the entire inner body monomorphized for the right P.
-        type CtbLoopResult = Result<
-            (
-                u32,
-                Option<[u8; crate::cabac_tables::HEVC_CONTEXTS]>,
-                [u8; crate::cabac_tables::HEVC_CONTEXTS],
-            ),
-            DecodeError,
-        >;
+        type CtbLoopResult = Result<(u32, Option<CabacContexts>, CabacContexts), DecodeError>;
         let ctb_loop_result: CtbLoopResult = with_picture_state!(&mut pic.state, |state| {
             let mut more_data = true;
             let mut ctb_addr_ts: u32 = slice_start_ts;
@@ -1325,8 +1342,9 @@ impl Decoder {
                         != tile_tables.tile_id[prev_rs as usize]
                 };
 
-                let is_row_start = col == 0;
-                let needs_wpp_reinit = wpp && !tiles_on && is_row_start && !is_first_ctb_of_slice;
+                // First CTB of a CTB row within its tile.
+                let is_row_start = col == tile_col_start[col as usize];
+                let needs_wpp_reinit = wpp && is_row_start && !is_first_ctb_of_slice;
 
                 if is_tile_start || needs_wpp_reinit {
                     substream_idx += 1;
@@ -1346,15 +1364,23 @@ impl Decoder {
                     let byte_offset = cabac_byte_offset + rbsp_offset_from_start as usize;
                     cabac.reinit_at(byte_offset)?;
 
-                    if is_tile_start || pic_width_in_ctbs == 1 {
+                    // WPP synchronisation (spec 9.3.1): from the state saved
+                    // after the second CTB of the row above when the CTB
+                    // above-right is available (same tile and slice);
+                    // otherwise, and at every tile start, initialise.
+                    let tr_available =
+                        wpp && ctb_addr_rs >= pic_width_in_ctbs && col + 1 < pic_width_in_ctbs && {
+                            let tr = (ctb_addr_rs - pic_width_in_ctbs + 1) as usize;
+                            tile_tables.tile_id[tr] == tile_tables.tile_id[ctb_addr_rs as usize]
+                                && state.tab_slice_addr_rs[tr] == recorded_slice_addr
+                        };
+                    if tr_available {
+                        contexts = *saved_state.as_ref().ok_or(DecodeError::InvalidSyntax(
+                            "WPP row start without a saved context state",
+                        ))?;
+                    } else {
                         contexts =
                             CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag);
-                    } else if let Some(saved) = saved_state.as_ref() {
-                        contexts.state.copy_from_slice(saved);
-                    } else {
-                        return Err(DecodeError::InvalidSyntax(
-                            "WPP row start without a saved context state",
-                        ));
                     }
                     state.first_qp_group = true;
                 }
@@ -1371,7 +1397,16 @@ impl Decoder {
                 );
                 state.filter_slice_edges[ctb_addr_rs as usize] =
                     sh.slice_loop_filter_across_slices_enabled_flag;
-                crate::sao::decode_sao_param(&mut cabac, &mut contexts, state, sps, &sh, rx, ry);
+                crate::sao::decode_sao_param(
+                    &mut cabac,
+                    &mut contexts,
+                    state,
+                    sps,
+                    pps,
+                    &sh,
+                    rx,
+                    ry,
+                );
                 more_data = decode_coding_quadtree(
                     &mut cabac,
                     &mut contexts,
@@ -1387,14 +1422,10 @@ impl Decoder {
                 )?;
                 ctb_addr_ts += 1;
 
-                if wpp && !tiles_on {
-                    let col_after = ctb_addr_ts % pic_width_in_ctbs;
-                    let should_save = col_after == 2
-                        || (pic_width_in_ctbs == 2 && col_after == 0)
-                        || pic_width_in_ctbs == 1;
-                    if should_save {
-                        saved_state = Some(contexts.state);
-                    }
+                // Storage for WPP (spec 9.3.2.4): after the second CTB of a
+                // CTB row within its tile.
+                if wpp && col == tile_col_start[col as usize] + 1 {
+                    saved_state = Some(contexts);
                 }
             }
 
@@ -1404,7 +1435,7 @@ impl Decoder {
                 ));
             }
 
-            Ok((ctb_addr_ts, saved_state, contexts.state))
+            Ok((ctb_addr_ts, saved_state, contexts))
         });
 
         let (final_ctb_addr_ts, final_saved_state, final_contexts_state) = ctb_loop_result?;
@@ -4584,53 +4615,92 @@ mod tests {
         (frames, errors)
     }
 
-    /// Range-extension coding tools the decoder does not implement are
-    /// rejected with `Unsupported`, at the parameter set and at every slice
-    /// that uses it, instead of being decoded as if they were off.
+    /// Range-extension coding tools: implicit RDPCM (an SPS range-extension
+    /// flag) and cross-component prediction (a PPS range-extension flag),
+    /// byte-exact against FFmpeg.
     ///
     /// Fixtures: HM `TAppEncoder`, 64x64 4:4:4 8-bit, one intra frame,
     /// `Profile main_444`, `TransformSkip 1`, CTU 32, QP 30, plus
-    /// `ImplicitResidualDPCM 1` (an SPS range-extension flag) or
-    /// `CrossComponentPrediction 1` (a PPS range-extension flag).
+    /// `ImplicitResidualDPCM 1` or `CrossComponentPrediction 1`.
     #[test]
-    fn test_unimplemented_range_extension_tools_rejected() {
-        for (name, tool) in [
+    fn test_decode_rext_rdpcm_and_ccp_hash() {
+        for (name, expected) in [
             (
                 "rext_implicit_rdpcm_hm_444_64x64.h265",
-                "implicit_rdpcm_enabled_flag",
+                "87df856a2ada4648a62572fac3f5b22159f5c74aa4483ceb6001ad1c4e4959a5",
             ),
             (
                 "rext_ccp_hm_444_64x64.h265",
-                "cross_component_prediction_enabled_flag",
+                "75233ed530402a8e3d7779d8237fb43750eab6358b06647b3ea325cfc5a4d1e0",
             ),
         ] {
-            let (frames, errors) = decode_collect_errors(&read_fixture(name));
-            assert_eq!(frames, 0, "{name}: decoded with {tool} ignored");
-            // The parameter set and the slice both report it.
-            assert!(errors.len() >= 2, "{name}: errors {errors:?}");
-            assert!(
-                errors.iter().all(|e| *e == DecodeError::Unsupported(tool)),
-                "{name}: errors {errors:?}"
-            );
+            assert_eq!(decode_and_hash(name, 1), expected, "{name} hash mismatch");
+        }
+    }
+
+    /// Range-extension tools in inter streams, against the HM encoder's
+    /// reconstruction (SHA-256 of its recon YUV). Each fixture is HM
+    /// `TAppEncoder`, 96x64, I + 4 P (GOPSize 1), CTU 32, TransformSkip 1,
+    /// TransformSkipFast 0, QP 27, `Profile main_444` (`main_444_12` for the
+    /// 12-bit one), plus:
+    ///
+    /// - lossless_rot_rdpcm: TransquantBypassEnable, CUTransquantBypassFlagForce,
+    ///   ResidualRotation, ImplicitResidualDPCM, ExplicitResidualDPCM. FFmpeg
+    ///   decodes this differently: it applies neither rotation nor (for
+    ///   inter CUs) explicit RDPCM to lossless blocks the way HM does.
+    /// - rice_wpp: GolombRiceParameterAdaptation, WaveFrontSynchro (StatCoeff
+    ///   synchronised across CTB rows).
+    /// - ts32_12bit: 12-bit, TransformSkipLog2MaxSize 5, QP 17 (negative
+    ///   transform-skip shift).
+    /// - hp_wp: HighPrecisionPredictionWeighting, WeightedPredP, fade-in input.
+    /// - chroma_qp_adj: MaxCUChromaQpAdjustmentDepth 1 (chroma QP offset lists).
+    #[test]
+    fn test_decode_rext_tools_match_hm() {
+        for (name, expected) in [
+            (
+                "rext_lossless_rot_rdpcm_hm_444_96x64.h265",
+                "0edb56876a266b124bff4c7491768db10246444a839eb62ae40ebc5cc4674df7",
+            ),
+            (
+                "rext_rice_wpp_hm_444_96x64.h265",
+                "93269487838c988d25bc472347b34527d219690215035ccfd49404e83db5d1d9",
+            ),
+            (
+                "rext_ts32_12bit_hm_444_12bit_96x64.h265",
+                "fe33ab56c97e76f2e4d9da5fa4dace3f08ba1735f74e4f27b712d0bb334aa892",
+            ),
+            (
+                "rext_hp_wp_hm_444_96x64.h265",
+                "8cd1a02bd582e6bdbc9bb04c5dbc49268c8a5f7110cd1958beb1cf7d7bc48929",
+            ),
+            (
+                "rext_chroma_qp_adj_hm_444_96x64.h265",
+                "3d7cf6860d67488fb42bc6cf5cb713e0920f1699685ff57e1c759c066ee8668a",
+            ),
+        ] {
+            assert_eq!(decode_and_hash(name, 5), expected, "{name} hash mismatch");
         }
     }
 
     /// A rejected SPS replaces an earlier SPS with the same ID: the slices
-    /// that follow it fail instead of decoding with the stale SPS.
+    /// that follow it fail instead of decoding with the stale SPS. The
+    /// rejected stream is 4:2:2 (x265 `--input-csp i422`, 64x64, 1 frame),
+    /// which the decoder does not support; it is reported at the SPS and at
+    /// its slice, and no frame comes out of it.
     #[test]
     fn test_rejected_sps_replaces_same_id() {
         let good = read_fixture("intra444_96x96.h265");
         let (good_frames, good_errors) = decode_collect_errors(&good);
         assert!(good_errors.is_empty());
         let mut data = good.clone();
-        data.extend_from_slice(&read_fixture("rext_implicit_rdpcm_hm_444_64x64.h265"));
+        data.extend_from_slice(&read_fixture("unsupported_422_x265_64x64.h265"));
         let (frames, errors) = decode_collect_errors(&data);
         assert_eq!(frames, good_frames);
-        assert!(!errors.is_empty());
+        assert!(errors.len() >= 2, "errors {errors:?}");
         assert!(
             errors
                 .iter()
-                .all(|e| *e == DecodeError::Unsupported("implicit_rdpcm_enabled_flag")),
+                .all(|e| matches!(e, DecodeError::Unsupported(_))),
             "errors {errors:?}"
         );
     }
