@@ -314,27 +314,43 @@ fn sao_edge_filter<P: Pixel>(
     };
     let a_off = a_dy * stride_src as isize + a_dx;
     let b_off = b_dy * stride_src as isize + b_dx;
-
-    let mut filter = |x: usize, y: usize| {
-        let si = (y0 + y) * stride_src + x0 + x;
-        let cur = src[si].to_i32();
-        let a = src[(si as isize + a_off) as usize].to_i32();
-        let b = src[(si as isize + b_off) as usize].to_i32();
-        let cat = EDGE_IDX[(2 + cmp(cur, a) + cmp(cur, b)) as usize];
-        dst[(y0 + y) * stride_dst + x0 + x] =
-            P::from_i32_clamped(cur + offset_val[cat] as i32, bit_depth);
-    };
+    // Offset by the sum of the two neighbour comparisons (-2..=2).
+    let off_by_sum: [i32; 5] = std::array::from_fn(|k| offset_val[EDGE_IDX[k]] as i32);
+    let edge = |c: i32, a: i32, b: i32| c + off_by_sum[(2 + cmp(c, a) + cmp(c, b)) as usize];
 
     for y in 0..height {
-        let border_row = y == 0 || y + 1 == height;
-        for x in 0..width {
-            if border_row || x == 0 || x + 1 == width {
-                let (xi, yi) = (x as isize, y as isize);
-                if !neighbour_ok(xi, yi, a_dx, a_dy) || !neighbour_ok(xi, yi, b_dx, b_dy) {
-                    continue;
-                }
+        let yi = y as isize;
+        // Interior samples (x in 1..width-1) have both neighbours in this
+        // CTB column, so only the CTB rows above / below matter: one check
+        // for the whole run, then a tight loop over row slices.
+        if width > 2
+            && avail[region(yi + a_dy, h)][1]
+            && avail[region(yi + b_dy, h)][1]
+        {
+            let n = width - 2;
+            let row = (y0 + y) * stride_src + x0 + 1;
+            let cur = &src[row..row + n];
+            let a = &src[(row as isize + a_off) as usize..][..n];
+            let b = &src[(row as isize + b_off) as usize..][..n];
+            let drow = (y0 + y) * stride_dst + x0 + 1;
+            let out = &mut dst[drow..drow + n];
+            for (((o, &c), &a), &b) in out.iter_mut().zip(cur).zip(a).zip(b) {
+                *o = P::from_i32_clamped(edge(c.to_i32(), a.to_i32(), b.to_i32()), bit_depth);
             }
-            filter(x, y);
+        }
+        // The first and last sample of the row may reach into the CTB to
+        // the left / right or diagonally: check per sample.
+        let edges: &[usize] = if width == 1 { &[0] } else { &[0, width - 1] };
+        for &x in edges {
+            let xi = x as isize;
+            if neighbour_ok(xi, yi, a_dx, a_dy) && neighbour_ok(xi, yi, b_dx, b_dy) {
+                let si = (y0 + y) * stride_src + x0 + x;
+                let cur = src[si].to_i32();
+                let a = src[(si as isize + a_off) as usize].to_i32();
+                let b = src[(si as isize + b_off) as usize].to_i32();
+                dst[(y0 + y) * stride_dst + x0 + x] =
+                    P::from_i32_clamped(edge(cur, a, b), bit_depth);
+            }
         }
     }
 }
