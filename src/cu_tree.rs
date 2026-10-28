@@ -282,7 +282,7 @@ pub struct PictureState<P: Pixel> {
     pub min_tb_width: usize,
     /// Motion compensation scratch buffers, reused by every inter block of
     /// this picture (see `inter_pred::McScratch`).
-    pub mc_scratch: crate::inter_pred::McScratch,
+    pub mc_scratch: crate::inter_pred::McScratch<P>,
 }
 
 impl<P: Pixel> PictureState<P> {

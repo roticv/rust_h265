@@ -74,8 +74,7 @@ pub(crate) const MC_TMP_LEN: usize = QPEL_TMP_ROWS * MAX_PB_SIZE;
 /// blocks: a bi-predicted block cleared six 16 KB stack arrays plus a filter
 /// temporary on every call. Every region is fully written before it is
 /// read, so stale contents left by earlier blocks are never observed.
-#[derive(Default)]
-pub struct McScratch {
+pub struct McScratch<P: Pixel> {
     /// L0 luma intermediate (bi-pred), or the weighted uni-pred luma.
     luma0: Vec<i32>,
     /// L1 luma intermediate (bi-pred).
@@ -88,9 +87,27 @@ pub struct McScratch {
     cr1: Vec<i32>,
     /// Separable 2-D filter intermediate, shared by luma and chroma.
     tmp: Vec<i32>,
+    /// Padded copy of the reference window for blocks near the picture
+    /// edge (see `ref_window`).
+    edge: Vec<P>,
 }
 
-impl McScratch {
+impl<P: Pixel> Default for McScratch<P> {
+    fn default() -> Self {
+        Self {
+            luma0: Vec::new(),
+            luma1: Vec::new(),
+            cb0: Vec::new(),
+            cr0: Vec::new(),
+            cb1: Vec::new(),
+            cr1: Vec::new(),
+            tmp: Vec::new(),
+            edge: Vec::new(),
+        }
+    }
+}
+
+impl<P: Pixel> McScratch<P> {
     /// Allocate buffers sized for the largest prediction block (64×64, and
     /// 64×64 chroma for 4:4:4). `Default` gives empty buffers instead, which
     /// is only used as the placeholder while the scratch is lent out.
@@ -103,6 +120,7 @@ impl McScratch {
             cb1: vec![0; MAX_PB_CHROMA],
             cr1: vec![0; MAX_PB_CHROMA],
             tmp: vec![0; MC_TMP_LEN],
+            edge: vec![P::zero(); MC_EDGE_LEN],
         }
     }
 }
@@ -134,6 +152,73 @@ fn ref_sample<P: Pixel>(plane: &[P], stride: usize, x: i32, y: i32, w: i32, h: i
     plane[idx].to_i32()
 }
 
+/// Row stride of the padded edge buffer: a 64-wide block plus the 7-sample
+/// luma filter margin.
+pub(crate) const MC_EDGE_STRIDE: usize = MAX_PB_SIZE + 7;
+/// Length of the padded edge buffer: 71 rows of `MC_EDGE_STRIDE`.
+pub(crate) const MC_EDGE_LEN: usize = MC_EDGE_STRIDE * (MAX_PB_SIZE + 7);
+
+/// Locate the reference samples a block's filter needs: the `ww × wh`
+/// window whose top-left is `(wx0, wy0)` in the reference plane.
+///
+/// Returns `(source, stride, origin)` such that reference sample
+/// `(wx0 + dx, wy0 + dy)` is `source[origin + dy * stride + dx]`.
+///
+/// When the window lies entirely inside the picture (the common case) the
+/// source is the reference plane itself, so the filter loops read memory
+/// directly with no per-tap clamping. Otherwise the window is copied into
+/// `edge` through `ref_sample`, which applies the spec 8.5.3.2.1 boundary
+/// clamp, and the filters read the padded copy. Either way every tap sees
+/// exactly the value `ref_sample` would return.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn ref_window<'a, P: Pixel>(
+    ref_plane: &'a [P],
+    ref_stride: usize,
+    ref_w: i32,
+    ref_h: i32,
+    wx0: i32,
+    wy0: i32,
+    ww: usize,
+    wh: usize,
+    edge: &'a mut [P],
+    bit_depth: u8,
+) -> (&'a [P], usize, usize) {
+    let inside = ww > 0
+        && wh > 0
+        && wx0 >= 0
+        && wy0 >= 0
+        && wx0 as i64 + ww as i64 <= ref_w as i64
+        && wy0 as i64 + wh as i64 <= ref_h as i64
+        && (wy0 as usize + wh - 1) * ref_stride + wx0 as usize + ww - 1 < ref_plane.len();
+    if inside {
+        return (
+            ref_plane,
+            ref_stride,
+            wy0 as usize * ref_stride + wx0 as usize,
+        );
+    }
+    debug_assert!(ww <= MC_EDGE_STRIDE && wh * MC_EDGE_STRIDE <= edge.len());
+    for r in 0..wh {
+        for c in 0..ww {
+            // `ref_sample` returns an in-range sample (or 0), so this
+            // conversion never actually clamps.
+            edge[r * MC_EDGE_STRIDE + c] = P::from_i32_clamped(
+                ref_sample(
+                    ref_plane,
+                    ref_stride,
+                    wx0 + c as i32,
+                    wy0 + r as i32,
+                    ref_w,
+                    ref_h,
+                ),
+                bit_depth,
+            );
+        }
+    }
+    (edge, MC_EDGE_STRIDE, 0)
+}
+
 /// Uni-directional luma motion compensation (8-tap filter).
 ///
 /// Writes `nPbW * nPbH` prediction samples into `dst` at stride `dst_stride`.
@@ -157,12 +242,34 @@ pub fn mc_luma<P: Pixel>(
     mv_y: i16,
     bit_depth: u8,
     tmp: &mut [i32],
+    edge: &mut [P],
 ) {
     let x_frac = (mv_x & 3) as usize;
     let y_frac = (mv_y & 3) as usize;
     // Integer part of the reference position.
     let x_int = x0 + (mv_x >> 2) as i32;
     let y_int = y0 + (mv_y >> 2) as i32;
+    // Filter window: taps reach 3 sample(s) before and 4 after on each axis
+    // with a fractional MV. Interior blocks read the reference plane
+    // directly; edge blocks read a padded copy (see `ref_window`).
+    let (bx, ax) = if x_frac != 0 { (3, 4) } else { (0, 0) };
+    let (by, ay) = if y_frac != 0 { (3, 4) } else { (0, 0) };
+    let (wx0, wy0) = (x_int - bx, y_int - by);
+    let (src, src_stride, org) = ref_window(
+        ref_plane,
+        ref_stride,
+        ref_w,
+        ref_h,
+        wx0,
+        wy0,
+        n_pb_w + (bx + ax) as usize,
+        n_pb_h + (by + ay) as usize,
+        edge,
+        bit_depth,
+    );
+    let at = |x: i32, y: i32| -> i32 {
+        src[org + (y - wy0) as usize * src_stride + (x - wx0) as usize].to_i32()
+    };
 
     let shift = crate::pixel::mc_shift(bit_depth) as i32;
     let offset = crate::pixel::mc_offset(bit_depth);
@@ -175,17 +282,8 @@ pub fn mc_luma<P: Pixel>(
         // Integer-pel: direct copy.
         for j in 0..n_pb_h {
             for i in 0..n_pb_w {
-                dst[j * dst_stride + i] = P::from_i32_clamped(
-                    ref_sample(
-                        ref_plane,
-                        ref_stride,
-                        x_int + i as i32,
-                        y_int + j as i32,
-                        ref_w,
-                        ref_h,
-                    ),
-                    bit_depth,
-                );
+                dst[j * dst_stride + i] =
+                    P::from_i32_clamped(at(x_int + i as i32, y_int + j as i32), bit_depth);
             }
         }
     } else if y_frac == 0 {
@@ -197,8 +295,7 @@ pub fn mc_luma<P: Pixel>(
                 let rx = x_int + i as i32;
                 let mut val: i32 = 0;
                 for (k, &coeff) in filter.iter().enumerate() {
-                    val += coeff as i32
-                        * ref_sample(ref_plane, ref_stride, rx + k as i32 - 3, ry, ref_w, ref_h);
+                    val += coeff as i32 * at(rx + k as i32 - 3, ry);
                 }
                 dst[j * dst_stride + i] =
                     P::from_i32_clamped(((val >> shift1) + offset) >> shift, bit_depth);
@@ -213,8 +310,7 @@ pub fn mc_luma<P: Pixel>(
                 let rx = x_int + i as i32;
                 let mut val: i32 = 0;
                 for (k, &coeff) in filter.iter().enumerate() {
-                    val += coeff as i32
-                        * ref_sample(ref_plane, ref_stride, rx, ry + k as i32 - 3, ref_w, ref_h);
+                    val += coeff as i32 * at(rx, ry + k as i32 - 3);
                 }
                 dst[j * dst_stride + i] =
                     P::from_i32_clamped(((val >> shift1) + offset) >> shift, bit_depth);
@@ -241,8 +337,7 @@ pub fn mc_luma<P: Pixel>(
                 let rx = x_int + i as i32;
                 let mut val: i32 = 0;
                 for (k, &coeff) in h_filter.iter().enumerate() {
-                    val += coeff as i32
-                        * ref_sample(ref_plane, ref_stride, rx + k as i32 - 3, ry, ref_w, ref_h);
+                    val += coeff as i32 * at(rx + k as i32 - 3, ry);
                 }
                 tmp[j * MAX_PB_SIZE + i] = val >> shift1;
             }
@@ -294,11 +389,33 @@ pub fn mc_luma_i32<P: Pixel>(
     mv_y: i16,
     bit_depth: u8,
     tmp: &mut [i32],
+    edge: &mut [P],
 ) {
     let x_frac = (mv_x & 3) as usize;
     let y_frac = (mv_y & 3) as usize;
     let x_int = x0 + (mv_x >> 2) as i32;
     let y_int = y0 + (mv_y >> 2) as i32;
+    // Filter window: taps reach 3 sample(s) before and 4 after on each axis
+    // with a fractional MV. Interior blocks read the reference plane
+    // directly; edge blocks read a padded copy (see `ref_window`).
+    let (bx, ax) = if x_frac != 0 { (3, 4) } else { (0, 0) };
+    let (by, ay) = if y_frac != 0 { (3, 4) } else { (0, 0) };
+    let (wx0, wy0) = (x_int - bx, y_int - by);
+    let (src, src_stride, org) = ref_window(
+        ref_plane,
+        ref_stride,
+        ref_w,
+        ref_h,
+        wx0,
+        wy0,
+        n_pb_w + (bx + ax) as usize,
+        n_pb_h + (by + ay) as usize,
+        edge,
+        bit_depth,
+    );
+    let at = |x: i32, y: i32| -> i32 {
+        src[org + (y - wy0) as usize * src_stride + (x - wx0) as usize].to_i32()
+    };
     // Intermediate precision shift: 14 - bit_depth (8-bit: 6, 10-bit: 4).
     let shift3 = crate::pixel::mc_shift(bit_depth) as i32;
     // Sub-pel filter output shift: bit_depth - 8 (8-bit: 0, 10-bit: 2).
@@ -307,14 +424,7 @@ pub fn mc_luma_i32<P: Pixel>(
     if x_frac == 0 && y_frac == 0 {
         for j in 0..n_pb_h {
             for i in 0..n_pb_w {
-                dst[j * dst_stride + i] = ref_sample(
-                    ref_plane,
-                    ref_stride,
-                    x_int + i as i32,
-                    y_int + j as i32,
-                    ref_w,
-                    ref_h,
-                ) << shift3;
+                dst[j * dst_stride + i] = at(x_int + i as i32, y_int + j as i32) << shift3;
             }
         }
     } else if y_frac == 0 {
@@ -325,8 +435,7 @@ pub fn mc_luma_i32<P: Pixel>(
                 let rx = x_int + i as i32;
                 let mut val: i32 = 0;
                 for (k, &coeff) in filter.iter().enumerate() {
-                    val += coeff as i32
-                        * ref_sample(ref_plane, ref_stride, rx + k as i32 - 3, ry, ref_w, ref_h);
+                    val += coeff as i32 * at(rx + k as i32 - 3, ry);
                 }
                 dst[j * dst_stride + i] = val >> shift1;
             }
@@ -339,8 +448,7 @@ pub fn mc_luma_i32<P: Pixel>(
                 let rx = x_int + i as i32;
                 let mut val: i32 = 0;
                 for (k, &coeff) in filter.iter().enumerate() {
-                    val += coeff as i32
-                        * ref_sample(ref_plane, ref_stride, rx, ry + k as i32 - 3, ref_w, ref_h);
+                    val += coeff as i32 * at(rx, ry + k as i32 - 3);
                 }
                 dst[j * dst_stride + i] = val >> shift1;
             }
@@ -357,8 +465,7 @@ pub fn mc_luma_i32<P: Pixel>(
                 let rx = x_int + i as i32;
                 let mut val: i32 = 0;
                 for (k, &coeff) in h_filter.iter().enumerate() {
-                    val += coeff as i32
-                        * ref_sample(ref_plane, ref_stride, rx + k as i32 - 3, ry, ref_w, ref_h);
+                    val += coeff as i32 * at(rx + k as i32 - 3, ry);
                 }
                 tmp[j * MAX_PB_SIZE + i] = val >> shift1;
             }
@@ -395,26 +502,41 @@ pub fn mc_chroma_i32<P: Pixel>(
     mv_y: i32,
     bit_depth: u8,
     tmp: &mut [i32],
+    edge: &mut [P],
 ) {
     // Chroma MV in eighth-chroma-sample units (see `chroma_mv`).
     let x_frac = (mv_x & 7) as usize;
     let y_frac = (mv_y & 7) as usize;
     let x_int = x0 + (mv_x >> 3);
     let y_int = y0 + (mv_y >> 3);
+    // Filter window: taps reach 1 sample(s) before and 2 after on each axis
+    // with a fractional MV. Interior blocks read the reference plane
+    // directly; edge blocks read a padded copy (see `ref_window`).
+    let (bx, ax) = if x_frac != 0 { (1, 2) } else { (0, 0) };
+    let (by, ay) = if y_frac != 0 { (1, 2) } else { (0, 0) };
+    let (wx0, wy0) = (x_int - bx, y_int - by);
+    let (src, src_stride, org) = ref_window(
+        ref_plane,
+        ref_stride,
+        ref_w,
+        ref_h,
+        wx0,
+        wy0,
+        n_pb_w + (bx + ax) as usize,
+        n_pb_h + (by + ay) as usize,
+        edge,
+        bit_depth,
+    );
+    let at = |x: i32, y: i32| -> i32 {
+        src[org + (y - wy0) as usize * src_stride + (x - wx0) as usize].to_i32()
+    };
     let shift3 = crate::pixel::mc_shift(bit_depth) as i32;
     let shift1 = (bit_depth as i32 - 8).max(0);
 
     if x_frac == 0 && y_frac == 0 {
         for j in 0..n_pb_h {
             for i in 0..n_pb_w {
-                dst[j * dst_stride + i] = ref_sample(
-                    ref_plane,
-                    ref_stride,
-                    x_int + i as i32,
-                    y_int + j as i32,
-                    ref_w,
-                    ref_h,
-                ) << shift3;
+                dst[j * dst_stride + i] = at(x_int + i as i32, y_int + j as i32) << shift3;
             }
         }
     } else if y_frac == 0 {
@@ -425,8 +547,7 @@ pub fn mc_chroma_i32<P: Pixel>(
                 let rx = x_int + i as i32;
                 let mut val: i32 = 0;
                 for (k, &coeff) in filter.iter().enumerate() {
-                    val += coeff as i32
-                        * ref_sample(ref_plane, ref_stride, rx + k as i32 - 1, ry, ref_w, ref_h);
+                    val += coeff as i32 * at(rx + k as i32 - 1, ry);
                 }
                 dst[j * dst_stride + i] = val >> shift1;
             }
@@ -439,8 +560,7 @@ pub fn mc_chroma_i32<P: Pixel>(
                 let rx = x_int + i as i32;
                 let mut val: i32 = 0;
                 for (k, &coeff) in filter.iter().enumerate() {
-                    val += coeff as i32
-                        * ref_sample(ref_plane, ref_stride, rx, ry + k as i32 - 1, ref_w, ref_h);
+                    val += coeff as i32 * at(rx, ry + k as i32 - 1);
                 }
                 dst[j * dst_stride + i] = val >> shift1;
             }
@@ -457,8 +577,7 @@ pub fn mc_chroma_i32<P: Pixel>(
                 let rx = x_int + i as i32;
                 let mut val: i32 = 0;
                 for (k, &coeff) in h_filter.iter().enumerate() {
-                    val += coeff as i32
-                        * ref_sample(ref_plane, ref_stride, rx + k as i32 - 1, ry, ref_w, ref_h);
+                    val += coeff as i32 * at(rx + k as i32 - 1, ry);
                 }
                 tmp[j * MAX_PB_SIZE + i] = val >> shift1;
             }
@@ -499,12 +618,34 @@ pub fn mc_chroma<P: Pixel>(
     mv_y_c: i32,
     bit_depth: u8,
     tmp: &mut [i32],
+    edge: &mut [P],
 ) {
     // Chroma MV in eighth-chroma-sample units (see `chroma_mv`).
     let x_frac = (mv_x_c & 7) as usize;
     let y_frac = (mv_y_c & 7) as usize;
     let x_int = x0_c + (mv_x_c >> 3);
     let y_int = y0_c + (mv_y_c >> 3);
+    // Filter window: taps reach 1 sample(s) before and 2 after on each axis
+    // with a fractional MV. Interior blocks read the reference plane
+    // directly; edge blocks read a padded copy (see `ref_window`).
+    let (bx, ax) = if x_frac != 0 { (1, 2) } else { (0, 0) };
+    let (by, ay) = if y_frac != 0 { (1, 2) } else { (0, 0) };
+    let (wx0, wy0) = (x_int - bx, y_int - by);
+    let (src, src_stride, org) = ref_window(
+        ref_plane,
+        ref_stride,
+        ref_w,
+        ref_h,
+        wx0,
+        wy0,
+        n_pb_w_c + (bx + ax) as usize,
+        n_pb_h_c + (by + ay) as usize,
+        edge,
+        bit_depth,
+    );
+    let at = |x: i32, y: i32| -> i32 {
+        src[org + (y - wy0) as usize * src_stride + (x - wx0) as usize].to_i32()
+    };
 
     let shift = crate::pixel::mc_shift(bit_depth) as i32;
     let offset = crate::pixel::mc_offset(bit_depth);
@@ -513,17 +654,8 @@ pub fn mc_chroma<P: Pixel>(
     if x_frac == 0 && y_frac == 0 {
         for j in 0..n_pb_h_c {
             for i in 0..n_pb_w_c {
-                dst[j * dst_stride + i] = P::from_i32_clamped(
-                    ref_sample(
-                        ref_plane,
-                        ref_stride,
-                        x_int + i as i32,
-                        y_int + j as i32,
-                        ref_w,
-                        ref_h,
-                    ),
-                    bit_depth,
-                );
+                dst[j * dst_stride + i] =
+                    P::from_i32_clamped(at(x_int + i as i32, y_int + j as i32), bit_depth);
             }
         }
     } else if y_frac == 0 {
@@ -534,8 +666,7 @@ pub fn mc_chroma<P: Pixel>(
                 let rx = x_int + i as i32;
                 let mut val: i32 = 0;
                 for (k, &coeff) in filter.iter().enumerate() {
-                    val += coeff as i32
-                        * ref_sample(ref_plane, ref_stride, rx + k as i32 - 1, ry, ref_w, ref_h);
+                    val += coeff as i32 * at(rx + k as i32 - 1, ry);
                 }
                 dst[j * dst_stride + i] =
                     P::from_i32_clamped(((val >> shift1) + offset) >> shift, bit_depth);
@@ -549,8 +680,7 @@ pub fn mc_chroma<P: Pixel>(
                 let rx = x_int + i as i32;
                 let mut val: i32 = 0;
                 for (k, &coeff) in filter.iter().enumerate() {
-                    val += coeff as i32
-                        * ref_sample(ref_plane, ref_stride, rx, ry + k as i32 - 1, ref_w, ref_h);
+                    val += coeff as i32 * at(rx, ry + k as i32 - 1);
                 }
                 dst[j * dst_stride + i] =
                     P::from_i32_clamped(((val >> shift1) + offset) >> shift, bit_depth);
@@ -570,8 +700,7 @@ pub fn mc_chroma<P: Pixel>(
                 let rx = x_int + i as i32;
                 let mut val: i32 = 0;
                 for (k, &coeff) in h_filter.iter().enumerate() {
-                    val += coeff as i32
-                        * ref_sample(ref_plane, ref_stride, rx + k as i32 - 1, ry, ref_w, ref_h);
+                    val += coeff as i32 * at(rx + k as i32 - 1, ry);
                 }
                 tmp[j * MAX_PB_SIZE + i] = val >> shift1;
             }
@@ -602,7 +731,7 @@ pub fn mc_chroma<P: Pixel>(
 #[allow(clippy::too_many_arguments)]
 pub fn motion_compensation_pu<P: Pixel>(
     state: &mut PictureState<P>,
-    scratch: &mut McScratch,
+    scratch: &mut McScratch<P>,
     ref_frames_l0: &[Rc<DecodedPicture>],
     ref_frames_l1: &[Rc<DecodedPicture>],
     x0: u32,
@@ -624,6 +753,7 @@ pub fn motion_compensation_pu<P: Pixel>(
         cb1,
         cr1,
         tmp,
+        edge,
     } = scratch;
 
     if mvf.pred_flag == 0 {
@@ -693,6 +823,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mvf.mv[0].y,
                 bit_depth,
                 &mut tmp[..],
+                &mut edge[..],
             );
             let rw_c = (ref_pic_l0.width >> csw) as i32;
             let rh_c = (ref_pic_l0.height >> csh) as i32;
@@ -714,6 +845,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_y_c,
                 bit_depth,
                 &mut tmp[..],
+                &mut edge[..],
             );
             mc_chroma_i32::<P>(
                 pred_l0_v,
@@ -730,6 +862,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_y_c,
                 bit_depth,
                 &mut tmp[..],
+                &mut edge[..],
             );
         }
 
@@ -758,6 +891,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mvf.mv[1].y,
                 bit_depth,
                 &mut tmp[..],
+                &mut edge[..],
             );
             let rw_c = (ref_pic_l1.width >> csw) as i32;
             let rh_c = (ref_pic_l1.height >> csh) as i32;
@@ -779,6 +913,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_y_c,
                 bit_depth,
                 &mut tmp[..],
+                &mut edge[..],
             );
             mc_chroma_i32::<P>(
                 pred_l1_v,
@@ -795,6 +930,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_y_c,
                 bit_depth,
                 &mut tmp[..],
+                &mut edge[..],
             );
         }
 
@@ -869,6 +1005,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv.y,
                 bit_depth,
                 &mut tmp[..],
+                &mut edge[..],
             );
 
             let ref_w_c = (ref_list.width >> csw) as i32;
@@ -892,6 +1029,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_y_c,
                 bit_depth,
                 &mut tmp[..],
+                &mut edge[..],
             );
             mc_chroma::<P>(
                 &mut state.v_plane[c_off..],
@@ -908,6 +1046,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_y_c,
                 bit_depth,
                 &mut tmp[..],
+                &mut edge[..],
             );
         } else {
             // Weighted uni-prediction: compute MC at i16 precision, then apply
@@ -950,6 +1089,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv.y,
                 bit_depth,
                 &mut tmp[..],
+                &mut edge[..],
             );
             // Apply weighted prediction: spec 8.5.3.3.4.1
             // For uni-pred weighted: log2WD = luma_log2_weight_denom + (bit_depth - 8)
@@ -1004,6 +1144,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_y_c,
                 bit_depth,
                 &mut tmp[..],
+                &mut edge[..],
             );
             mc_chroma_i32::<P>(
                 pred_v,
@@ -1020,6 +1161,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 mv_y_c,
                 bit_depth,
                 &mut tmp[..],
+                &mut edge[..],
             );
 
             for j in 0..h_c {
@@ -1168,6 +1310,7 @@ mod tests {
             0,
             8,
             &mut vec![0i32; MC_TMP_LEN],
+            &mut vec![0u8; MC_EDGE_LEN],
         );
 
         for j in 0..h {
@@ -1201,6 +1344,7 @@ mod tests {
             0,
             8,
             &mut vec![0i32; MC_TMP_LEN],
+            &mut vec![0u8; MC_EDGE_LEN],
         );
 
         // With uniform reference, all outputs should be 128.
@@ -1232,6 +1376,7 @@ mod tests {
             3,
             8,
             &mut vec![0i32; MC_TMP_LEN],
+            &mut vec![0u8; MC_EDGE_LEN],
         );
 
         for &v in &dst {
@@ -1270,6 +1415,7 @@ mod tests {
             0,
             8,
             &mut vec![0i32; MC_TMP_LEN],
+            &mut vec![0u8; MC_EDGE_LEN],
         );
 
         for j in 0..h {
@@ -1302,6 +1448,7 @@ mod tests {
             5,
             8,
             &mut vec![0i32; MC_TMP_LEN],
+            &mut vec![0u8; MC_EDGE_LEN],
         );
 
         for &v in &dst {
