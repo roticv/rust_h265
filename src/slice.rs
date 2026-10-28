@@ -613,9 +613,17 @@ pub fn parse_slice_segment_header(
     }
 
     if pps.slice_segment_header_extension_present_flag {
-        return Err(DecodeError::Unsupported(
-            "slice_segment_header_extension not supported",
-        ));
+        // Reserved for future extensions (spec 7.3.6.1 / 7.4.7.1): a length in
+        // 0..=256 followed by that many bytes, which decoders shall ignore.
+        let slice_segment_header_extension_length = r.read_ue()?;
+        if slice_segment_header_extension_length > 256 {
+            return Err(DecodeError::InvalidSyntax(
+                "slice_segment_header_extension_length out of range",
+            ));
+        }
+        for _ in 0..slice_segment_header_extension_length {
+            r.read_bits(8)?;
+        }
     }
 
     // byte_alignment(): one '1' bit followed by zero bits up to a byte boundary.
