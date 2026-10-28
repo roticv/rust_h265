@@ -2013,7 +2013,30 @@ fn decode_mvd_sign(cabac: &mut CabacReader) -> i32 {
 /// per HEVC spec 8.7.2.5 / FFmpeg `boundary_strength`.
 ///
 /// Returns 0 if MVs are close enough (diff < 4 in quarter-pel units), 1 otherwise.
+/// Boundary strength between two inter blocks (spec 8.7.2.4): 1 if they
+/// use different reference pictures or any MV component differs by 4 or
+/// more quarter samples, else 0.
+///
+/// The common case, identical motion on both sides (every 8×8 grid line
+/// inside one prediction unit), is checked inline: with the same reference
+/// lists both sides resolve to the same pictures and every |ΔMV| is 0, so
+/// the strength is 0. Everything else goes to the out-of-line full check.
+#[inline(always)]
 fn inter_boundary_strength(
+    curr: &MvField,
+    neigh: &MvField,
+    curr_ref_pocs: &[Vec<i32>; 2],
+    neigh_ref_pocs: &[Vec<i32>; 2],
+) -> u8 {
+    if curr == neigh && std::ptr::eq(curr_ref_pocs, neigh_ref_pocs) {
+        0
+    } else {
+        inter_boundary_strength_full(curr, neigh, curr_ref_pocs, neigh_ref_pocs)
+    }
+}
+
+#[inline(never)]
+fn inter_boundary_strength_full(
     curr: &MvField,
     neigh: &MvField,
     curr_ref_pocs: &[Vec<i32>; 2],

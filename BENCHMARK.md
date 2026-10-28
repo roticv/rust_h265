@@ -119,6 +119,12 @@ In order of landing, with each step's gain over the one before it:
    lanes per instruction. 10-bit keeps i32.
 6. **No row copy for intermediates** (+3–9%). Intermediate rows are written
    straight into their destination instead of through a staging buffer.
+7. **Deblocking boundary strength** (+3–6%, measured after the tables above
+   were taken). Inside one prediction unit the strength is computed on every
+   8×8 grid line between identical motion fields, which always gives 0; that
+   case is now an inline struct comparison. The luma edge filter was also
+   restructured to load each 4-line segment once and filter the lines as
+   lanes, but compiler vectorisation helped it little (see Priorities).
 
 ### Comparison with libde265
 
@@ -386,11 +392,12 @@ bottleneck per the profile.
 All six real-world fixtures decode byte-exact. Remaining focus is
 performance, ordered by expected return:
 
-1. **Vectorise deblocking** (~17%). The luma edge filter and the boundary
-   strength derivation are scalar. The same approach that worked for MC
-   (row-slice loops LLVM can vectorise, no `unsafe`) is the cheap first
-   step; BS derivation could also batch per 8x8 block instead of per 4x4
-   edge.
+1. **Deblocking** (~14% after change 7). Compiler vectorisation was tried
+   on the luma edge filter and did not pay off: each 4-line segment makes
+   its own filter decisions, and vertical edges need a transpose, so LLVM
+   vectorises only a small part. FFmpeg filters 8 lines at a time with
+   hand-written NEON and in-register transposes; matching it likely needs
+   intrinsics. The remaining BS cost is the per-edge driver loop.
 
 2. **Vectorise the inverse transform** (~17%). `tr_32` and `tr_16` first.
    Same approach: try compiler vectorisation before intrinsics.

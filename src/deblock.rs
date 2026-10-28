@@ -92,96 +92,109 @@ fn chroma_tc(
 
 // ---- Inner luma kernels (per "filter unit" of 4 pixels along the edge) ----
 
-/// Strong luma filter, modifies up to 3 pixels on each side.
-/// `pix` points to the first sample. `xstride` is the across-edge stride
-/// (1 for horizontal edge, plane stride for vertical edge). `ystride` is
-/// the along-edge stride. `tc`, `tc2`, `tc3` are bounded by `tc << 0/1/?`.
-#[allow(clippy::too_many_arguments)]
-fn loop_filter_luma_strong<P: Pixel>(
+/// One 4-line luma deblocking segment, tap-major: `seg[t][l]` is tap `t`
+/// (0 = p3, 1 = p2, 2 = p1, 3 = p0, 4 = q0, 5 = q1, 6 = q2, 7 = q3) on line
+/// `l`. Holding a segment as lanes lets the filters below run all four
+/// lines at once, which LLVM vectorises.
+type LumaSeg = [[i32; 4]; 8];
+
+/// Load the 8-tap × 4-line segment whose q0 on line 0 is `plane[base]`.
+/// `xstride` crosses the edge, `ystride` runs along it. Each contiguous run
+/// (a line for a vertical edge, a tap for a horizontal one) is read as one
+/// slice, so there is one bounds check per run rather than per sample.
+#[inline(always)]
+fn load_luma_seg<P: Pixel>(plane: &[P], base: usize, xstride: isize, ystride: isize) -> LumaSeg {
+    let mut seg = [[0i32; 4]; 8];
+    if xstride == 1 {
+        // Vertical edge: each line is 8 contiguous samples p3..q3.
+        for l in 0..4 {
+            let start = (base as isize + l as isize * ystride - 4) as usize;
+            let line = &plane[start..start + 8];
+            for t in 0..8 {
+                seg[t][l] = line[t].to_i32();
+            }
+        }
+    } else {
+        // Horizontal edge (ystride == 1): each tap is 4 contiguous samples.
+        for (t, tap) in seg.iter_mut().enumerate() {
+            let start = (base as isize + (t as isize - 4) * xstride) as usize;
+            for (v, &p) in tap.iter_mut().zip(&plane[start..start + 4]) {
+                *v = p.to_i32();
+            }
+        }
+    }
+    seg
+}
+
+/// Store taps `taps` of `seg` back to the plane (inverse of
+/// `load_luma_seg`), clipping to the sample range.
+#[inline(always)]
+fn store_luma_seg<P: Pixel>(
     plane: &mut [P],
     base: usize,
     xstride: isize,
     ystride: isize,
-    tc: i32,
-    tc2: i32,
-    tc3: i32,
+    seg: &LumaSeg,
+    taps: std::ops::Range<usize>,
     bit_depth: u8,
 ) {
-    for d in 0..4 {
-        let line_off = d * ystride;
-        let p3 = plane[(base as isize + line_off + (-4) * xstride) as usize].to_i32();
-        let p2 = plane[(base as isize + line_off + (-3) * xstride) as usize].to_i32();
-        let p1 = plane[(base as isize + line_off + (-2) * xstride) as usize].to_i32();
-        let p0 = plane[(base as isize + line_off + (-1) * xstride) as usize].to_i32();
-        let q0 = plane[(base as isize + line_off + 0 * xstride) as usize].to_i32();
-        let q1 = plane[(base as isize + line_off + 1 * xstride) as usize].to_i32();
-        let q2 = plane[(base as isize + line_off + 2 * xstride) as usize].to_i32();
-        let q3 = plane[(base as isize + line_off + 3 * xstride) as usize].to_i32();
-
-        let new_p0 = p0 + ((((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3) - p0).clamp(-tc3, tc3));
-        let new_p1 = p1 + ((((p2 + p1 + p0 + q0 + 2) >> 2) - p1).clamp(-tc2, tc2));
-        let new_p2 = p2 + ((((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3) - p2).clamp(-tc, tc));
-        let new_q0 = q0 + ((((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3) - q0).clamp(-tc3, tc3));
-        let new_q1 = q1 + ((((p0 + q0 + q1 + q2 + 2) >> 2) - q1).clamp(-tc2, tc2));
-        let new_q2 = q2 + ((((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3) - q2).clamp(-tc, tc));
-
-        plane[(base as isize + line_off + (-3) * xstride) as usize] =
-            P::from_i32_clamped(new_p2, bit_depth);
-        plane[(base as isize + line_off + (-2) * xstride) as usize] =
-            P::from_i32_clamped(new_p1, bit_depth);
-        plane[(base as isize + line_off + (-1) * xstride) as usize] =
-            P::from_i32_clamped(new_p0, bit_depth);
-        plane[(base as isize + line_off + 0 * xstride) as usize] =
-            P::from_i32_clamped(new_q0, bit_depth);
-        plane[(base as isize + line_off + 1 * xstride) as usize] =
-            P::from_i32_clamped(new_q1, bit_depth);
-        plane[(base as isize + line_off + 2 * xstride) as usize] =
-            P::from_i32_clamped(new_q2, bit_depth);
+    if xstride == 1 {
+        for l in 0..4 {
+            let start = (base as isize + l as isize * ystride - 4) as usize;
+            let line = &mut plane[start..start + 8];
+            for t in taps.clone() {
+                line[t] = P::from_i32_clamped(seg[t][l], bit_depth);
+            }
+        }
+    } else {
+        for t in taps {
+            let start = (base as isize + (t as isize - 4) * xstride) as usize;
+            for (p, &v) in plane[start..start + 4].iter_mut().zip(&seg[t]) {
+                *p = P::from_i32_clamped(v, bit_depth);
+            }
+        }
     }
 }
 
-/// Weak (normal) luma filter.
-#[allow(clippy::too_many_arguments)]
-fn loop_filter_luma_weak<P: Pixel>(
-    plane: &mut [P],
-    base: usize,
-    xstride: isize,
-    ystride: isize,
-    tc: i32,
-    nd_p: i32,
-    nd_q: i32,
-    bit_depth: u8,
-) {
-    let tc_2 = tc >> 1;
-    for d in 0..4 {
-        let line_off = d * ystride;
-        let p2 = plane[(base as isize + line_off + (-3) * xstride) as usize].to_i32();
-        let p1 = plane[(base as isize + line_off + (-2) * xstride) as usize].to_i32();
-        let p0 = plane[(base as isize + line_off + (-1) * xstride) as usize].to_i32();
-        let q0 = plane[(base as isize + line_off + 0 * xstride) as usize].to_i32();
-        let q1 = plane[(base as isize + line_off + 1 * xstride) as usize].to_i32();
-        let q2 = plane[(base as isize + line_off + 2 * xstride) as usize].to_i32();
+/// Strong luma filter (spec 8.7.2.5.7, dE == 2) on all four lines of a
+/// segment: modifies p2..q2, each change clipped to ±`tc2` (= 2·tC).
+#[inline(always)]
+fn luma_strong_seg(seg: &mut LumaSeg, tc2: i32) {
+    let [p3, p2, p1, p0, q0, q1, q2, q3] = *seg;
+    for l in 0..4 {
+        let (p3, p2, p1, p0) = (p3[l], p2[l], p1[l], p0[l]);
+        let (q0, q1, q2, q3) = (q0[l], q1[l], q2[l], q3[l]);
+        let c = |new: i32, old: i32| old + (new - old).clamp(-tc2, tc2);
+        seg[1][l] = c((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3, p2);
+        seg[2][l] = c((p2 + p1 + p0 + q0 + 2) >> 2, p1);
+        seg[3][l] = c((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3, p0);
+        seg[4][l] = c((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3, q0);
+        seg[5][l] = c((p0 + q0 + q1 + q2 + 2) >> 2, q1);
+        seg[6][l] = c((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3, q2);
+    }
+}
 
-        let mut delta0 = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
-        if delta0.abs() < 10 * tc {
-            delta0 = delta0.clamp(-tc, tc);
-            plane[(base as isize + line_off + (-1) * xstride) as usize] =
-                P::from_i32_clamped(p0 + delta0, bit_depth);
-            plane[(base as isize + line_off + 0 * xstride) as usize] =
-                P::from_i32_clamped(q0 - delta0, bit_depth);
-            if nd_p > 1 {
-                let dp = (((p2 + p0 + 1) >> 1) - p1 + delta0) >> 1;
-                let dp = dp.clamp(-tc_2, tc_2);
-                plane[(base as isize + line_off + (-2) * xstride) as usize] =
-                    P::from_i32_clamped(p1 + dp, bit_depth);
-            }
-            if nd_q > 1 {
-                let dq = (((q2 + q0 + 1) >> 1) - q1 - delta0) >> 1;
-                let dq = dq.clamp(-tc_2, tc_2);
-                plane[(base as isize + line_off + 1 * xstride) as usize] =
-                    P::from_i32_clamped(q1 + dq, bit_depth);
-            }
-        }
+/// Weak luma filter (spec 8.7.2.5.7, dE == 1) on all four lines of a
+/// segment: modifies p0/q0, and p1/q1 when `nd_p` / `nd_q` is 2. A line
+/// whose |Δ| reaches 10·tC is left unchanged.
+#[inline(always)]
+fn luma_weak_seg(seg: &mut LumaSeg, tc: i32, nd_p: i32, nd_q: i32) {
+    let tc_2 = tc >> 1;
+    let (mod_p1, mod_q1) = (nd_p > 1, nd_q > 1);
+    let [_, p2, p1, p0, q0, q1, q2, _] = *seg;
+    // Branch-free: compute every line's filtered values, then select per
+    // line between filtered and original, so the four lines vectorise.
+    for l in 0..4 {
+        let (p2, p1, p0, q0, q1, q2) = (p2[l], p1[l], p0[l], q0[l], q1[l], q2[l]);
+        let raw = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
+        let on = raw.abs() < 10 * tc;
+        let delta0 = raw.clamp(-tc, tc);
+        let np1 = p1 + ((((p2 + p0 + 1) >> 1) - p1 + delta0) >> 1).clamp(-tc_2, tc_2);
+        let nq1 = q1 + ((((q2 + q0 + 1) >> 1) - q1 - delta0) >> 1).clamp(-tc_2, tc_2);
+        seg[3][l] = if on { p0 + delta0 } else { p0 };
+        seg[4][l] = if on { q0 - delta0 } else { q0 };
+        seg[2][l] = if on && mod_p1 { np1 } else { p1 };
+        seg[5][l] = if on && mod_q1 { nq1 } else { q1 };
     }
 }
 
@@ -242,75 +255,41 @@ fn filter_luma_edge<P: Pixel>(
         },
     ];
 
-    for j in 0..2 {
-        let tc = tcs[j];
+    for (j, &tc) in tcs.iter().enumerate() {
         if tc == 0 {
             continue;
         }
-        // Each j-half is 4 lines along the edge, starting at row j*4.
+        // Each j-half is 4 lines along the edge, starting at line j*4.
         let j_base = (pix_base as isize + (j as isize * 4) * ystride) as usize;
+        let mut seg = load_luma_seg(plane, j_base, xstride, ystride);
+        let [p3, p2, p1, p0, q0, q1, q2, q3] = seg;
 
-        // Compute d on lines 0 and 3 of this segment, per spec 8.7.2.5.
-        let d0_p = (plane[(j_base as isize + 0 * ystride + (-3) * xstride) as usize].to_i32()
-            - 2 * plane[(j_base as isize + 0 * ystride + (-2) * xstride) as usize].to_i32()
-            + plane[(j_base as isize + 0 * ystride + (-1) * xstride) as usize].to_i32())
-        .abs();
-        let d0_q = (plane[(j_base as isize + 0 * ystride + 0 * xstride) as usize].to_i32()
-            - 2 * plane[(j_base as isize + 0 * ystride + 1 * xstride) as usize].to_i32()
-            + plane[(j_base as isize + 0 * ystride + 2 * xstride) as usize].to_i32())
-        .abs();
-        let d3_p = (plane[(j_base as isize + 3 * ystride + (-3) * xstride) as usize].to_i32()
-            - 2 * plane[(j_base as isize + 3 * ystride + (-2) * xstride) as usize].to_i32()
-            + plane[(j_base as isize + 3 * ystride + (-1) * xstride) as usize].to_i32())
-        .abs();
-        let d3_q = (plane[(j_base as isize + 3 * ystride + 0 * xstride) as usize].to_i32()
-            - 2 * plane[(j_base as isize + 3 * ystride + 1 * xstride) as usize].to_i32()
-            + plane[(j_base as isize + 3 * ystride + 2 * xstride) as usize].to_i32())
-        .abs();
+        // Decisions use lines 0 and 3 only (spec 8.7.2.5.3).
+        let dp = |l: usize| (p2[l] - 2 * p1[l] + p0[l]).abs();
+        let dq = |l: usize| (q2[l] - 2 * q1[l] + q0[l]).abs();
+        let (d0_p, d0_q, d3_p, d3_q) = (dp(0), dq(0), dp(3), dq(3));
         let d0 = d0_p + d0_q;
         let d3 = d3_p + d3_q;
-        let dp_total = d0_p + d3_p;
-        let dq_total = d0_q + d3_q;
-        let d = d0 + d3;
-
-        if d < beta {
-            let beta_3 = beta >> 3;
-            let beta_2 = beta >> 2;
-            let tc25 = (tc * 5 + 1) >> 1;
-
-            // Strong filter check.
-            let p3_l0 = plane[(j_base as isize + 0 * ystride + (-4) * xstride) as usize].to_i32();
-            let p0_l0 = plane[(j_base as isize + 0 * ystride + (-1) * xstride) as usize].to_i32();
-            let q0_l0 = plane[(j_base as isize + 0 * ystride + 0 * xstride) as usize].to_i32();
-            let q3_l0 = plane[(j_base as isize + 0 * ystride + 3 * xstride) as usize].to_i32();
-            let p3_l3 = plane[(j_base as isize + 3 * ystride + (-4) * xstride) as usize].to_i32();
-            let p0_l3 = plane[(j_base as isize + 3 * ystride + (-1) * xstride) as usize].to_i32();
-            let q0_l3 = plane[(j_base as isize + 3 * ystride + 0 * xstride) as usize].to_i32();
-            let q3_l3 = plane[(j_base as isize + 3 * ystride + 3 * xstride) as usize].to_i32();
-
-            let strong = (p3_l0 - p0_l0).abs() + (q3_l0 - q0_l0).abs() < beta_3
-                && (p0_l0 - q0_l0).abs() < tc25
-                && (p3_l3 - p0_l3).abs() + (q3_l3 - q0_l3).abs() < beta_3
-                && (p0_l3 - q0_l3).abs() < tc25
-                && (d0 << 1) < beta_2
-                && (d3 << 1) < beta_2;
-
-            if strong {
-                let tc2 = tc << 1;
-                loop_filter_luma_strong(plane, j_base, xstride, ystride, tc2, tc2, tc2, bit_depth);
-            } else {
-                let nd_p = if dp_total < ((beta + (beta >> 1)) >> 3) {
-                    2
-                } else {
-                    1
-                };
-                let nd_q = if dq_total < ((beta + (beta >> 1)) >> 3) {
-                    2
-                } else {
-                    1
-                };
-                loop_filter_luma_weak(plane, j_base, xstride, ystride, tc, nd_p, nd_q, bit_depth);
-            }
+        if d0 + d3 >= beta {
+            continue;
+        }
+        let beta_3 = beta >> 3;
+        let beta_2 = beta >> 2;
+        let tc25 = (tc * 5 + 1) >> 1;
+        let strong_line = |l: usize, d: i32| {
+            (p3[l] - p0[l]).abs() + (q3[l] - q0[l]).abs() < beta_3
+                && (p0[l] - q0[l]).abs() < tc25
+                && (d << 1) < beta_2
+        };
+        if strong_line(0, d0) && strong_line(3, d3) {
+            luma_strong_seg(&mut seg, tc << 1);
+            store_luma_seg(plane, j_base, xstride, ystride, &seg, 1..7, bit_depth);
+        } else {
+            let side = (beta + (beta >> 1)) >> 3;
+            let nd_p = if d0_p + d3_p < side { 2 } else { 1 };
+            let nd_q = if d0_q + d3_q < side { 2 } else { 1 };
+            luma_weak_seg(&mut seg, tc, nd_p, nd_q);
+            store_luma_seg(plane, j_base, xstride, ystride, &seg, 2..6, bit_depth);
         }
     }
 }
