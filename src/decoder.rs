@@ -328,6 +328,17 @@ pub struct Decoder {
     /// slices. Consumed by Phase 3d-5 AMVP.
     current_ref_list_l1: Vec<Rc<DecodedPicture>>,
 
+    /// Parameter sets received so far, indexed by their IDs (up to 16 SPSs
+    /// and 64 PPSs). `sps` / `pps` hold the active pair, activated from
+    /// these tables at the first slice of each picture.
+    sps_table: Vec<Option<Sps>>,
+    pps_table: Vec<Option<Pps>>,
+    /// IDs of the active SPS / PPS, and whether a parameter set arrived
+    /// since they were activated.
+    active_sps_id: Option<u32>,
+    active_pps_id: Option<u32>,
+    parameter_sets_changed: bool,
+
     /// Min-TB Z-scan table shared by every picture with the same geometry,
     /// keyed by (width, height, log2 CTB size, log2 min TB size). Building
     /// it per picture was a measurable share of decode time.
@@ -529,26 +540,28 @@ impl Decoder {
             NalUnitType::Sps => {
                 let new_sps = parse_sps(&nal.rbsp)?;
                 self.validate_picture_limits(&new_sps)?;
-                let old_bd = self.sps.as_ref().map(|s| s.bit_depth_luma);
-                if old_bd.is_some() && old_bd != Some(new_sps.bit_depth_luma) {
-                    self.dpb.clear();
-                    self.current_picture = None;
+                let id = new_sps.sps_seq_parameter_set_id as usize;
+                if id > 15 {
+                    return Err(DecodeError::InvalidSyntax("sps_seq_parameter_set_id > 15"));
                 }
-                self.sps = Some(new_sps);
-                self.tile_tables = None;
-                // The active PPS's tile geometry was resolved against the
-                // previous SPS. Clear it so the next slice re-derives column
-                // widths / row heights for the new picture size (a stream may
-                // change resolution and keep its PPS).
-                if let Some(pps) = self.pps.as_mut() {
-                    pps.column_widths_in_ctbs.clear();
-                    pps.row_heights_in_ctbs.clear();
+                if self.sps_table.len() <= id {
+                    self.sps_table.resize(id + 1, None);
                 }
+                self.sps_table[id] = Some(new_sps);
+                self.parameter_sets_changed = true;
                 Ok(None)
             }
             NalUnitType::Pps => {
-                self.pps = Some(parse_pps(&nal.rbsp)?);
-                self.tile_tables = None;
+                let new_pps = parse_pps(&nal.rbsp)?;
+                let id = new_pps.pps_pic_parameter_set_id as usize;
+                if id > 63 {
+                    return Err(DecodeError::InvalidSyntax("pps_pic_parameter_set_id > 63"));
+                }
+                if self.pps_table.len() <= id {
+                    self.pps_table.resize(id + 1, None);
+                }
+                self.pps_table[id] = Some(new_pps);
+                self.parameter_sets_changed = true;
                 Ok(None)
             }
             NalUnitType::Eos => {
@@ -610,6 +623,11 @@ impl Decoder {
         nal: &NalUnit<'_>,
         nut: NalUnitType,
     ) -> Result<Option<Frame>, DecodeError> {
+        // first_slice_segment_in_pic_flag is the slice header's first bit.
+        if nal.rbsp.first().is_some_and(|b| b & 0x80 != 0) {
+            self.activate_parameter_sets(nal, nut)?;
+        }
+
         // Phase 3c-2: resolve PPS tile geometry and cache the tile-scan
         // tables up front. We need `&mut self.pps` for `resolve_tile_geometry`
         // but `&self.sps` for the inputs — take the SPS out of the option
@@ -1474,6 +1492,55 @@ impl Decoder {
     /// exactly `num_ref_idx_l{0,1}_active_minus1 + 1` entries and every
     /// entry points to a picture already in the DPB.
     #[allow(clippy::type_complexity)]
+    /// Activate the PPS named by a picture's first slice header, and the SPS
+    /// it refers to (spec 7.4.2.4.2). Only does work when the IDs changed or
+    /// a parameter set arrived since the last activation.
+    fn activate_parameter_sets(
+        &mut self,
+        nal: &NalUnit<'_>,
+        nut: NalUnitType,
+    ) -> Result<(), DecodeError> {
+        // Slice header prefix: first_slice_segment_in_pic_flag,
+        // [no_output_of_prior_pics_flag for IRAP], slice_pic_parameter_set_id.
+        let mut r = crate::bitstream::BitstreamReader::new(&nal.rbsp);
+        r.read_bit()?;
+        if nut.is_irap() {
+            r.read_bit()?;
+        }
+        let pps_id = r.read_ue()?;
+        if !self.parameter_sets_changed && self.active_pps_id == Some(pps_id) {
+            return Ok(());
+        }
+        let pps = self
+            .pps_table
+            .get(pps_id as usize)
+            .and_then(Option::as_ref)
+            .ok_or(DecodeError::InvalidSyntax("slice refers to a missing PPS"))?
+            .clone();
+        let sps_id = pps.pps_seq_parameter_set_id;
+        let sps = self
+            .sps_table
+            .get(sps_id as usize)
+            .and_then(Option::as_ref)
+            .ok_or(DecodeError::InvalidSyntax("PPS refers to a missing SPS"))?
+            .clone();
+        // A bit-depth change invalidates every picture in the DPB.
+        let old_bd = self.sps.as_ref().map(|s| s.bit_depth_luma);
+        if old_bd.is_some() && old_bd != Some(sps.bit_depth_luma) {
+            self.dpb.clear();
+            self.current_picture = None;
+        }
+        self.sps = Some(sps);
+        // A fresh PPS copy has no tile geometry resolved yet; it is derived
+        // for this SPS at the next slice, and the scan tables rebuilt.
+        self.pps = Some(pps);
+        self.tile_tables = None;
+        self.active_sps_id = Some(sps_id);
+        self.active_pps_id = Some(pps_id);
+        self.parameter_sets_changed = false;
+        Ok(())
+    }
+
     /// POCs and long-term flags of the current slice's reference lists.
     fn slice_ref_lists(
         l0: &[Rc<DecodedPicture>],
