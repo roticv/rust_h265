@@ -111,6 +111,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   syntax. It was unbounded. This is the input pattern behind libde265
   GHSA-g2rg-wj66-w594; here it caused no memory-safety issue.
 
+### Performance
+
+- The decode-time regression since 0.2.0 is gone. The per-sample
+  neighbour check added to SAO edge offset (for CTB corners) cost 3-4% on
+  SAO-heavy content; interior samples now take a per-row fast path. Hot
+  CTB-address helpers no longer divide by the CTB size at run time.
+  CPU cycles against 0.2.0 on the Big Buck Bunny 1080p benchmark
+  fixtures: `bbb_1080p_5s_safe` unchanged, `bbb_1080p_5s_medium` 2%
+  fewer.
+
 ## [0.2.0] - 2026-10-28
 
 Adds 4:4:4 decoding, fixes open-GOP streams, hardens the decoder against
