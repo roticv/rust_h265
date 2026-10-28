@@ -394,6 +394,12 @@ pub struct Sps {
 }
 
 impl Sps {
+    /// Whether samples need 16-bit storage: luma or chroma deeper than 8
+    /// bits (the two bit depths may differ).
+    pub fn needs_u16_samples(&self) -> bool {
+        self.bit_depth_luma.max(self.bit_depth_chroma) > 8
+    }
+
     /// `ChromaArrayType` (spec 7.4.3.2.1): equals `chroma_format_idc` unless
     /// the 4:4:4 planes are coded separately, in which case it is 0.
     pub fn chroma_array_type(&self) -> u32 {

@@ -496,7 +496,7 @@ impl Decoder {
         let aligned_pixels = width.checked_mul(height).ok_or(DecodeError::ResourceLimit(
             "picture memory estimate overflow",
         ))?;
-        let pixel_bytes = if sps.bit_depth_luma > 8 { 2 } else { 1 };
+        let pixel_bytes = if sps.needs_u16_samples() { 2 } else { 1 };
         let plane_bytes =
             aligned_pixels
                 .checked_mul(3 * pixel_bytes)
@@ -909,7 +909,7 @@ impl Decoder {
                     tab
                 }
             };
-            let ps_enum = if sps.bit_depth_luma > 8 {
+            let ps_enum = if sps.needs_u16_samples() {
                 let mut ps = PictureState::<u16>::new_with_zscan(sps, zscan);
                 let n = ps.tab_tile_id.len();
                 ps.tab_tile_id.copy_from_slice(&tile_tables.tile_id[..n]);
@@ -1529,8 +1529,9 @@ impl Decoder {
             .ok_or(DecodeError::InvalidSyntax("PPS refers to a missing SPS"))?
             .clone();
         // A bit-depth change invalidates every picture in the DPB.
-        let old_bd = self.sps.as_ref().map(|s| s.bit_depth_luma);
-        if old_bd.is_some() && old_bd != Some(sps.bit_depth_luma) {
+        let bit_depths = |s: &Sps| (s.bit_depth_luma, s.bit_depth_chroma);
+        let old_bd = self.sps.as_ref().map(bit_depths);
+        if old_bd.is_some() && old_bd != Some(bit_depths(&sps)) {
             self.dpb.clear();
             self.current_picture = None;
         }

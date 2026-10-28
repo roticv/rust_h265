@@ -175,6 +175,8 @@ pub struct PictureState<P: Pixel> {
     pub width: u32,
     pub height: u32,
     pub bit_depth: u8,
+    /// Chroma sample bit depth (BitDepthC); may differ from luma.
+    pub bit_depth_c: u8,
     pub log2_min_cb_size: u8,
     pub log2_min_pu_size: u8,
     pub log2_ctb_size: u8,
@@ -361,6 +363,7 @@ impl<P: Pixel> PictureState<P> {
             width: w,
             height: h,
             bit_depth: sps.bit_depth_luma,
+            bit_depth_c: sps.bit_depth_chroma,
             log2_min_cb_size,
             log2_min_pu_size,
             log2_ctb_size,
@@ -3013,7 +3016,7 @@ fn decode_pcm_block<P: Pixel>(
                 for i in 0..cb_chroma_w {
                     let sample = reader.read_bits(pcm_bd_chroma);
                     plane[dst_off + j * stride + i] =
-                        P::from_i32_clamped((sample << chroma_shift) as i32, state.bit_depth);
+                        P::from_i32_clamped((sample << chroma_shift) as i32, state.bit_depth_c);
                 }
             }
         }
@@ -3931,7 +3934,7 @@ fn decode_chroma_residuals<P: Pixel>(
             dst_stride,
             &residual,
             log2_trafo_size_c,
-            state.bit_depth,
+            state.bit_depth_c,
         );
     }
     Ok(())
@@ -4292,7 +4295,7 @@ fn predict_intra_chroma<P: Pixel>(
                 x_c,
                 y_c,
                 log2_size,
-                state.bit_depth,
+                state.bit_depth_c,
                 avail,
                 cip.as_ref().map(|(t, l)| (t.as_slice(), l.as_slice())),
             )
@@ -4312,7 +4315,7 @@ fn predict_intra_chroma<P: Pixel>(
                 sps.strong_intra_smoothing_enabled_flag,
                 c_idx,
                 sps.chroma_format_idc,
-                state.bit_depth,
+                state.bit_depth_c,
             );
         }
 
@@ -4324,7 +4327,7 @@ fn predict_intra_chroma<P: Pixel>(
         let dst_offset = y_c * dst_stride + x_c;
         let dst = &mut plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
         match mode {
-            0 => predict_planar(dst, dst_stride, &top, &left, log2_size, state.bit_depth),
+            0 => predict_planar(dst, dst_stride, &top, &left, log2_size, state.bit_depth_c),
             1 => predict_dc(
                 dst,
                 dst_stride,
@@ -4332,7 +4335,7 @@ fn predict_intra_chroma<P: Pixel>(
                 &left,
                 log2_size,
                 false,
-                state.bit_depth,
+                state.bit_depth_c,
             ),
             2..=34 => predict_angular(
                 dst,
@@ -4342,7 +4345,7 @@ fn predict_intra_chroma<P: Pixel>(
                 log2_size,
                 mode,
                 c_idx,
-                state.bit_depth,
+                state.bit_depth_c,
             ),
             _ => {
                 return Err(DecodeError::Unsupported("invalid intra prediction mode"));

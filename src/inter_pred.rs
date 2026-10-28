@@ -799,9 +799,9 @@ pub fn motion_compensation_pu<P: Pixel>(
     let is_l1 = mvf.pred_flag & 2 != 0;
     let is_bi = is_l0 && is_l1;
 
+    // Luma and chroma may have different bit depths (BitDepthY, BitDepthC).
     let bit_depth = state.bit_depth;
-    let bi_shift = crate::pixel::bipred_shift(bit_depth) as i32;
-    let bi_offset = crate::pixel::bipred_offset(bit_depth);
+    let bit_depth_c = state.bit_depth_c;
 
     if is_bi {
         // Bi-prediction: compute L0 and L1 intermediates at i32 precision
@@ -860,7 +860,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 h_c,
                 mv_x_c,
                 mv_y_c,
-                bit_depth,
+                bit_depth_c,
                 &mut tmp[..],
                 &mut edge[..],
             );
@@ -877,7 +877,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 h_c,
                 mv_x_c,
                 mv_y_c,
-                bit_depth,
+                bit_depth_c,
                 &mut tmp[..],
                 &mut edge[..],
             );
@@ -928,7 +928,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 h_c,
                 mv_x_c,
                 mv_y_c,
-                bit_depth,
+                bit_depth_c,
                 &mut tmp[..],
                 &mut edge[..],
             );
@@ -945,7 +945,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 h_c,
                 mv_x_c,
                 mv_y_c,
-                bit_depth,
+                bit_depth_c,
                 &mut tmp[..],
                 &mut edge[..],
             );
@@ -956,9 +956,10 @@ pub fn motion_compensation_pu<P: Pixel>(
         // Explicit weighted bi-prediction (spec 8.5.3.3.4.3) uses per-list
         // weights and offsets for each plane; otherwise the default average.
         let wt = pred_weight_table;
-        let ofs = 1i32 << (bit_depth as i32 - 8);
-        let mc_sh = crate::pixel::mc_shift(bit_depth) as i32;
         let plane_weights = |c: usize| -> (i32, i32, i32, i32, i32) {
+            let bd = if c == 0 { bit_depth } else { bit_depth_c };
+            let ofs = 1i32 << (bd as i32 - 8);
+            let mc_sh = crate::pixel::mc_shift(bd) as i32;
             if c == 0 {
                 (
                     wt.luma_weight_l0[l0_idx] as i32,
@@ -979,6 +980,9 @@ pub fn motion_compensation_pu<P: Pixel>(
             }
         };
         let bi = |plane: &mut [P], c: usize, off, stride, a: &[i32], b: &[i32], w, h| {
+            let bit_depth = if c == 0 { bit_depth } else { bit_depth_c };
+            let bi_shift = crate::pixel::bipred_shift(bit_depth) as i32;
+            let bi_offset = crate::pixel::bipred_offset(bit_depth);
             if weighted_pred_flag {
                 let (w0, w1, o0, o1, log2wd) = plane_weights(c);
                 let round = (o0 + o1 + 1) << log2wd;
@@ -1095,7 +1099,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 h_c,
                 mv_x_c,
                 mv_y_c,
-                bit_depth,
+                bit_depth_c,
                 &mut tmp[..],
                 &mut edge[..],
             );
@@ -1112,7 +1116,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 h_c,
                 mv_x_c,
                 mv_y_c,
-                bit_depth,
+                bit_depth_c,
                 &mut tmp[..],
                 &mut edge[..],
             );
@@ -1123,6 +1127,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             // Offsets are coded at 8-bit precision and scaled by
             // 1 << (BitDepth - 8) (spec 7.4.7.3, high_precision_offsets off).
             let ofs = 1i32 << (bit_depth as i32 - 8);
+            let ofs_c = 1i32 << (bit_depth_c as i32 - 8);
             let (luma_w, luma_o, chroma_w, chroma_o, luma_denom, chroma_denom) = if use_l0 {
                 (
                     wt.luma_weight_l0[ref_idx] as i32,
@@ -1190,7 +1195,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             let ref_uv_stride = ref_list.uv_stride;
             let mv_x_c = chroma_mv(mv.x, csw);
             let mv_y_c = chroma_mv(mv.y, csh);
-            let c_shift = mc_sh + chroma_denom as i32;
+            let c_shift = crate::pixel::mc_shift(bit_depth_c) as i32 + chroma_denom as i32;
             let c_round = if c_shift > 0 {
                 1i32 << (c_shift - 1)
             } else {
@@ -1212,7 +1217,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 h_c,
                 mv_x_c,
                 mv_y_c,
-                bit_depth,
+                bit_depth_c,
                 &mut tmp[..],
                 &mut edge[..],
             );
@@ -1229,7 +1234,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 h_c,
                 mv_x_c,
                 mv_y_c,
-                bit_depth,
+                bit_depth_c,
                 &mut tmp[..],
                 &mut edge[..],
             );
@@ -1248,9 +1253,9 @@ pub fn motion_compensation_pu<P: Pixel>(
                         chroma_w[c] as i32,
                         c_round,
                         c_shift,
-                        chroma_o[c] as i32 * ofs,
+                        chroma_o[c] as i32 * ofs_c,
                     ),
-                    bit_depth,
+                    bit_depth_c,
                 );
             }
         }

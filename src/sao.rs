@@ -169,7 +169,13 @@ pub fn decode_sao_param<P: Pixel>(
 
             let mut offset_abs = [0u32; 4];
             for v in offset_abs.iter_mut() {
-                *v = decode_sao_offset_abs(cabac, sps.bit_depth_luma);
+                // cMax = (1 << (Min(bitDepth, 10) - 5)) - 1 for this component.
+                let bd = if c_idx == 0 {
+                    sps.bit_depth_luma
+                } else {
+                    sps.bit_depth_chroma
+                };
+                *v = decode_sao_offset_abs(cabac, bd);
             }
 
             if sao.type_idx[c_idx] == SaoType::Band {
