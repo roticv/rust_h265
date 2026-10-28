@@ -250,6 +250,9 @@ pub struct PictureState<P: Pixel> {
     /// Luma residual of the current transform unit after the inverse
     /// transform, kept for cross-component prediction (spec 8.6.6).
     pub ccp_luma_residual: Vec<i16>,
+    /// Coefficient / residual buffer lent to each transform block in turn,
+    /// so residual decoding does not allocate per block.
+    pub coeff_buf: Vec<i16>,
 
     /// Phase 2c-3 sentinel — most recently decoded luma residual block.
     pub last_luma_residual: Option<ResidualBlock>,
@@ -482,6 +485,7 @@ impl<P: Pixel> PictureState<P> {
             first_qp_group: false,
             cu_origin: (0, 0),
             ccp_luma_residual: reuse!(ccp_luma_residual).unwrap_or_default(),
+            coeff_buf: reuse!(coeff_buf).unwrap_or_default(),
             last_luma_residual: None,
             tab_qp_y: refill(reuse!(tab_qp_y), min_cb_width * min_cb_height, 0i8),
             bs_vertical: refill(
@@ -3590,7 +3594,7 @@ fn decode_transform_unit<P: Pixel>(
             } else {
                 ScanOrder::Diag
             };
-            let block = decode_residual_coding(
+            let mut block = decode_residual_coding(
                 cabac,
                 contexts,
                 sps,
@@ -3602,17 +3606,23 @@ fn decode_transform_unit<P: Pixel>(
                 is_intra,
                 luma_mode,
                 cu_transquant_bypass,
+                std::mem::take(&mut state.coeff_buf),
             )?;
+            // Tests inspect the dequantized coefficients of the last block.
+            #[cfg(test)]
+            {
+                state.last_luma_residual = Some(block.clone());
+            }
             apply_residual_to_luma(
                 state,
                 x0,
                 y0,
                 log2_trafo_size,
-                &block,
+                &mut block,
                 is_intra,
                 pps.cross_component_prediction_enabled_flag,
             );
-            state.last_luma_residual = Some(block);
+            state.coeff_buf = block.coeffs;
         }
 
         // ---- Step 4: chroma prediction + (optional) residual.
@@ -4075,6 +4085,7 @@ fn decode_chroma_residuals<P: Pixel>(
                 is_intra,
                 state.last_chroma_pred_mode,
                 cu_transquant_bypass,
+                std::mem::take(&mut state.coeff_buf),
             )?;
             // Apply inverse transform + add to chroma plane.
             if let Some(wide) = &block.coeffs_wide {
@@ -4100,7 +4111,10 @@ fn decode_chroma_residuals<P: Pixel>(
                 residual
             }
         } else {
-            vec![0i16; size_c * size_c]
+            let mut zeros = std::mem::take(&mut state.coeff_buf);
+            zeros.clear();
+            zeros.resize(size_c * size_c, 0);
+            zeros
         };
         // Cross-component prediction (spec 8.6.6): add the scaled luma
         // residual. Only in 4:4:4, where the blocks are the same size.
@@ -4126,6 +4140,7 @@ fn decode_chroma_residuals<P: Pixel>(
             log2_trafo_size_c,
             state.bit_depth_c,
         );
+        state.coeff_buf = residual;
     }
     Ok(())
 }
@@ -4577,7 +4592,7 @@ fn apply_residual_to_luma<P: Pixel>(
     x0: u32,
     y0: u32,
     log2_size: u8,
-    block: &ResidualBlock,
+    block: &mut ResidualBlock,
     is_intra: bool,
     keep_for_ccp: bool,
 ) {
@@ -4606,7 +4621,8 @@ fn apply_residual_to_luma<P: Pixel>(
         }
         return;
     }
-    let mut residual_pixels = block.coeffs.clone();
+    // The inverse transform runs in place on the block's buffer.
+    let residual_pixels = &mut block.coeffs;
     // Spec 8.6.4.2: 4×4 DST is only used for INTRA luma. Inter 4×4 uses
     // regular DCT. Previously this flag was `log2_size == 2`, which silently
     // miscompiled inter 4×4 luma TUs (only reachable with
@@ -4614,7 +4630,7 @@ fn apply_residual_to_luma<P: Pixel>(
     if !block.transform_skip && !block.cu_transquant_bypass {
         let is_luma_intra_4x4 = log2_size == 2 && is_intra;
         apply_inverse_transform(
-            &mut residual_pixels,
+            residual_pixels,
             log2_size,
             block.last_sig_x,
             block.last_sig_y,
@@ -4627,15 +4643,11 @@ fn apply_residual_to_luma<P: Pixel>(
     let dst_stride = state.y_stride;
     let dst_offset = (y0 as usize) * dst_stride + (x0 as usize);
     let dst = &mut state.y_plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
-    add_residual(
-        dst,
-        dst_stride,
-        &residual_pixels,
-        log2_size,
-        state.bit_depth,
-    );
+    add_residual(dst, dst_stride, residual_pixels, log2_size, state.bit_depth);
     if keep_for_ccp {
-        state.ccp_luma_residual = residual_pixels;
+        // Copy into the persistent buffer, which keeps its allocation.
+        state.ccp_luma_residual.clear();
+        state.ccp_luma_residual.extend_from_slice(residual_pixels);
     }
 }
 

@@ -125,6 +125,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and motion field of a picture that left the DPB, instead of allocating
   and zero-filling them. About 1-2% fewer cycles; with the changes above,
   the 1080p fixtures now take 1-3% fewer cycles than 0.2.0.
+- Residual decoding no longer allocates a coefficient block for every
+  transform block, and the luma inverse transform runs in place instead
+  of on a clone: one buffer is lent to each block in turn. About 1% fewer
+  instructions and cycles.
 
 ## [0.2.0] - 2026-10-28
 

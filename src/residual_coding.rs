@@ -425,6 +425,7 @@ const SIG_CTX_IDX_MAP: [u8; 5 * 16] = [
 /// coefficients (in raster order), the size of the block, and the position
 /// of the last significant coefficient (used by Phase 2c-4 to limit IDCT
 /// scan).
+#[derive(Clone)]
 pub struct ResidualBlock {
     pub coeffs: Vec<i16>,
     pub log2_size: u8,
@@ -492,6 +493,7 @@ pub fn decode_residual_coding(
     is_intra: bool,
     intra_mode: u8,
     cu_transquant_bypass: bool,
+    buffer: Vec<i16>,
 ) -> Result<ResidualBlock, DecodeError> {
     let rext = &sps.range;
     // Decode transform_skip_flag (HEVC spec 7.3.8.11 / 9.3.4.2.5), allowed
@@ -543,7 +545,11 @@ pub fn decode_residual_coding(
 
     let trafo_size = 1usize << log2_trafo_size;
     let c_idx = plane.c_idx();
-    let mut coeffs = vec![0i16; trafo_size * trafo_size];
+    // `buffer` is a recycled allocation (any contents): reuse it instead of
+    // allocating a coefficient block per transform block.
+    let mut coeffs = buffer;
+    coeffs.clear();
+    coeffs.resize(trafo_size * trafo_size, 0);
 
     // ---- Last significant coefficient position ----
     let (last_x_prefix, last_y_prefix) =
