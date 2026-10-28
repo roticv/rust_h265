@@ -265,6 +265,10 @@ impl Default for DecodeLimits {
     }
 }
 
+/// Picture geometry that determines the min-TB Z-scan table: width,
+/// height, log2 CTB size, log2 min TB size.
+type ZscanKey = (u32, u32, u8, u8);
+
 #[derive(Default)]
 pub struct Decoder {
     limits: DecodeLimits,
@@ -316,6 +320,11 @@ pub struct Decoder {
     /// Phase 3d-2: RefPicList1 for the current B slice. Empty for P and I
     /// slices. Consumed by Phase 3d-5 AMVP.
     current_ref_list_l1: Vec<Rc<DecodedPicture>>,
+
+    /// Min-TB Z-scan table shared by every picture with the same geometry,
+    /// keyed by (width, height, log2 CTB size, log2 min TB size). Building
+    /// it per picture was a measurable share of decode time.
+    zscan_cache: Option<(ZscanKey, Rc<Vec<i32>>)>,
 }
 
 /// Crop a decoded picture's planes to the conformance window and build a Frame.
@@ -828,8 +837,22 @@ impl Decoder {
             // Populate `tab_tile_id` on the fresh picture state so intra
             // availability checks can see it. Create the right pixel type
             // based on the SPS bit depth.
+            let zscan_key = (
+                sps.pic_width_in_luma_samples,
+                sps.pic_height_in_luma_samples,
+                sps.ctb_log2_size_y,
+                sps.min_tb_log2_size_y,
+            );
+            let zscan = match &self.zscan_cache {
+                Some((key, tab)) if *key == zscan_key => Rc::clone(tab),
+                _ => {
+                    let tab = Rc::new(crate::cu_tree::build_min_tb_addr_zs(sps));
+                    self.zscan_cache = Some((zscan_key, Rc::clone(&tab)));
+                    tab
+                }
+            };
             let ps_enum = if sps.bit_depth_luma > 8 {
-                let mut ps = PictureState::<u16>::new(sps);
+                let mut ps = PictureState::<u16>::new_with_zscan(sps, zscan);
                 let n = ps.tab_tile_id.len();
                 ps.tab_tile_id.copy_from_slice(&tile_tables.tile_id[..n]);
                 ps.qpy_pred = sh.slice_qp_y;
@@ -837,7 +860,7 @@ impl Decoder {
                 ps.first_qp_group = !sh.dependent_slice_segment_flag;
                 PictureStateEnum::U16(ps)
             } else {
-                let mut ps = PictureState::<u8>::new(sps);
+                let mut ps = PictureState::<u8>::new_with_zscan(sps, zscan);
                 let n = ps.tab_tile_id.len();
                 ps.tab_tile_id.copy_from_slice(&tile_tables.tile_id[..n]);
                 // QP-prediction state (spec 8.6.1 / FFmpeg hevcdec.c:3066-3069):

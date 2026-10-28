@@ -273,7 +273,9 @@ pub struct PictureState<P: Pixel> {
     /// picture. Used to determine whether bottom-left / upper-right reference
     /// samples are available (decoded before the current block in Z-scan order).
     /// Matches FFmpeg's `pps->min_tb_addr_zs`.
-    pub min_tb_addr_zs: Vec<i32>,
+    /// Shared between pictures: it depends only on the SPS geometry, so the
+    /// decoder builds it once (see `build_min_tb_addr_zs`).
+    pub min_tb_addr_zs: std::rc::Rc<Vec<i32>>,
     /// Stride (width in min-TB units + 1 for the -1 sentinel column) of the
     /// Z-scan table.
     pub min_tb_addr_zs_stride: usize,
@@ -287,6 +289,12 @@ pub struct PictureState<P: Pixel> {
 
 impl<P: Pixel> PictureState<P> {
     pub fn new(sps: &Sps) -> Self {
+        Self::new_with_zscan(sps, std::rc::Rc::new(build_min_tb_addr_zs(sps)))
+    }
+
+    /// Like `new`, reusing a Z-scan table previously built by
+    /// `build_min_tb_addr_zs` for an SPS with the same picture geometry.
+    pub fn new_with_zscan(sps: &Sps, zscan: std::rc::Rc<Vec<i32>>) -> Self {
         let log2_min_cb_size = sps.min_cb_log2_size_y;
         // HEVC base profile pins min PU size to 4×4 (spec 7.4.3.2.1).
         let log2_min_pu_size = 2u8;
@@ -392,51 +400,7 @@ impl<P: Pixel> PictureState<P> {
             },
             tab_mvf: vec![MvField::default(); min_pu_width * min_pu_height],
             tab_skip_flag: vec![0u8; min_cb_width * min_cb_height],
-            min_tb_addr_zs: {
-                // Build Z-scan order table (HEVC spec 6.5.1, FFmpeg min_tb_addr_zs).
-                // tb_mask = number of min-TBs per CTB side - 1
-                let log2_diff = log2_ctb_size.saturating_sub(sps.min_tb_log2_size_y) as u32;
-                let tb_per_ctb = 1u32 << log2_diff; // min-TBs per CTB side
-                let tb_mask = tb_per_ctb - 1;
-                let ctb_size = 1u32 << log2_ctb_size;
-                let pic_w_in_ctbs = w.div_ceil(ctb_size);
-                let pic_h_in_ctbs = h.div_ceil(ctb_size);
-                let pic_w_in_tbs = pic_w_in_ctbs * tb_per_ctb;
-                let pic_h_in_tbs = pic_h_in_ctbs * tb_per_ctb;
-                // Table stride includes a -1 sentinel column at index -1,
-                // represented as column 0 in the raw array. Accessible range:
-                // y in -1..pic_h_in_tbs, x in -1..pic_w_in_tbs.
-                let stride = (pic_w_in_tbs + 1) as usize;
-                let rows = (pic_h_in_tbs + 1) as usize;
-                let mut tab = vec![-1i32; stride * rows];
-                // Fill the table (skip sentinel row 0 and column 0).
-                for y in 0..pic_h_in_tbs {
-                    for x in 0..pic_w_in_tbs {
-                        let tb_x = x >> log2_diff; // CTB column
-                        let tb_y = y >> log2_diff; // CTB row
-                        let rs = pic_w_in_ctbs * tb_y + tb_x;
-                        // For single-tile: ts = rs. For tiles: use
-                        // ctb_addr_rs_to_ts. We'll use rs directly (tiles
-                        // are handled via tab_tile_id checks elsewhere).
-                        let mut val = (rs << (log2_diff * 2)) as i32;
-                        // Z-order interleave of within-CTB coordinates.
-                        let lx = x & tb_mask;
-                        let ly = y & tb_mask;
-                        for i in 0..log2_diff {
-                            let m = 1u32 << i;
-                            if lx & m != 0 {
-                                val += (m * m) as i32;
-                            }
-                            if ly & m != 0 {
-                                val += (2 * m * m) as i32;
-                            }
-                        }
-                        // +1 offset for the sentinel row/column.
-                        tab[(y as usize + 1) * stride + (x as usize + 1)] = val;
-                    }
-                }
-                tab
-            },
+            min_tb_addr_zs: zscan,
             min_tb_addr_zs_stride: {
                 let log2_diff = log2_ctb_size.saturating_sub(sps.min_tb_log2_size_y) as u32;
                 let tb_per_ctb = 1u32 << log2_diff;
@@ -497,6 +461,59 @@ impl<P: Pixel> PictureState<P> {
             self.log2_ctb_size,
         )
     }
+}
+
+/// Build the min-TB Z-scan order table (HEVC spec 6.5.1, FFmpeg
+/// `pps->min_tb_addr_zs`) for an SPS. It depends only on the picture size,
+/// CTB size and min TB size, so callers decoding many pictures should build
+/// it once and share it.
+pub fn build_min_tb_addr_zs(sps: &Sps) -> Vec<i32> {
+    let log2_ctb_size = sps.ctb_log2_size_y;
+    let w = sps.pic_width_in_luma_samples;
+    let h = sps.pic_height_in_luma_samples;
+    // Build Z-scan order table (HEVC spec 6.5.1, FFmpeg min_tb_addr_zs).
+    // tb_mask = number of min-TBs per CTB side - 1
+    let log2_diff = log2_ctb_size.saturating_sub(sps.min_tb_log2_size_y) as u32;
+    let tb_per_ctb = 1u32 << log2_diff; // min-TBs per CTB side
+    let tb_mask = tb_per_ctb - 1;
+    let ctb_size = 1u32 << log2_ctb_size;
+    let pic_w_in_ctbs = w.div_ceil(ctb_size);
+    let pic_h_in_ctbs = h.div_ceil(ctb_size);
+    let pic_w_in_tbs = pic_w_in_ctbs * tb_per_ctb;
+    let pic_h_in_tbs = pic_h_in_ctbs * tb_per_ctb;
+    // Table stride includes a -1 sentinel column at index -1,
+    // represented as column 0 in the raw array. Accessible range:
+    // y in -1..pic_h_in_tbs, x in -1..pic_w_in_tbs.
+    let stride = (pic_w_in_tbs + 1) as usize;
+    let rows = (pic_h_in_tbs + 1) as usize;
+    let mut tab = vec![-1i32; stride * rows];
+    // Fill the table (skip sentinel row 0 and column 0).
+    for y in 0..pic_h_in_tbs {
+        for x in 0..pic_w_in_tbs {
+            let tb_x = x >> log2_diff; // CTB column
+            let tb_y = y >> log2_diff; // CTB row
+            let rs = pic_w_in_ctbs * tb_y + tb_x;
+            // For single-tile: ts = rs. For tiles: use
+            // ctb_addr_rs_to_ts. We'll use rs directly (tiles
+            // are handled via tab_tile_id checks elsewhere).
+            let mut val = (rs << (log2_diff * 2)) as i32;
+            // Z-order interleave of within-CTB coordinates.
+            let lx = x & tb_mask;
+            let ly = y & tb_mask;
+            for i in 0..log2_diff {
+                let m = 1u32 << i;
+                if lx & m != 0 {
+                    val += (m * m) as i32;
+                }
+                if ly & m != 0 {
+                    val += (2 * m * m) as i32;
+                }
+            }
+            // +1 offset for the sentinel row/column.
+            tab[(y as usize + 1) * stride + (x as usize + 1)] = val;
+        }
+    }
+    tab
 }
 
 /// Recursive coding tree decode (HEVC spec 7.3.8.4).
