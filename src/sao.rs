@@ -251,11 +251,15 @@ fn cmp(a: i32, b: i32) -> i32 {
 }
 
 /// Edge offset filter: per-pixel category (1..4) drives the offset.
-/// Pixels at the picture borders (or slice/tile boundaries when
-/// `no_cross_left/right/top/bottom` restrict the accessible area) along
-/// the EO direction are skipped.
+///
+/// `avail[1 + dy][1 + dx]` says whether samples of the CTB at offset
+/// `(dx, dy)` from this one may be used as neighbours: false outside the
+/// picture and across a slice or tile boundary that must not be filtered
+/// across (spec 8.7.3.2). A sample whose neighbour along the EO direction is
+/// unavailable is left unchanged. The check is per sample, so a CTB corner
+/// sample uses the diagonal CTB's availability, not that of the CTB above,
+/// below or beside it.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::needless_range_loop)]
 fn sao_edge_filter<P: Pixel>(
     dst: &mut [P],
     src: &[P],
@@ -267,74 +271,57 @@ fn sao_edge_filter<P: Pixel>(
     height: usize,
     x0: usize,
     y0: usize,
-    pic_w: usize,
-    pic_h: usize,
-    no_cross_left: bool,
-    no_cross_right: bool,
-    no_cross_top: bool,
-    no_cross_bottom: bool,
+    avail: &[[bool; 3]; 3],
     bit_depth: u8,
 ) {
     // edge_idx maps (1 + cmp(a) + cmp(b)) → category.
     // FFmpeg uses { 1, 2, 0, 3, 4 } indexed by [2 + diff0 + diff1].
     static EDGE_IDX: [usize; 5] = [1, 2, 0, 3, 4];
     // Direction offsets for the two neighbors (a and b).
-    let (a_dx, a_dy, b_dx, b_dy): (i32, i32, i32, i32) = match eo {
+    let (a_dx, a_dy, b_dx, b_dy): (isize, isize, isize, isize) = match eo {
         SAO_EO_HORIZ => (-1, 0, 1, 0),
         SAO_EO_VERT => (0, -1, 0, 1),
         SAO_EO_135D => (-1, -1, 1, 1),
         SAO_EO_45D => (1, -1, -1, 1),
-        _ => (0, 0, 0, 0),
+        _ => return,
+    };
+    let (w, h) = (width as isize, height as isize);
+    // Which neighbouring CTB a CTB-relative coordinate falls in.
+    let region = |v: isize, n: isize| -> usize {
+        if v < 0 {
+            0
+        } else if v >= n {
+            2
+        } else {
+            1
+        }
+    };
+    let neighbour_ok = |x: isize, y: isize, dx: isize, dy: isize| -> bool {
+        avail[region(y + dy, h)][region(x + dx, w)]
+    };
+    let a_off = a_dy * stride_src as isize + a_dx;
+    let b_off = b_dy * stride_src as isize + b_dx;
+
+    let mut filter = |x: usize, y: usize| {
+        let si = (y0 + y) * stride_src + x0 + x;
+        let cur = src[si].to_i32();
+        let a = src[(si as isize + a_off) as usize].to_i32();
+        let b = src[(si as isize + b_off) as usize].to_i32();
+        let cat = EDGE_IDX[(2 + cmp(cur, a) + cmp(cur, b)) as usize];
+        dst[(y0 + y) * stride_dst + x0 + x] =
+            P::from_i32_clamped(cur + offset_val[cat] as i32, bit_depth);
     };
 
-    // Determine which rows/cols of the CTB to actually process — skip
-    // pixels whose neighbors would lie outside the picture or across a
-    // restricted slice/tile boundary.
-    let init_x = if a_dx == -1 || b_dx == -1 {
-        if x0 == 0 || no_cross_left { 1 } else { 0 }
-    } else {
-        0
-    };
-    let end_x = if a_dx == 1 || b_dx == 1 {
-        if x0 + width >= pic_w || no_cross_right {
-            width.saturating_sub(1)
-        } else {
-            width
-        }
-    } else {
-        width
-    };
-    let init_y = if a_dy == -1 || b_dy == -1 {
-        if y0 == 0 || no_cross_top { 1 } else { 0 }
-    } else {
-        0
-    };
-    let end_y = if a_dy == 1 || b_dy == 1 {
-        if y0 + height >= pic_h || no_cross_bottom {
-            height.saturating_sub(1)
-        } else {
-            height
-        }
-    } else {
-        height
-    };
-
-    for y in init_y..end_y {
-        for x in init_x..end_x {
-            let cur_x = x0 + x;
-            let cur_y = y0 + y;
-            let cur = src[cur_y * stride_src + cur_x].to_i32();
-            let a_x = (cur_x as i32 + a_dx) as usize;
-            let a_y = (cur_y as i32 + a_dy) as usize;
-            let b_x = (cur_x as i32 + b_dx) as usize;
-            let b_y = (cur_y as i32 + b_dy) as usize;
-            let a = src[a_y * stride_src + a_x].to_i32();
-            let b = src[b_y * stride_src + b_x].to_i32();
-            let diff0 = cmp(cur, a);
-            let diff1 = cmp(cur, b);
-            let cat = EDGE_IDX[(2 + diff0 + diff1) as usize];
-            let new_val = cur + offset_val[cat] as i32;
-            dst[cur_y * stride_dst + cur_x] = P::from_i32_clamped(new_val, bit_depth);
+    for y in 0..height {
+        let border_row = y == 0 || y + 1 == height;
+        for x in 0..width {
+            if border_row || x == 0 || x + 1 == width {
+                let (xi, yi) = (x as isize, y as isize);
+                if !neighbour_ok(xi, yi, a_dx, a_dy) || !neighbour_ok(xi, yi, b_dx, b_dy) {
+                    continue;
+                }
+            }
+            filter(x, y);
         }
     }
 }
@@ -385,14 +372,17 @@ pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &
             let ctb_rs = ry * pic_w_in_ctbs + rx;
             let sao = state.sao_params[ctb_rs].clone();
 
-            // Compute slice-boundary "no cross" flags for this CTB.
-            let no_cross_left = rx > 0 && sao_skip_slice_boundary(state, ctb_rs, ctb_rs - 1);
-            let no_cross_right =
-                rx + 1 < pic_w_in_ctbs && sao_skip_slice_boundary(state, ctb_rs, ctb_rs + 1);
-            let no_cross_top =
-                ry > 0 && sao_skip_slice_boundary(state, ctb_rs, ctb_rs - pic_w_in_ctbs);
-            let no_cross_bottom = ry + 1 < pic_h_in_ctbs
-                && sao_skip_slice_boundary(state, ctb_rs, ctb_rs + pic_w_in_ctbs);
+            // Which of the 8 neighbouring CTBs may supply EO neighbours.
+            let mut avail = [[false; 3]; 3];
+            for (dy, row) in avail.iter_mut().enumerate() {
+                for (dx, ok) in row.iter_mut().enumerate() {
+                    let (nx, ny) = ((rx + dx).wrapping_sub(1), (ry + dy).wrapping_sub(1));
+                    *ok = nx < pic_w_in_ctbs
+                        && ny < pic_h_in_ctbs
+                        && (nx == rx && ny == ry
+                            || !sao_skip_slice_boundary(state, ctb_rs, ny * pic_w_in_ctbs + nx));
+                }
+            }
 
             // Luma
             if sh.slice_sao_luma_flag && sao.type_idx[0] != SaoType::NotApplied {
@@ -426,12 +416,7 @@ pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &
                         h,
                         x0,
                         y0,
-                        pic_w,
-                        pic_h,
-                        no_cross_left,
-                        no_cross_right,
-                        no_cross_top,
-                        no_cross_bottom,
+                        &avail,
                         bit_depth_y,
                     ),
                     SaoType::NotApplied => {}
@@ -482,12 +467,7 @@ pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &
                             h_c,
                             x0_c,
                             y0_c,
-                            pic_w_c,
-                            pic_h_c,
-                            no_cross_left,
-                            no_cross_right,
-                            no_cross_top,
-                            no_cross_bottom,
+                            &avail,
                             bit_depth_c,
                         ),
                         SaoType::NotApplied => {}
