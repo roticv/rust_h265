@@ -2,18 +2,27 @@
 
 A pure Rust H.265 / HEVC video decoder.
 
-> **Status:** functional. Main and Main 10 profile HEVC (8-bit and 10-bit
-> 4:2:0) plus 4:4:4 (8-bit and 10-bit, as used by HEIF/HEIC still images)
-> decodes end-to-end with CTU 16/32/64, I/P/B slices (including
-> hierarchical B), WPP, tiles, dependent slice segments, SAO, deblocking,
-> AQ (`cu_qp_delta`), scaling lists, sign-data hiding, weighted prediction,
-> transform skip, transquant bypass, constrained intra prediction, and PCM.
-> Byte-exact against FFmpeg on every in-tree fixture plus
-> real 1080p Big Buck Bunny at x265 presets `ultrafast` / `medium` / `slow`
-> in both 8-bit and 10-bit. No threading or hand-written SIMD yet — ~2.5×
-> slower than single-threaded FFmpeg on 8-bit content, roughly at parity
-> on 10-bit; see
-> [`BENCHMARK.md`](BENCHMARK.md).
+> **Status:** complete for the Main and Main 10 profiles. Passes all 147
+> vectors of the JCT-VC HEVC_v1 conformance suite, and is byte-exact
+> against FFmpeg on every in-tree fixture and on real 1080p Big Buck Bunny
+> encodes (x265 `ultrafast` / `medium` / `slow`, 8-bit and 10-bit).
+>
+> - **Formats:** 4:2:0 and 4:4:4 (as used by HEIF/HEIC images), 8-bit and
+>   10-bit; 12-bit decodes but is lightly tested.
+> - **Tools:** CTU 16/32/64, I/P/B slices including hierarchical B and
+>   open-GOP CRA, WPP, tiles, dependent slice segments, SAO, deblocking,
+>   `cu_qp_delta`, scaling lists, sign-data hiding, weighted prediction,
+>   transform skip, transquant bypass, constrained intra prediction, PCM.
+> - **Output:** decoding order, or display order following the spec's output
+>   process (`Decoder::with_display_order`).
+> - **Robustness:** damaged or missing slices cost the affected pictures, not
+>   the rest of the stream. Fuzzed.
+> - **Not supported:** 4:2:2, monochrome, bit depths above 12, and the
+>   range-extension and screen-content coding tools. These streams are
+>   rejected with `DecodeError::Unsupported` rather than decoded wrongly.
+> - **Speed:** no threading or hand-written SIMD yet; about 2.5× slower than
+>   single-threaded FFmpeg on 8-bit content and roughly at parity on 10-bit.
+>   See [`BENCHMARK.md`](BENCHMARK.md).
 
 While working on `rust_media` it became clear that there isn't a sufficiently good open source software HEVC decoder that ships as a standalone library. FFmpeg has one, but it isn't split out. Most devices have hardware HEVC decoders, but a portable software fallback is still useful when you want one binary that runs anywhere.
 
@@ -170,6 +179,15 @@ in-tree fixtures are byte-exact against FFmpeg; tests that need >1 MB of
 reference output (e.g. 1080p) use a SHA-256 hash of the decoded planes. The
 `bench_realworld` example covers real 1080p Big Buck Bunny in both 8-bit
 and 10-bit and requires `ffmpeg` and `x265` on `$PATH`.
+
+### Conformance
+
+[`tools/conformance/`](tools/conformance/README.md) runs the official
+JCT-VC conformance bitstreams (using the suite definitions from
+[Fluster](https://github.com/fluendo/fluster)) and compares the MD5 of the
+decoded output with the expected value. JCT-VC HEVC_v1 passes 147 / 147.
+On JCT-VC-RExt only the plain 4:2:0 vectors pass; the rest use
+range-extension tools and are rejected as unsupported.
 
 ### Fuzzing
 

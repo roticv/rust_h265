@@ -4,11 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**Feature-complete for Main and Main 10 profile (8-bit and 10-bit 4:2:0),
-plus 4:4:4 (ChromaArrayType 3, 8-bit and 10-bit, intra and inter).** 4:2:2
-and monochrome are rejected at SPS parse. Byte-exact against FFmpeg on all
-in-tree fixtures plus 6 real-world Big Buck Bunny 1080p transcodes (8-bit and
-10-bit). No SIMD yet.
+**Complete for Main and Main 10 profile (8-bit and 10-bit 4:2:0), plus
+4:4:4 (ChromaArrayType 3, 8-bit and 10-bit, intra and inter).** JCT-VC
+HEVC_v1 conformance: 147 / 147 (`tools/conformance/`). Byte-exact against
+FFmpeg on all in-tree fixtures plus 6 real-world Big Buck Bunny 1080p
+transcodes (8-bit and 10-bit). 12-bit decodes but is lightly tested (one
+RExt vector). Rejected with `DecodeError::Unsupported` rather than decoded
+wrongly: 4:2:2, monochrome, bit depth > 12, every range-extension coding
+tool and SCC. Display-order output (`with_display_order`) and recovery from
+damaged slices are in place. No threading or SIMD yet.
 
 ## Build Commands
 
