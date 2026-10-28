@@ -64,6 +64,10 @@ pub trait Pixel: Copy + Clone + Default + Send + Sync + Sized + 'static {
     /// Create a zero value.
     fn zero() -> Self;
 
+    /// Storage width of the sample type in bits (8 for `u8`, 16 for `u16`).
+    /// Lets hot loops pick a narrower accumulator at compile time.
+    const BITS: u32;
+
     /// Extract a typed slice from a `PixelData` enum.
     ///
     /// Returns the inner `&[Self]` if the variant matches `Self`, panics otherwise.
@@ -79,6 +83,8 @@ pub trait Pixel: Copy + Clone + Default + Send + Sync + Sized + 'static {
 }
 
 impl Pixel for u8 {
+    const BITS: u32 = 8;
+
     #[inline(always)]
     fn from_i32_clamped(val: i32, _bit_depth: u8) -> Self {
         val.clamp(0, 255) as u8
@@ -117,6 +123,8 @@ impl Pixel for u8 {
 }
 
 impl Pixel for u16 {
+    const BITS: u32 = 16;
+
     #[inline(always)]
     fn from_i32_clamped(val: i32, bit_depth: u8) -> Self {
         let max = (1i32 << bit_depth) - 1;

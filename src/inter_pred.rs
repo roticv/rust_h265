@@ -308,23 +308,60 @@ fn interp_block<P: Pixel, const N: usize>(
     }
 }
 
+/// Largest `Σ |coefficient|` over all luma and chroma sub-pel filters
+/// (the half-sample luma filter: 1+4+11+40+40+11+4+1). With 8-bit samples
+/// one filter pass is bounded by 112 × 255 = 28,560, so it fits in i16.
+const MAX_FILTER_ABS_SUM: i32 = 112;
+const _: () = assert!(MAX_FILTER_ABS_SUM * 255 <= i16::MAX as i32);
+
+/// N-tap filter of one row of pixels: `out[i] = (Σ f[k] * src(k)[i]) >> shift`,
+/// where `src(k)` is the `w`-sample row slice for tap `k`. 8-bit samples
+/// accumulate in i16 (exact, see `MAX_FILTER_ABS_SUM`), which doubles the
+/// SIMD lanes per instruction; 16-bit samples accumulate in i32.
+#[inline(always)]
+fn filter_px<'a, P: Pixel, const N: usize>(
+    out: &mut [i32],
+    f: &[i16; N],
+    shift: u32,
+    src: impl Fn(usize) -> &'a [P],
+) {
+    let w = out.len();
+    if P::BITS == 8 {
+        let mut acc_buf = [0i16; MAX_PB_SIZE];
+        let acc = &mut acc_buf[..w];
+        for (a, &p) in acc.iter_mut().zip(&src(0)[..w]) {
+            *a = f[0] * p.to_i32() as i16;
+        }
+        for (k, &c) in f.iter().enumerate().skip(1) {
+            for (a, &p) in acc.iter_mut().zip(&src(k)[..w]) {
+                *a += c * p.to_i32() as i16;
+            }
+        }
+        for (o, &a) in out.iter_mut().zip(acc.iter()) {
+            *o = (a as i32) >> shift;
+        }
+    } else {
+        let c0 = f[0] as i32;
+        for (o, &p) in out.iter_mut().zip(&src(0)[..w]) {
+            *o = c0 * p.to_i32();
+        }
+        for (k, &c) in f.iter().enumerate().skip(1) {
+            let c = c as i32;
+            for (o, &p) in out.iter_mut().zip(&src(k)[..w]) {
+                *o += c * p.to_i32();
+            }
+        }
+        for o in out.iter_mut() {
+            *o >>= shift;
+        }
+    }
+}
+
 /// Horizontal N-tap filter of one row: `out[i] = (Σ f[k] * src[i + k]) >> shift`.
 #[inline(always)]
 fn filter_h<P: Pixel, const N: usize>(out: &mut [i32], src: &[P], f: &[i16; N], shift: u32) {
     let w = out.len();
-    let c0 = f[0] as i32;
-    for (o, &p) in out.iter_mut().zip(&src[..w]) {
-        *o = c0 * p.to_i32();
-    }
-    for (k, &c) in f.iter().enumerate().skip(1) {
-        let c = c as i32;
-        for (o, &p) in out.iter_mut().zip(&src[k..k + w]) {
-            *o += c * p.to_i32();
-        }
-    }
-    for o in out.iter_mut() {
-        *o >>= shift;
-    }
+    filter_px(out, f, shift, |k| &src[k..k + w]);
 }
 
 /// Vertical N-tap filter over pixel rows starting at `src[base]`:
@@ -339,19 +376,7 @@ fn filter_v_px<P: Pixel, const N: usize>(
     shift: u32,
 ) {
     let w = out.len();
-    let c0 = f[0] as i32;
-    for (o, &p) in out.iter_mut().zip(&src[base..][..w]) {
-        *o = c0 * p.to_i32();
-    }
-    for (k, &c) in f.iter().enumerate().skip(1) {
-        let c = c as i32;
-        for (o, &p) in out.iter_mut().zip(&src[base + k * stride..][..w]) {
-            *o += c * p.to_i32();
-        }
-    }
-    for o in out.iter_mut() {
-        *o >>= shift;
-    }
+    filter_px(out, f, shift, |k| &src[base + k * stride..][..w]);
 }
 
 /// Vertical N-tap filter over i32 intermediate rows (second pass of a 2-D
@@ -1211,6 +1236,20 @@ pub fn motion_compensation_cu<P: Pixel>(
 
 #[cfg(test)]
 mod tests {
+    /// The i16 accumulation in `filter_px` is only exact if no filter's
+    /// coefficient magnitudes sum to more than `MAX_FILTER_ABS_SUM`.
+    #[test]
+    fn filter_abs_sum_fits_i16_bound() {
+        let abs_sum = |f: &[i16]| f.iter().map(|&c| (c as i32).abs()).sum::<i32>();
+        let max = QPEL_FILTER
+            .iter()
+            .map(|f| abs_sum(f))
+            .chain(EPEL_FILTER.iter().map(|f| abs_sum(f)))
+            .max()
+            .unwrap();
+        assert_eq!(max, MAX_FILTER_ABS_SUM);
+    }
+
     use super::*;
 
     /// Integer-pel copy should reproduce the reference exactly.
