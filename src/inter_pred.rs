@@ -516,6 +516,28 @@ impl<P: Pixel> RowSink for PixelSink<'_, P> {
     }
 }
 
+/// Default bi-prediction (spec 8.5.3.3.4.2):
+/// `dst[i] = clip((a[i] + b[i] + offset) >> shift)`, in 16-bit lanes with
+/// saturating adds. Exact after the clip: `max << shift` is at most
+/// 255 << 7 = 32,640 (8-bit), 1023 << 5 (10-bit) or 4095 << 3 (12-bit),
+/// within i16, so a sum that saturates rounds to the same clipped sample as
+/// the true one. Twice the lanes per instruction of the i32 form.
+#[inline(always)]
+fn bi_average_row<P: Pixel>(
+    dst: &mut [P],
+    a: &[i16],
+    b: &[i16],
+    offset: i16,
+    shift: u32,
+    bit_depth: u8,
+) {
+    let max = ((1i32 << bit_depth) - 1) as i16;
+    for ((o, &x), &y) in dst.iter_mut().zip(a).zip(b) {
+        let v = x.saturating_add(y).saturating_add(offset) >> shift;
+        *o = P::from_i32_clamped(v.clamp(0, max) as i32, bit_depth);
+    }
+}
+
 /// Row stride of the padded edge buffer: a 64-wide block plus the 7-sample
 /// luma filter margin.
 pub(crate) const MC_EDGE_STRIDE: usize = MAX_PB_SIZE + 7;
@@ -1039,11 +1061,14 @@ pub fn motion_compensation_pu<P: Pixel>(
                 })
             } else {
                 put_rows(plane, off, stride, w, h, |d, j| {
-                    let (a, b) = (&a[j * w..][..w], &b[j * w..][..w]);
-                    for ((o, &x), &y) in d.iter_mut().zip(a).zip(b) {
-                        let (x, y) = (x as i32, y as i32);
-                        *o = P::from_i32_clamped((x + y + bi_offset) >> bi_shift, bit_depth);
-                    }
+                    bi_average_row(
+                        d,
+                        &a[j * w..][..w],
+                        &b[j * w..][..w],
+                        bi_offset as i16,
+                        bi_shift as u32,
+                        bit_depth,
+                    );
                 })
             }
         };
@@ -1400,6 +1425,29 @@ pub fn motion_compensation_cu<P: Pixel>(
 
 #[cfg(test)]
 mod tests {
+    /// The saturating i16 bi-prediction average equals the exact i32
+    /// formula after clipping, for every bit depth up to 12 and inputs
+    /// spanning (and beyond) the 14-bit intermediate range, including sums
+    /// that overflow i16.
+    #[test]
+    fn bi_average_row_matches_exact_formula() {
+        let samples: Vec<i16> = (-20000i32..=32767).step_by(97).map(|v| v as i16).collect();
+        for bd in [8u8, 10, 12] {
+            let shift = crate::pixel::bipred_shift(bd) as u32;
+            let offset = crate::pixel::bipred_offset(bd);
+            let max = (1i32 << bd) - 1;
+            for &x in samples.iter().step_by(7) {
+                let a = vec![x; samples.len()];
+                let mut out = vec![0u16; samples.len()];
+                super::bi_average_row(&mut out, &a, &samples, offset as i16, shift, bd);
+                for (i, &y) in samples.iter().enumerate() {
+                    let exact = ((x as i32 + y as i32 + offset) >> shift).clamp(0, max);
+                    assert_eq!(out[i] as i32, exact, "bd {bd} x {x} y {y}");
+                }
+            }
+        }
+    }
+
     /// The i16 accumulation in `filter_px` is only exact if no filter's
     /// coefficient magnitudes sum to more than `MAX_FILTER_ABS_SUM`.
     #[test]

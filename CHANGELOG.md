@@ -150,6 +150,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vectorised run whenever their neighbours are available, so a full CTB
   row has no scalar tail. 6-7% fewer cycles on SAO-heavy 8-bit content
   (x265 `medium` / `slow` fixtures), 3% on 10-bit.
+- The default bi-prediction average runs in 16-bit lanes with saturating
+  adds (exact after the clip, as FFmpeg's NEON code relies on too) instead
+  of 32-bit. About 1-2% fewer cycles on B-frame-heavy 8-bit content.
 
 ## [0.2.0] - 2026-10-28
 
