@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The published crate no longer includes the test fixtures (`testdata/`),
+  the conformance tooling, CI configuration or `CLAUDE.md`: 256 KB
+  instead of 1.06 MB. The tests run from a repository checkout.
+
 ## [0.3.0] - 2026-10-29
 
 ### Added

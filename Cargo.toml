@@ -8,6 +8,9 @@ repository = "https://github.com/roticv/rust_h265"
 readme = "README.md"
 keywords = ["hevc", "h265", "video", "decoder", "codec"]
 categories = ["multimedia::video"]
+# Test fixtures and development tooling stay in the repository: the
+# library needs none of them, and testdata is most of the package size.
+exclude = ["testdata/", "tools/", ".github/", "CLAUDE.md"]
 
 [dependencies]
 
