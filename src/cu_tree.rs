@@ -4107,6 +4107,7 @@ fn decode_chroma_residuals<P: Pixel>(
                         log2_trafo_size_c,
                         block.last_sig_x,
                         block.last_sig_y,
+                        (block.nz_cols, block.nz_rows),
                         sps.bit_depth_chroma as u32,
                         false, // chroma never uses DST
                     );
@@ -4637,6 +4638,7 @@ fn apply_residual_to_luma<P: Pixel>(
             log2_size,
             block.last_sig_x,
             block.last_sig_y,
+            (block.nz_cols, block.nz_rows),
             state.bit_depth as u32,
             is_luma_intra_4x4,
         );
@@ -5112,6 +5114,7 @@ mod tests {
             4,
             resid.last_sig_x,
             resid.last_sig_y,
+            (resid.nz_cols, resid.nz_rows),
             8,
             false,
         );

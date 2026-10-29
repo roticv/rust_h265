@@ -431,6 +431,12 @@ pub struct ResidualBlock {
     pub log2_size: u8,
     pub last_sig_x: u32,
     pub last_sig_y: u32,
+    /// Coefficients lie in the top-left `nz_cols` x `nz_rows` (multiples of
+    /// 4, from the coded coefficient groups); everything outside is zero.
+    /// `last_sig_x` / `last_sig_y` alone do not bound this: with horizontal
+    /// or vertical scans earlier coefficients can lie further out.
+    pub nz_cols: u8,
+    pub nz_rows: u8,
     /// When true, the inverse transform is bypassed — the dequantized
     /// coefficients ARE the spatial-domain residual (HEVC spec 8.6.4).
     pub transform_skip: bool,
@@ -677,6 +683,9 @@ pub fn decode_residual_coding(
     // 8×8 grid of CG flags. The largest TU is 32×32 → 8×8 sub-blocks.
     let mut significant_coeff_group_flag = [[false; 8]; 8];
     let mut greater1_ctx: u32 = 1;
+    // Bounding box of the coefficient groups that hold coefficients, in
+    // groups: lets the inverse transform skip all-zero rows and columns.
+    let (mut nz_cg_cols, mut nz_cg_rows) = (0u8, 0u8);
 
     // ---- Reverse scan from last sub-block to (0, 0) ----
     for i in (0..=num_last_subset).rev() {
@@ -807,6 +816,8 @@ pub fn decode_residual_coding(
         if n_end == 0 {
             continue;
         }
+        nz_cg_cols = nz_cg_cols.max(x_cg as u8 + 1);
+        nz_cg_rows = nz_cg_rows.max(y_cg as u8 + 1);
 
         // ---- Coefficient levels ----
         let mut ctx_set = if i > 0 && c_idx == 0 { 2u32 } else { 0 };
@@ -1053,6 +1064,8 @@ pub fn decode_residual_coding(
         log2_size: log2_trafo_size,
         last_sig_x,
         last_sig_y,
+        nz_cols: nz_cg_cols * 4,
+        nz_rows: nz_cg_rows * 4,
         transform_skip,
         cu_transquant_bypass,
         coeffs_wide: (wide && !transform_skip).then_some(coeffs_wide),

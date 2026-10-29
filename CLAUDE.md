@@ -52,7 +52,7 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 | `cu_tree.rs` | `PictureState<P>`, quad-tree CU/PU/TU decode, all CABAC syntax parsing, `SliceParams` |
 | `inter_pred.rs` | MC luma 7/8-tap, chroma 4-tap (generic `<P: Pixel>`, 4:2:0 and 4:4:4 geometry), bi-pred, weighted pred |
 | `intra_pred.rs` | Planar, DC, 33 angular modes, reference sample filtering (generic `<P: Pixel>`) |
-| `inverse_transform.rs` | 4×4 DST, 4/8/16/32 IDCT, DC fast path |
+| `inverse_transform.rs` | 4×4 DST, 4/8/16/32 IDCT, DC fast path; 8-32 use zero-skipping matrix kernels bounded by `ResidualBlock::nz_cols/nz_rows` |
 | `residual_coding.rs` | CABAC coefficient decode, dequantization (with `qp_bd_offset`), transform_skip |
 | `deblock.rs` | 8×8-grid deblocking, beta/tc scaling by `1 << (bit_depth - 8)` |
 | `sao.rs` | Band offset + edge offset, per-CTB SAO params, slice boundary handling |
@@ -71,6 +71,7 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 - **Bit-depth parameterization:** `pixel::mc_shift(bit_depth)` = `14 - bit_depth`, `pixel::bipred_shift(bit_depth)` = `15 - bit_depth`. Dequant uses `qp + 6*(bit_depth-8)`. Deblock scales beta/tc by `1 << (bit_depth-8)`.
 - **MC kernels are written for auto-vectorisation:** `inter_pred::filter_px` / `filter_v_i16` loop tap-major over fixed 8-lane chunks (`&[P; 8]` row windows, `[i16; 8]` / `[i32; 8]` accumulators) with a scalar tail for narrow chroma, which LLVM keeps in registers and turns into NEON/SSE. Do not reintroduce per-row accumulator arrays (`[0; MAX_PB_SIZE]` zero-filled per row), per-sample index closures or per-pixel bounds-checked writes: replacing the per-row arrays with chunks took 11-16% off total decode time. 8-bit first passes accumulate in i16 (bounded by `MAX_FILTER_ABS_SUM * 255`), deeper samples and the 2-D second pass in i32. Bi-prediction / weighted intermediates (`mc_luma_i16` / `mc_chroma_i16`, `McScratch`) are i16, as in HM and FFmpeg.
 - **Picture buffer pool:** `decoder::PicturePool` keeps the last finished `PictureState` (its tables are refilled with their initial values by `PictureState::new_recycled`) and the planes / motion field of pictures that leave the DPB. Recycled sample planes are *not* cleared: decoding writes every sample inside the picture and nothing reads the CTU-alignment padding. Do not add code that relies on zero-initialised planes; refill any new table in `new_recycled`.
+- **Inverse transform zero bounds:** `ResidualBlock::nz_cols` / `nz_rows` come from the coded coefficient groups, not `last_sig_x/y` (with horizontal / vertical scans earlier coefficients lie beyond the last one). The 8-32 point kernels (`impl_idct_skip!`) are even/odd matrix products, bit-identical to the butterflies (kept under `cfg(test)` as the reference for `skip_transforms_match_butterflies`).
 - **Reused MC scratch buffers:** `inter_pred::McScratch` (owned by `PictureState`, lent to each PU by `motion_compensation_cu`) holds the bi-pred / weighted intermediates and the separable-filter temporary, sized for 64×64 luma and 64×64 chroma (4:4:4). Do not reintroduce per-call zero-initialised stack arrays in the MC path: zero-filling ~100 KB per bi-predicted block cost 7-10% of total decode time on 1080p content.
 
 ## Testing Strategy

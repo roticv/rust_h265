@@ -210,9 +210,111 @@ macro_rules! impl_idct {
 }
 
 impl_idct!(idct_4x4, 4, tr_4);
+// The butterfly versions of the larger sizes are the reference for the
+// zero-skipping matrix versions below, which decoding uses.
+#[cfg(test)]
 impl_idct!(idct_8x8, 8, tr_8);
+#[cfg(test)]
 impl_idct!(idct_16x16, 16, tr_16);
+#[cfg(test)]
 impl_idct!(idct_32x32, 32, tr_32);
+
+// ---- Zero-skipping inverse DCT (8x8 to 32x32) -------------------------------
+
+/// The left half of the `N`-point inverse transform matrix:
+/// `m[k][i] = TRANSFORM[k * 32 / N][i]`, the weight of input `k` in output
+/// `i < N / 2`. Output `N - 1 - i` has the same weights for even `k` and
+/// negated ones for odd `k` (the DCT's even/odd symmetry, which the
+/// butterflies exploit too).
+const fn half_matrix<const N: usize, const H: usize>() -> [[i32; H]; N] {
+    let mut m = [[0i32; H]; N];
+    let mut k = 0;
+    while k < N {
+        let mut i = 0;
+        while i < H {
+            m[k][i] = TRANSFORM[k * (32 / N)][i] as i32;
+            i += 1;
+        }
+        k += 1;
+    }
+    m
+}
+
+const HALF_8: [[i32; 4]; 8] = half_matrix::<8, 4>();
+const HALF_16: [[i32; 8]; 16] = half_matrix::<16, 8>();
+const HALF_32: [[i32; 16]; 32] = half_matrix::<32, 16>();
+
+/// Two-pass inverse DCT as even/odd matrix products that skip the zero
+/// rows and columns outside the coded region (`nz_cols` x `nz_rows`), as
+/// FFmpeg's `col_limit` does. Bit-identical to the butterfly version: the
+/// 1-D transform is exact integer arithmetic either way, and the rounding
+/// and clipping points are the same.
+///
+/// Both passes run in fixed-width lanes LLVM vectorises: the column pass
+/// over 8 adjacent columns at a time (rows of the block are contiguous),
+/// the row pass over the `N / 2` outputs of each half of a row.
+macro_rules! impl_idct_skip {
+    ($fn_name:ident, $n:expr, $h:expr, $m:ident) => {
+        // Not inlined: three large kernels would bloat the dispatch.
+        #[inline(never)]
+        fn $fn_name(coeffs: &mut [i16], bit_depth: u32, nz_cols: usize, nz_rows: usize) {
+            const N: usize = $n;
+            const H: usize = $h;
+            const L: usize = 8;
+            let coeffs: &mut [i16; N * N] = (&mut coeffs[..N * N]).try_into().unwrap();
+            let (nz_cols, nz_rows) = (nz_cols.clamp(1, N), nz_rows.clamp(1, N));
+
+            // Pass 1: vertical. Columns at or past nz_cols are zero in and
+            // out, so only the chunks covering 0..nz_cols run.
+            for c0 in (0..nz_cols).step_by(L) {
+                let mut inp = [[0i32; L]; N];
+                for (k, row) in inp.iter_mut().enumerate().take(nz_rows) {
+                    for (l, v) in row.iter_mut().enumerate() {
+                        *v = coeffs[k * N + c0 + l] as i32;
+                    }
+                }
+                for i in 0..H {
+                    let (mut e, mut o) = ([0i32; L], [0i32; L]);
+                    for k in (0..nz_rows).step_by(2) {
+                        let (we, wo) = ($m[k][i], $m[k + 1][i]);
+                        let (re, ro) = (&inp[k], &inp[k + 1]);
+                        for l in 0..L {
+                            e[l] += we * re[l];
+                            o[l] += wo * ro[l];
+                        }
+                    }
+                    for l in 0..L {
+                        coeffs[i * N + c0 + l] = clip_i16((e[l] + o[l] + 64) >> 7);
+                        coeffs[(N - 1 - i) * N + c0 + l] = clip_i16((e[l] - o[l] + 64) >> 7);
+                    }
+                }
+            }
+
+            // Pass 2: horizontal, every row; inputs past nz_cols are zero.
+            let shift = 20u32.saturating_sub(bit_depth);
+            let add = 1i32 << (shift.max(1) - 1);
+            for row in coeffs.chunks_exact_mut(N) {
+                let (mut e, mut o) = ([0i32; H], [0i32; H]);
+                for k in (0..nz_cols).step_by(2) {
+                    let (ce, co) = (row[k] as i32, row[k + 1] as i32);
+                    let (me, mo) = (&$m[k], &$m[k + 1]);
+                    for j in 0..H {
+                        e[j] += me[j] * ce;
+                        o[j] += mo[j] * co;
+                    }
+                }
+                for j in 0..H {
+                    row[j] = clip_i16((e[j] + o[j] + add) >> shift);
+                    row[N - 1 - j] = clip_i16((e[j] - o[j] + add) >> shift);
+                }
+            }
+        }
+    };
+}
+
+impl_idct_skip!(idct_8x8_skip, 8, 4, HALF_8);
+impl_idct_skip!(idct_16x16_skip, 16, 8, HALF_16);
+impl_idct_skip!(idct_32x32_skip, 32, 16, HALF_32);
 
 // ---- DC-only fast path ------------------------------------------------------
 
@@ -348,11 +450,15 @@ pub fn inverse_transform_ext(
 ///
 /// `is_luma_intra_4x4` selects the 4×4 intra luma DST instead of the DCT
 /// (HEVC spec 8.6.4.2).
+///
+/// `(nz_cols, nz_rows)` bounds the non-zero coefficients (see
+/// `ResidualBlock::nz_cols`); the larger transforms skip what lies outside.
 pub fn apply_inverse_transform(
     coeffs: &mut [i16],
     log2_size: u8,
     last_sig_x: u32,
     last_sig_y: u32,
+    (nz_cols, nz_rows): (u8, u8),
     bit_depth: u32,
     is_luma_intra_4x4: bool,
 ) {
@@ -367,9 +473,9 @@ pub fn apply_inverse_transform(
     }
     match log2_size {
         2 => idct_4x4(coeffs, bit_depth),
-        3 => idct_8x8(coeffs, bit_depth),
-        4 => idct_16x16(coeffs, bit_depth),
-        5 => idct_32x32(coeffs, bit_depth),
+        3 => idct_8x8_skip(coeffs, bit_depth, nz_cols as usize, nz_rows as usize),
+        4 => idct_16x16_skip(coeffs, bit_depth, nz_cols as usize, nz_rows as usize),
+        5 => idct_32x32_skip(coeffs, bit_depth, nz_cols as usize, nz_rows as usize),
         _ => panic!("invalid log2_size for inverse transform: {log2_size}"),
     }
 }
@@ -377,6 +483,52 @@ pub fn apply_inverse_transform(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The zero-skipping matrix transforms match the butterflies exactly
+    /// for random coefficients confined to random coefficient-group
+    /// bounds, at every bit depth (including values that clip).
+    #[test]
+    fn skip_transforms_match_butterflies() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        type Reference = fn(&mut [i16], u32);
+        type Kernel = fn(&mut [i16], u32, usize, usize);
+        let cases: [(usize, Reference, Kernel); 3] = [
+            (8, idct_8x8, idct_8x8_skip),
+            (16, idct_16x16, idct_16x16_skip),
+            (32, idct_32x32, idct_32x32_skip),
+        ];
+        for (n, reference, skip) in cases {
+            for iter in 0..400 {
+                let cols = 4 * (1 + rnd() as usize % (n / 4));
+                let rows = 4 * (1 + rnd() as usize % (n / 4));
+                let mut block = vec![0i16; n * n];
+                for y in 0..rows {
+                    for x in 0..cols {
+                        if rnd() % 3 == 0 {
+                            // Mostly small levels, sometimes full range.
+                            block[y * n + x] = if iter % 4 == 0 {
+                                rnd() as i16
+                            } else {
+                                (rnd() % 512) as i16 - 256
+                            };
+                        }
+                    }
+                }
+                for bd in [8, 10, 12] {
+                    let (mut a, mut b) = (block.clone(), block.clone());
+                    reference(&mut a, bd);
+                    skip(&mut b, bd, cols, rows);
+                    assert_eq!(a, b, "{n}x{n} bounds {cols}x{rows} bit depth {bd}");
+                }
+            }
+        }
+    }
 
     /// Pure DC input → pure DC output.
     #[test]

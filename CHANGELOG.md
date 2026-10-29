@@ -153,6 +153,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The default bi-prediction average runs in 16-bit lanes with saturating
   adds (exact after the clip, as FFmpeg's NEON code relies on too) instead
   of 32-bit. About 1-2% fewer cycles on B-frame-heavy 8-bit content.
+- The 8x8, 16x16 and 32x32 inverse DCTs skip the all-zero rows and columns
+  outside the coded coefficient groups (like FFmpeg's `col_limit`) and run
+  as even/odd matrix products in fixed-width lanes that vectorise, instead
+  of one scalar butterfly per column and row. Inverse transform time fell
+  from about 9.6% to 2% of decode time: 14-18% fewer cycles on the x265
+  `safe` fixtures, 5-9% on `medium` / `slow`.
 
 ## [0.2.0] - 2026-10-28
 
