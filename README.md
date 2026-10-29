@@ -24,9 +24,9 @@ A pure Rust H.265 / HEVC video decoder.
 > - **Not supported:** 4:2:2, monochrome, bit depths above 12, and screen
 >   content coding. These streams are rejected with
 >   `DecodeError::Unsupported` rather than decoded wrongly.
-> - **Speed:** no threading or hand-written SIMD yet; about 2.5× slower than
->   single-threaded FFmpeg on 8-bit content and roughly at parity on 10-bit.
->   See [`BENCHMARK.md`](BENCHMARK.md).
+> - **Speed:** no threading or hand-written SIMD yet; about 1.5–1.6× slower
+>   than single-threaded FFmpeg on 8-bit content and 1.3–1.5× faster on
+>   10-bit. See [`BENCHMARK.md`](BENCHMARK.md).
 
 While working on `rust_media` it became clear that there isn't a sufficiently good open source software HEVC decoder that ships as a standalone library. FFmpeg has one, but it isn't split out. Most devices have hardware HEVC decoders, but a portable software fallback is still useful when you want one binary that runs anywhere.
 
@@ -36,7 +36,7 @@ A pure Rust H.264 decoder ([`rust_h264`](https://github.com/roticv/rust_h264)) a
 
 - **Input:** Both **Annex B** (start-code delimited, `.h265` raw files) and **HVCC** (length-prefixed, MP4/MKV containers) formats via `parse_annex_b()` and `parse_hvcc()`.
 - **Streaming:** `Decoder::decode_nal(&NalUnit) -> Result<Option<Frame>, DecodeError>` plus `flush()`. NAL units are fed incrementally. Frames come out in **decoding order** by default, or in **display order** with `Decoder::new().with_display_order()` and `next_output()` (see [frame ordering](#important-frame-ordering)).
-- **Performance:** The decoder aims to be fast, with FFmpeg's software HEVC decoder as the target benchmark. Current gap vs single-threaded FFmpeg: ~2.5× on 8-bit, roughly parity on 10-bit real 1080p content. Motion compensation is compiler-vectorised; there are no hand-written NEON / SSE kernels yet.
+- **Performance:** The decoder aims to be fast, with FFmpeg's software HEVC decoder as the target benchmark. Against single-threaded FFmpeg on real 1080p content: about 1.5–1.6× slower on 8-bit and 1.3–1.5× faster on 10-bit (see [`BENCHMARK.md`](BENCHMARK.md)). Motion compensation, SAO and the inverse transform are compiler-vectorised; there are no hand-written NEON / SSE kernels yet.
 - **Multi-bit-depth:** 8-bit and 10-bit (Main / Main 10 profile) via a generic `Pixel` trait. 12-bit decodes (the 12-bit range-extensions conformance vectors pass); deeper streams are rejected with `DecodeError::Unsupported`. Pixel planes are `PixelData::U8(Vec<u8>)` or `PixelData::U16(Vec<u16>)` — check `frame.bit_depth` to determine which.
 - **Chroma formats:** 4:2:0 and 4:4:4, intra and inter. Check `frame.chroma_format_idc` (1 = 4:2:0, 3 = 4:4:4) to size the `u`/`v` planes: half width and height for 4:2:0, full size for 4:4:4. 4:2:2 and monochrome streams are rejected with `DecodeError::Unsupported`.
 - **Range extensions:** all range-extension coding tools are implemented: cross-component prediction, implicit and explicit RDPCM, transform-skip rotation and contexts, transform skip up to 32×32, extended precision processing, persistent Rice adaptation, CABAC bypass alignment, chroma QP offset lists, SAO offset scaling, disabled intra smoothing and high-precision weighted-prediction offsets, plus WPP combined with tiles. Screen content coding is rejected with `DecodeError::Unsupported`.
