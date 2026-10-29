@@ -9,18 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `Decoder::with_threads(n)`: the loop filters (deblocking and SAO) run in
-  parallel over bands of picture rows. The output is identical for every
-  thread count (tested on every fixture and both conformance suites).
-  The rest of decoding is still sequential, so the gain is modest: 5-7%
-  more frames per second with 4 threads on the 1080p benchmark fixtures.
-  The default stays at 1 thread.
+- **Multithreaded decoding:** `Decoder::with_threads(n)` (default 1).
+  - Wavefront parallel processing: in streams coded with
+    `entropy_coding_sync_enabled_flag` (x265's default) the CTB rows of a
+    slice decode on separate threads, each row two CTBs behind the row
+    above. About 2.2-2.5x the single-threaded speed with 4 threads on the
+    1080p benchmark fixtures. Slices with tiles or chroma QP offset lists
+    decode sequentially.
+  - The loop filters (deblocking and SAO) run over bands of picture rows,
+    for every stream (5-7% with 4 threads on their own).
+  - The output is identical for every thread count, including for
+    damaged streams: tested on every fixture with 1-7 threads, on
+    corrupted WPP streams, and on both conformance suites.
 - `Decoder` is now `Send`: reference pictures are shared with `Arc` and
   atomic marking instead of `Rc` / `RefCell`.
 - `dump_frames` and `bench_decode` take `--threads N`.
 
 ### Changed
 
+- The crate has `unsafe` code for the first time, confined to one module
+  (`src/shared.rs`): wavefront decoding needs several threads writing
+  disjoint parts of the same picture tables, which safe Rust cannot
+  express. The module documents the rules that make it sound, and in test
+  builds every table access is checked against them.
 - The published crate no longer includes the test fixtures (`testdata/`),
   the conformance tooling, CI configuration or `CLAUDE.md`: 256 KB
   instead of 1.06 MB. The tests run from a repository checkout.

@@ -71,6 +71,14 @@
 //! for 4:2:0, where `u` and `v` have half the width and height, and 3 for
 //! 4:4:4, where they are full size.
 //!
+//! # Threads
+//!
+//! [`Decoder::with_threads`] decodes on several threads with output
+//! identical to single-threaded decoding. Streams coded with wavefront
+//! parallel processing (x265's default) decode their CTB rows in parallel;
+//! for others only the loop filters run in parallel. The default is one
+//! thread.
+//!
 //! # Resource limits
 //!
 //! [`Decoder::new`] rejects any SPS whose picture exceeds the Level 6.2
@@ -119,6 +127,7 @@ mod slice;
 mod sps;
 #[allow(dead_code)]
 mod vps;
+mod wavefront;
 
 // --- Internal but needs pub(crate) access from decoder ---
 #[allow(dead_code)]

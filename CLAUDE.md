@@ -14,7 +14,7 @@ reconstruction instead, since FFmpeg lacks bypass alignment and differs
 on lossless rotation / RDPCM. Rejected with `DecodeError::Unsupported`
 rather than decoded wrongly: 4:2:2, monochrome, bit depth > 12, SCC.
 Display-order output (`with_display_order`) and recovery from damaged
-slices are in place. Decoding is single-threaded apart from the loop filters (`with_threads`), no hand-written SIMD (MC, SAO and
+slices are in place. `with_threads(n)` decodes WPP streams' CTB rows in parallel (2.2-2.5x with 4 threads) and runs the loop filters in bands; no hand-written SIMD (MC, SAO and
 the inverse transform are compiler-vectorised): about 1.5-1.6x slower
 than single-threaded FFmpeg on 8-bit, 1.3-1.5x faster on 10-bit
 (`BENCHMARK.md`).
@@ -62,6 +62,8 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 | `deblock.rs` | 8×8-grid deblocking, beta/tc scaling by `1 << (bit_depth - 8)` |
 | `sao.rs` | Band offset + edge offset, per-CTB SAO params, slice boundary handling |
 | `parallel.rs` | Row-band splitting of the three planes and scoped-thread execution (`for_each_band`), used by the loop filters for `with_threads` |
+| `shared.rs` | The only `unsafe` module: `SharedTable` (picture planes / tables, owned or per-worker views with element/range access only), `RowProgress` (per-row progress, failure, condvar waiting), `AccessCheck` (test builds) |
+| `wavefront.rs` | WPP row-parallel slice decode (`decode_rows`), `decode_ctb` shared with the sequential loop, undo of rows below a failure |
 | `output.rs` | Display-order output process (spec C.5.2 bumping, NoOutputOfPriorPicsFlag), used by `with_display_order` |
 | `dpb.rs` | `DecodedPicture` (with `PixelData` planes), DPB, RPS, ref list construction |
 | `cabac.rs` | CABAC arithmetic engine (renorm, bypass, terminate) |
@@ -115,4 +117,6 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 - **Range extensions:** flags live in `Sps::range` and the PPS range fields. Rotation applies to transform-skip *and* transquant-bypass 4×4 intra blocks (HM; FFmpeg skips bypass). StatCoeff (persistent Rice) lives in `CabacContexts`, so it resets and syncs with the contexts. Extended precision with a coefficient range above 16 bits uses `ResidualBlock::coeffs_wide` and `inverse_transform::inverse_transform_ext`; the 8-bit path is unchanged. With WPP and tiles together, a CTB row of a tile is a substream (`tile_col_start` in `decode_slice`). Verify RExt work with the JCT-VC-RExt suite and the HM-recon fixtures (`test_decode_rext_tools_match_hm`); FFmpeg lacks extended precision and bypass alignment and differs on lossless RDPCM.
 - **Conformance:** `tools/conformance/run_suite.py` runs the JCT-VC suites from Fluster's JSON (see its README). Re-run it after changes to parsing, prediction or loop filters.
 - **Threaded loop filters must stay band-local:** `deblock_picture` runs vertical edges on bands `[y0, y1)` (multiples of 16 luma rows), then horizontal edges on bands `[y0 - 4, y1 - 4)` (an edge at row y touches rows y-4..=y+3; chroma edges y-2..=y+1); SAO runs per band of CTB rows reading the shared snapshot. A change that makes a filter read or write further from its edge breaks this; `threaded_decode_matches_single_thread` and the conformance suites with `dump_frames --threads 7` catch it. `Decoder` must stay `Send` (compile-time assertion in `decoder.rs`): no `Rc` / `RefCell` in pictures or picture state.
+- **Wavefront protocol (`shared.rs`):** while decoding CTB `(r, c)` a worker writes only that CTB and reads its own row, finished CTBs of rows above (it waits for `(r-1, c+1)`), or CTBs `c-1` and later of row `r+1` (not started yet; A0 merge availability reads them). Decode-path code must use element / range indexing on `PictureState` tables, never whole-table access (`Deref` panics on a view), and ranges must stay inside one CTB row and end at the block. In test builds `AccessCheck` asserts every access: `threaded_decode_matches_single_thread`, `threaded_wpp_damage_matches_single_thread` and the ignored `wavefront_matches_on_directory` (point `RUST_H265_WPP_DIR` at the conformance vectors) exercise it.
+- **Adding a `PictureState` field:** classify it in `worker_view` / `take_worker_state` (cu_tree.rs): a per-picture table (a `SharedTable`, viewed by workers; add its geometry in `attach_checks` and initial value in `reset_ctbs`, matching `new_recycled`), per-thread decoding state (copied back from the worker that decoded the slice's last CTB), a picture-level flag set while decoding (merged, like `any_no_filter`), or scratch. Decoding state that carries across CTB rows in sequential order breaks wavefront decoding: exclude the feature in `wavefront::applies` (as for chroma QP offset lists).
 - **EPB compensation for WPP entry points:** `entry_point_offset` is in NAL-byte space (includes EPBs). Must convert to RBSP-byte offset by subtracting EPB count.

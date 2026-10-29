@@ -25,7 +25,15 @@
 //! - a worker writes only elements of the CTB it is decoding;
 //! - a worker reads elements of CTBs in its own CTB row, or of CTBs in rows
 //!   above that are finished: row `r` decodes CTB `c` only after row `r - 1`
-//!   has finished CTB `c + 1` (published through [`RowProgress`]).
+//!   has finished CTB `c + 1` (published through [`RowProgress`]);
+//! - while decoding CTB `(r, c)` a worker may also read CTBs `c - 1` and
+//!   later of row `r + 1` (the below-left merge candidate A0 reads its
+//!   CTB's slice address and motion field, which decide that it is not
+//!   available yet). Those CTBs cannot have started: row `r + 1` starts
+//!   CTB `c'` only after it observes (Acquire) that row `r` finished CTB
+//!   `c' + 1 >= c`, which row `r` publishes (Release) after this read. The
+//!   read therefore happens before any write to them and sees their initial
+//!   values, as a sequential decoder does.
 //!
 //! In test builds each view checks every access against that rule (see
 //! [`AccessCheck`]), so the decode path cannot silently step outside it:
@@ -33,8 +41,8 @@
 
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut, Index, IndexMut, Range};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// A buffer that is either owned (behaves like a `Vec<T>` / `[T]`) or a
 /// view of another table's buffer for one worker thread. See the module
@@ -46,7 +54,7 @@ pub struct SharedTable<T> {
     cap: Option<usize>,
     /// Access checking for a view, in test builds.
     #[cfg(test)]
-    check: Option<(Arc<AccessCheck>, Geometry)>,
+    check: Option<(Arc<AccessCheck>, Geometry, &'static str)>,
     _owns: PhantomData<T>,
 }
 
@@ -107,24 +115,24 @@ impl<T> SharedTable<T> {
 
     /// Attach access checking to a view (test builds only).
     #[cfg(test)]
-    pub fn set_check(&mut self, check: Arc<AccessCheck>, geometry: Geometry) {
+    pub fn set_check(&mut self, check: Arc<AccessCheck>, geometry: Geometry, name: &'static str) {
         debug_assert!(!self.is_owner());
-        self.check = Some((check, geometry));
+        self.check = Some((check, geometry, name));
     }
 
     #[inline(always)]
     fn check_read(&self, _range: Range<usize>) {
         #[cfg(test)]
-        if let Some((c, g)) = &self.check {
-            c.check(g, _range, false);
+        if let Some((c, g, name)) = &self.check {
+            c.check(g, _range, false, name);
         }
     }
 
     #[inline(always)]
     fn check_write(&self, _range: Range<usize>) {
         #[cfg(test)]
-        if let Some((c, g)) = &self.check {
-            c.check(g, _range, true);
+        if let Some((c, g, name)) = &self.check {
+            c.check(g, _range, true, name);
         }
     }
 
@@ -329,10 +337,22 @@ owner_range_index!(
 /// `done(r)` is the number of leading CTBs of row `r` that are finished
 /// (the row width once the row is complete).
 pub struct RowProgress {
-    done: Vec<AtomicUsize>,
-    /// Set when decoding stops early (an error or a slice that ends before
-    /// its last row): waiting rows give up instead of waiting forever.
-    abort: AtomicBool,
+    rows: Vec<RowSlot>,
+    /// The first row (in decoding order) that stopped before its end (an
+    /// error, or the slice ended there); `usize::MAX` while none has. Rows
+    /// below it are never reached by a sequential decode, so they give up
+    /// instead of waiting forever. Rows above it run to completion.
+    failed: AtomicUsize,
+}
+
+/// One row's progress, and the means to sleep until it advances.
+struct RowSlot {
+    done: AtomicUsize,
+    /// Threads asleep (or about to sleep) on `wake`: `publish` only takes
+    /// the lock to notify when this is nonzero.
+    sleepers: AtomicUsize,
+    lock: Mutex<()>,
+    wake: Condvar,
 }
 
 impl RowProgress {
@@ -340,8 +360,16 @@ impl RowProgress {
     /// starts (by earlier slices).
     pub fn new(initial: impl IntoIterator<Item = usize>) -> Self {
         Self {
-            done: initial.into_iter().map(AtomicUsize::new).collect(),
-            abort: AtomicBool::new(false),
+            rows: initial
+                .into_iter()
+                .map(|n| RowSlot {
+                    done: AtomicUsize::new(n),
+                    sleepers: AtomicUsize::new(0),
+                    lock: Mutex::new(()),
+                    wake: Condvar::new(),
+                })
+                .collect(),
+            failed: AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -349,39 +377,78 @@ impl RowProgress {
     /// wrote for those CTBs is visible afterwards).
     #[inline]
     pub fn done(&self, r: usize) -> usize {
-        self.done[r].load(Ordering::Acquire)
+        self.rows[r].done.load(Ordering::Acquire)
     }
 
-    /// Publish that row `r` has finished its first `n` CTBs (`Release`).
+    /// Publish that row `r` has finished its first `n` CTBs (`Release`),
+    /// waking threads waiting on it.
     #[inline]
     pub fn publish(&self, r: usize, n: usize) {
-        self.done[r].store(n, Ordering::Release);
+        let row = &self.rows[r];
+        // SeqCst with the waiter's `sleepers` increment and re-check (see
+        // `wait`): either the waiter sees the new count, or this load sees
+        // the waiter and notifies it.
+        row.done.store(n, Ordering::SeqCst);
+        if row.sleepers.load(Ordering::SeqCst) > 0 {
+            Self::notify(row);
+        }
     }
 
-    pub fn abort(&self) {
-        self.abort.store(true, Ordering::Release);
+    fn notify(row: &RowSlot) {
+        // Taking the lock orders this notify after a waiter that has
+        // checked the condition but not yet started waiting.
+        drop(row.lock.lock().unwrap());
+        row.wake.notify_all();
     }
 
-    pub fn aborted(&self) -> bool {
-        self.abort.load(Ordering::Acquire)
+    /// Row `r` stopped before its end: rows below it are abandoned.
+    pub fn fail(&self, r: usize) {
+        self.failed.fetch_min(r, Ordering::SeqCst);
+        for row in &self.rows {
+            if row.sleepers.load(Ordering::SeqCst) > 0 {
+                Self::notify(row);
+            }
+        }
+    }
+
+    /// Whether a row above `r` stopped early, so row `r` is abandoned.
+    pub fn failed_above(&self, r: usize) -> bool {
+        self.failed.load(Ordering::Acquire) < r
     }
 
     /// Wait until row `r` has finished at least `n` CTBs. Returns false if
-    /// decoding was aborted first.
+    /// row `r` or a row above it stopped early first (the waiting row is
+    /// then abandoned). Spins briefly, then sleeps until `publish` or
+    /// `fail` wakes it: yielding instead lets a busy machine deschedule a
+    /// waiting row for a whole scheduler quantum, stalling every row below.
     pub fn wait(&self, r: usize, n: usize) -> bool {
-        let mut spins = 0u32;
-        while self.done(r) < n {
-            if self.aborted() {
-                return false;
-            }
-            if spins < 64 {
-                std::hint::spin_loop();
-                spins += 1;
+        let ready = |s: &Self| {
+            if s.done(r) >= n {
+                Some(true)
+            } else if s.failed.load(Ordering::SeqCst) <= r {
+                Some(false)
             } else {
-                std::thread::yield_now();
+                None
             }
+        };
+        for _ in 0..2000 {
+            if let Some(ok) = ready(self) {
+                return ok;
+            }
+            std::hint::spin_loop();
         }
-        true
+        let row = &self.rows[r];
+        let mut guard = row.lock.lock().unwrap();
+        row.sleepers.fetch_add(1, Ordering::SeqCst);
+        let ok = loop {
+            if let Some(ok) = ready(self) {
+                break ok;
+            }
+            guard = row.wake.wait(guard).unwrap();
+        };
+        row.sleepers.fetch_sub(1, Ordering::SeqCst);
+        drop(guard);
+        ok
     }
 }
 
@@ -418,7 +485,7 @@ impl AccessCheck {
         *self.current.lock().unwrap() = ctb;
     }
 
-    fn check(&self, g: &Geometry, range: Range<usize>, write: bool) {
+    fn check(&self, g: &Geometry, range: Range<usize>, write: bool, table: &str) {
         if range.is_empty() {
             return;
         }
@@ -430,11 +497,11 @@ impl AccessCheck {
             let ok = if write {
                 r == row && c == col
             } else {
-                r == row || (r < row && self.progress.done(r) > c)
+                r == row || (r < row && self.progress.done(r) > c) || (r == row + 1 && c + 1 >= col)
             };
             assert!(
                 ok,
-                "wavefront violation: CTB ({row}, {col}) {} element {i} in CTB ({r}, {c})",
+                "wavefront violation: CTB ({row}, {col}) {} {table}[{i}] in CTB ({r}, {c})",
                 if write { "writes" } else { "reads" },
             );
         }
@@ -447,7 +514,9 @@ impl AccessCheck {
         );
         assert!(
             r0 == r1,
-            "wavefront violation: CTB ({row}, {col}) accesses a range spanning CTB rows {r0}..={r1}"
+            "wavefront violation: CTB ({row}, {col}) accesses {table}[{}..{}], spanning CTB rows {r0}..={r1}",
+            range.start,
+            range.end,
         );
     }
 }
@@ -512,29 +581,40 @@ mod tests {
         let progress = Arc::new(RowProgress::new([4, 3, 0]));
         let check = AccessCheck::new(progress);
         check.set_current(Some((1, 1)));
-        check.check(&g, 0..1, false); // row above, finished
-        check.check(&g, 4 + 3..4 + 4, false); // own row, any column
-        check.check(&g, 4 + 1..4 + 2, true); // own CTB
-        let r = std::panic::catch_unwind(|| check.check(&g, 4 + 2..4 + 3, true));
+        check.check(&g, 0..1, false, "t"); // row above, finished
+        check.check(&g, 4 + 3..4 + 4, false, "t"); // own row, any column
+        check.check(&g, 4 + 1..4 + 2, true, "t"); // own CTB
+        let r = std::panic::catch_unwind(|| check.check(&g, 4 + 2..4 + 3, true, "t"));
         assert!(r.is_err(), "write outside the current CTB");
-        let r = std::panic::catch_unwind(|| check.check(&g, 8..9, false));
-        assert!(r.is_err(), "read from a row below");
+        // Row below: CTBs from one column left of the current one may be
+        // read (they cannot have started), earlier ones may not.
+        check.check(&g, 8..9, false, "t");
+        check.set_current(Some((1, 2)));
+        let r = std::panic::catch_unwind(|| check.check(&g, 8..9, false, "t"));
+        assert!(
+            r.is_err(),
+            "read of a CTB of the row below that may be in progress"
+        );
+        check.set_current(Some((1, 1)));
         let check2 = AccessCheck::new(Arc::new(RowProgress::new([2, 0, 0])));
         check2.set_current(Some((1, 1)));
-        let r = std::panic::catch_unwind(|| check2.check(&g, 2..3, false));
+        let r = std::panic::catch_unwind(|| check2.check(&g, 2..3, false, "t"));
         assert!(r.is_err(), "read of an unfinished CTB above");
     }
 
     #[test]
-    fn progress_wait_and_abort() {
-        let p = Arc::new(RowProgress::new([0, 0]));
+    fn progress_wait_and_fail() {
+        let p = Arc::new(RowProgress::new([0, 0, 0]));
         let p2 = Arc::clone(&p);
         let h = std::thread::spawn(move || p2.wait(0, 3));
         p.publish(0, 3);
         assert!(h.join().unwrap());
+        // Row 1 stops early: a wait on row 1 (by row 2) gives up, a wait on
+        // row 0 (by row 1's own neighbours above) does not.
+        p.fail(1);
         let p3 = Arc::clone(&p);
-        let h = std::thread::spawn(move || p3.wait(1, 1));
-        p.abort();
-        assert!(!h.join().unwrap());
+        assert!(!std::thread::spawn(move || p3.wait(1, 1)).join().unwrap());
+        assert!(p.wait(0, 3));
+        assert!(p.failed_above(2) && !p.failed_above(1));
     }
 }

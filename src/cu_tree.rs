@@ -356,6 +356,277 @@ impl<P: Pixel> Default for RecycledBuffers<P> {
     }
 }
 
+// ---- Wavefront workers -------------------------------------------------------
+
+impl<P: Pixel> PictureState<P> {
+    /// A picture state for a worker thread decoding CTB rows of this
+    /// picture in parallel (wavefront decoding, see `crate::wavefront`).
+    /// Its tables and planes are views of this state's buffers
+    /// (`SharedTable::view`); its per-thread decoding state starts as a
+    /// copy of this state's, and it has its own scratch buffers.
+    ///
+    /// # Safety
+    ///
+    /// As for `SharedTable::view`: every worker state must be dropped
+    /// before `self` is used again, and the workers must follow the
+    /// wavefront protocol (`crate::shared`).
+    pub(crate) unsafe fn worker_view(&self) -> Self {
+        Self {
+            width: self.width,
+            height: self.height,
+            bit_depth: self.bit_depth,
+            bit_depth_c: self.bit_depth_c,
+            log2_min_cb_size: self.log2_min_cb_size,
+            log2_min_pu_size: self.log2_min_pu_size,
+            log2_ctb_size: self.log2_ctb_size,
+            width_in_ctbs: self.width_in_ctbs,
+            min_cb_width: self.min_cb_width,
+            min_pu_width: self.min_pu_width,
+            // SAFETY: forwarded to the caller (see the function's contract).
+            tab_ct_depth: unsafe { self.tab_ct_depth.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            tab_ipm: unsafe { self.tab_ipm.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            tab_chroma_ipm: unsafe { self.tab_chroma_ipm.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            y_plane: unsafe { self.y_plane.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            u_plane: unsafe { self.u_plane.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            v_plane: unsafe { self.v_plane.view() },
+            y_stride: self.y_stride,
+            uv_stride: self.uv_stride,
+            chroma_array_type: self.chroma_array_type,
+            chroma_shift_w: self.chroma_shift_w,
+            chroma_shift_h: self.chroma_shift_h,
+            last_luma_pred_mode: self.last_luma_pred_mode,
+            last_chroma_pred_mode: self.last_chroma_pred_mode,
+            cu_count: self.cu_count,
+            last_split_transform_flag: self.last_split_transform_flag,
+            last_cbf_luma: self.last_cbf_luma,
+            last_cbf_cb: self.last_cbf_cb,
+            last_cbf_cr: self.last_cbf_cr,
+            last_cu_qp_delta: self.last_cu_qp_delta,
+            is_cu_qp_delta_coded: self.is_cu_qp_delta_coded,
+            is_cu_chroma_qp_offset_coded: self.is_cu_chroma_qp_offset_coded,
+            cu_qp_offset_cb: self.cu_qp_offset_cb,
+            cu_qp_offset_cr: self.cu_qp_offset_cr,
+            last_qp_y: self.last_qp_y,
+            qpy_pred: self.qpy_pred,
+            first_qp_group: self.first_qp_group,
+            cu_origin: self.cu_origin,
+            cu_single_pu: self.cu_single_pu,
+            ccp_luma_residual: Vec::new(),
+            coeff_buf: Vec::new(),
+            sao_snapshot: Default::default(),
+            last_luma_residual: None,
+            // SAFETY: forwarded to the caller (see the function's contract).
+            tab_qp_y: unsafe { self.tab_qp_y.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            bs_vertical: unsafe { self.bs_vertical.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            bs_horizontal: unsafe { self.bs_horizontal.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            tab_cbf_luma: unsafe { self.tab_cbf_luma.view() },
+            log2_min_tb_size: self.log2_min_tb_size,
+            // SAFETY: forwarded to the caller (see the function's contract).
+            sao_params: unsafe { self.sao_params.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            tab_slice_addr_rs: unsafe { self.tab_slice_addr_rs.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            filter_slice_edges: unsafe { self.filter_slice_edges.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            tab_tile_id: unsafe { self.tab_tile_id.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            tab_ctb_ts: unsafe { self.tab_ctb_ts.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            tab_deblock_offsets: unsafe { self.tab_deblock_offsets.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            tab_no_filter: unsafe { self.tab_no_filter.view() },
+            any_no_filter: self.any_no_filter,
+            filter_across_tiles: self.filter_across_tiles,
+            // SAFETY: forwarded to the caller (see the function's contract).
+            tab_mvf: unsafe { self.tab_mvf.view() },
+            // SAFETY: forwarded to the caller (see the function's contract).
+            tab_skip_flag: unsafe { self.tab_skip_flag.view() },
+            min_tb_addr_zs: std::sync::Arc::clone(&self.min_tb_addr_zs),
+            min_tb_addr_zs_stride: self.min_tb_addr_zs_stride,
+            min_tb_width: self.min_tb_width,
+            mc_scratch: crate::inter_pred::McScratch::new(),
+        }
+    }
+
+    /// Drop a worker state's table views (replacing them with empty owned
+    /// tables), keeping its per-thread decoding state. Every worker calls
+    /// this before the picture state it views is used again.
+    pub(crate) fn release_views(&mut self) {
+        self.tab_ct_depth = SharedTable::default();
+        self.tab_ipm = SharedTable::default();
+        self.tab_chroma_ipm = SharedTable::default();
+        self.y_plane = SharedTable::default();
+        self.u_plane = SharedTable::default();
+        self.v_plane = SharedTable::default();
+        self.tab_qp_y = SharedTable::default();
+        self.bs_vertical = SharedTable::default();
+        self.bs_horizontal = SharedTable::default();
+        self.tab_cbf_luma = SharedTable::default();
+        self.sao_params = SharedTable::default();
+        self.tab_slice_addr_rs = SharedTable::default();
+        self.filter_slice_edges = SharedTable::default();
+        self.tab_tile_id = SharedTable::default();
+        self.tab_ctb_ts = SharedTable::default();
+        self.tab_deblock_offsets = SharedTable::default();
+        self.tab_no_filter = SharedTable::default();
+        self.tab_mvf = SharedTable::default();
+        self.tab_skip_flag = SharedTable::default();
+    }
+
+    /// After the workers of one slice finished: take the per-thread
+    /// decoding state of `last`, the worker that decoded the slice's last
+    /// CTB (as if one thread had decoded the whole slice), and merge the
+    /// picture-level values every worker may have set.
+    pub(crate) fn take_worker_state(&mut self, last: &Self, all: &[Self]) {
+        self.last_luma_pred_mode = last.last_luma_pred_mode;
+        self.last_chroma_pred_mode = last.last_chroma_pred_mode;
+        self.last_split_transform_flag = last.last_split_transform_flag;
+        self.last_cbf_luma = last.last_cbf_luma;
+        self.last_cbf_cb = last.last_cbf_cb;
+        self.last_cbf_cr = last.last_cbf_cr;
+        self.last_cu_qp_delta = last.last_cu_qp_delta;
+        self.is_cu_qp_delta_coded = last.is_cu_qp_delta_coded;
+        self.is_cu_chroma_qp_offset_coded = last.is_cu_chroma_qp_offset_coded;
+        self.cu_qp_offset_cb = last.cu_qp_offset_cb;
+        self.cu_qp_offset_cr = last.cu_qp_offset_cr;
+        self.last_qp_y = last.last_qp_y;
+        self.qpy_pred = last.qpy_pred;
+        self.first_qp_group = last.first_qp_group;
+        self.cu_origin = last.cu_origin;
+        self.cu_single_pu = last.cu_single_pu;
+        for w in all {
+            self.any_no_filter |= w.any_no_filter;
+            self.cu_count += w.cu_count;
+        }
+    }
+
+    /// Where each table's elements lie: `(row_len, table rows per CTB row,
+    /// table columns per CTB column)` (`crate::shared::Geometry`), for the
+    /// picture-level tables a wavefront worker writes.
+    pub(crate) fn table_geometries(&self) -> TableGeometries {
+        use crate::shared::Geometry;
+        let ctb = 1usize << self.log2_ctb_size;
+        let grid = |row_len: usize, log2_unit: u32| Geometry {
+            row_len,
+            ctb_rows: ctb >> log2_unit,
+            ctb_cols: ctb >> log2_unit,
+        };
+        TableGeometries {
+            luma: grid(self.y_stride, 0),
+            chroma: Geometry {
+                row_len: self.uv_stride,
+                ctb_rows: ctb >> self.chroma_shift_h,
+                ctb_cols: ctb >> self.chroma_shift_w,
+            },
+            min_cb: grid(self.min_cb_width, self.log2_min_cb_size as u32),
+            min_pu: grid(self.min_pu_width, self.log2_min_pu_size as u32),
+            min_tb: grid(self.min_tb_width, self.log2_min_tb_size),
+            // Boundary strengths are indexed with the unaligned width.
+            grid4: grid(self.width as usize >> 2, 2),
+            ctb: grid(self.width_in_ctbs, self.log2_ctb_size as u32),
+        }
+    }
+
+    /// Attach wavefront access checking to every table view (test builds).
+    #[cfg(test)]
+    pub(crate) fn attach_checks(&mut self, check: &std::sync::Arc<crate::shared::AccessCheck>) {
+        let g = self.table_geometries();
+        let c = || std::sync::Arc::clone(check);
+        self.y_plane.set_check(c(), g.luma, "y_plane");
+        self.u_plane.set_check(c(), g.chroma, "u_plane");
+        self.v_plane.set_check(c(), g.chroma, "v_plane");
+        self.tab_ct_depth.set_check(c(), g.min_cb, "tab_ct_depth");
+        self.tab_qp_y.set_check(c(), g.min_cb, "tab_qp_y");
+        self.tab_skip_flag.set_check(c(), g.min_cb, "tab_skip_flag");
+        self.tab_ipm.set_check(c(), g.min_pu, "tab_ipm");
+        self.tab_chroma_ipm
+            .set_check(c(), g.min_pu, "tab_chroma_ipm");
+        self.tab_no_filter.set_check(c(), g.min_pu, "tab_no_filter");
+        self.tab_mvf.set_check(c(), g.min_pu, "tab_mvf");
+        self.tab_cbf_luma.set_check(c(), g.min_tb, "tab_cbf_luma");
+        self.bs_vertical.set_check(c(), g.grid4, "bs_vertical");
+        self.bs_horizontal.set_check(c(), g.grid4, "bs_horizontal");
+        self.sao_params.set_check(c(), g.ctb, "sao_params");
+        self.tab_slice_addr_rs
+            .set_check(c(), g.ctb, "tab_slice_addr_rs");
+        self.filter_slice_edges
+            .set_check(c(), g.ctb, "filter_slice_edges");
+        self.tab_tile_id.set_check(c(), g.ctb, "tab_tile_id");
+        self.tab_ctb_ts.set_check(c(), g.ctb, "tab_ctb_ts");
+        self.tab_deblock_offsets
+            .set_check(c(), g.ctb, "tab_deblock_offsets");
+    }
+
+    /// Return the tables of CTBs `cols` of CTB row `row` to their initial
+    /// values (those of `new_recycled`), as if the CTBs had never been
+    /// decoded. Used for rows a wavefront decode ran ahead into but the
+    /// slice did not reach (an error or an early end above them). The
+    /// samples are left alone: `fill_undecoded_ctbs` greys out CTBs whose
+    /// slice address is -1.
+    pub(crate) fn reset_ctbs(&mut self, row: usize, cols: std::ops::Range<usize>) {
+        fn reset<T: Clone>(
+            t: &mut SharedTable<T>,
+            g: crate::shared::Geometry,
+            row: usize,
+            cols: &std::ops::Range<usize>,
+            value: T,
+        ) {
+            let (c0, c1) = (
+                cols.start * g.ctb_cols,
+                (cols.end * g.ctb_cols).min(g.row_len),
+            );
+            for r in row * g.ctb_rows..(row + 1) * g.ctb_rows {
+                let (a, b) = (r * g.row_len + c0, r * g.row_len + c1);
+                if b <= t.len() && a < b {
+                    t[a..b].fill(value.clone());
+                }
+            }
+        }
+        let g = self.table_geometries();
+        reset(&mut self.tab_ct_depth, g.min_cb, row, &cols, 0);
+        reset(&mut self.tab_qp_y, g.min_cb, row, &cols, 0);
+        reset(&mut self.tab_skip_flag, g.min_cb, row, &cols, 0);
+        reset(&mut self.tab_ipm, g.min_pu, row, &cols, INTRA_DC);
+        reset(&mut self.tab_chroma_ipm, g.min_pu, row, &cols, INTRA_DC);
+        reset(&mut self.tab_no_filter, g.min_pu, row, &cols, 0);
+        reset(&mut self.tab_mvf, g.min_pu, row, &cols, MvField::default());
+        reset(&mut self.tab_cbf_luma, g.min_tb, row, &cols, 0);
+        reset(&mut self.bs_vertical, g.grid4, row, &cols, 0);
+        reset(&mut self.bs_horizontal, g.grid4, row, &cols, 0);
+        reset(
+            &mut self.sao_params,
+            g.ctb,
+            row,
+            &cols,
+            crate::sao::SaoParams::default(),
+        );
+        reset(&mut self.tab_slice_addr_rs, g.ctb, row, &cols, -1);
+        reset(&mut self.filter_slice_edges, g.ctb, row, &cols, true);
+        reset(&mut self.tab_ctb_ts, g.ctb, row, &cols, 0);
+        reset(&mut self.tab_deblock_offsets, g.ctb, row, &cols, (0, 0));
+    }
+}
+
+/// Table geometries of a picture state (see `PictureState::table_geometries`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TableGeometries {
+    pub luma: crate::shared::Geometry,
+    pub chroma: crate::shared::Geometry,
+    pub min_cb: crate::shared::Geometry,
+    pub min_pu: crate::shared::Geometry,
+    pub min_tb: crate::shared::Geometry,
+    pub grid4: crate::shared::Geometry,
+    pub ctb: crate::shared::Geometry,
+}
+
 /// `buf` (or a new buffer) holding `n` copies of `value`. Works on `Vec`s
 /// and `SharedTable`s alike (in and out).
 fn refill<T: Clone, R: From<Vec<T>>>(buf: Option<impl Into<Vec<T>>>, n: usize, value: T) -> R {

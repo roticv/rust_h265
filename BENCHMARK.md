@@ -78,6 +78,33 @@ throughput, while FFmpeg's drops to 39% (see Interpretation).
 
 All six fixtures are byte-exact against FFmpeg.
 
+### Threads
+
+`Decoder::with_threads(n)` against FFmpeg 9.0.2 with `-threads N`, frames
+per second (`bench_decode` best of 3; FFmpeg `-benchmark` rtime best of
+3). The machine was loaded during this run (load average 5-5.6, from
+other work), so the threaded figures are conservative: an earlier run at
+load ~2.4 measured 674 fps for `medium` and 530 for `10bit_medium` at 4
+threads.
+
+| Fixture | WPP | ours, 1 | 2 | 4 | 8 | FFmpeg, 1 | 4 | default |
+|---|:-:|---:|---:|---:|---:|---:|---:|---:|
+| `bbb_1080p_5s_safe` | no | 375 | 387 | 390 | 387 | 563 | 1500 | 2000 |
+| `bbb_720p_10s_safe` | no | 684 | 718 | 705 | 679 | 1071 | 2927 | 3810 |
+| `bbb_1080p_5s_medium` | yes | 281 | 466 | 530 | 482 | 393 | 822 | 1122 |
+| `bbb_1080p_5s_slow` | yes | 271 | 446 | 536 | 497 | 440 | 857 | 1111 |
+| `bbb_1080p_5s_10bit_safe` | no | 279 | 302 | 292 | 305 | 226 | 645 | 938 |
+| `bbb_1080p_5s_10bit_medium` | yes | 225 | 366 | 430 | 418 | 148 | 404 | 550 |
+
+- **WPP streams** (x265's default; the `safe` fixtures disable it): CTB
+  rows decode in parallel, 1.9-2.5x with 4 threads (2.2-2.5x on a quieter
+  machine). The machine has 4 performance cores; 8 threads is slower than
+  4. 10-bit `medium` with 4 threads is faster than FFmpeg with 4.
+- **Streams without WPP** only parallelise the loop filters (a few
+  percent). FFmpeg's frame threading parallelises any stream, which is
+  why it is far ahead on the `safe` fixtures; frame threading is the next
+  step for those (see Priorities).
+
 ### What changed in this round
 
 The previous round measured 375–486 Mpx/s on 8-bit and 328–414 Mpx/s on
@@ -438,7 +465,8 @@ We are faster on 10-bit because:
 Second-order effects now. Picture setup and allocation are ~4% (fresh
 Y/U/V planes and bookkeeping tables per picture; the Z-scan table is
 shared). MC scratch buffers are allocated once per picture and reused.
-Bounds checks are present throughout (no `unsafe`) but are not the
+Bounds checks are present throughout (the shared picture tables in
+`src/shared.rs`, the only `unsafe` code, check bounds too) but are not the
 bottleneck per the profile.
 
 ## Priorities
@@ -450,8 +478,8 @@ Remaining focus, ordered by expected return:
 1. **Hand-written NEON for MC** (~43%, already vectorised). Closing the
    remaining gap to FFmpeg likely needs explicit intrinsics: the `usdot`
    dot-product filters with runtime CPU detection and a plain-NEON
-   fallback, and per-width kernels. This brings `unsafe` into the crate,
-   which the README reserves for SIMD paths.
+   fallback, and per-width kernels. This needs `unsafe` beyond the one
+   module that has it now (`src/shared.rs`), kept as narrow.
 
 2. **Luma deblocking filter** (~8%). Compiler vectorisation was tried
    twice (4-line lanes, then direction-specialised code) and did not pay
@@ -463,9 +491,12 @@ Remaining focus, ordered by expected return:
    spot: a 64-bit CABAC refill, batched bypass bins, cheaper neighbour
    availability and leaner per-CU bookkeeping are each worth 1–2%.
 
-4. **Threading** (wall-clock, not per-core efficiency). WPP rows, tiles or
-   frame-level parallelism; the only route to FFmpeg's default
-   multithreaded throughput.
+4. **Frame threading** (wall-clock). WPP row parallelism is done (see
+   Threads); streams without WPP still decode on one thread apart from the
+   loop filters. Frame-level parallelism (a picture decodes while its
+   references are still finishing, waiting on their row progress) would
+   cover every stream and combine with WPP. It builds on the same shared
+   tables and progress counters.
 
 ## Appendix: tool usage
 

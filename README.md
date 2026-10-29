@@ -25,7 +25,11 @@ A pure Rust H.265 / HEVC video decoder.
 > - **Not supported:** 4:2:2, monochrome, bit depths above 12, and screen
 >   content coding. These streams are rejected with
 >   `DecodeError::Unsupported` rather than decoded wrongly.
-> - **Speed:** no threading or hand-written SIMD yet; about 1.5–1.6× slower
+> - **Threads:** `Decoder::with_threads(n)` decodes the CTB rows of WPP
+>   streams (x265's default) in parallel, about 2.2–2.5× faster with 4
+>   threads; other streams parallelise only the loop filters. The output is
+>   identical for every thread count.
+> - **Speed:** no hand-written SIMD yet; single-threaded, about 1.5–1.6× slower
 >   than single-threaded FFmpeg on 8-bit content and 1.3–1.5× faster on
 >   10-bit. See [`BENCHMARK.md`](BENCHMARK.md).
 
@@ -42,7 +46,7 @@ A pure Rust H.264 decoder ([`rust_h264`](https://github.com/roticv/rust_h264)) a
 - **Chroma formats:** 4:2:0 and 4:4:4, intra and inter. Check `frame.chroma_format_idc` (1 = 4:2:0, 3 = 4:4:4) to size the `u`/`v` planes: half width and height for 4:2:0, full size for 4:4:4. 4:2:2 and monochrome streams are rejected with `DecodeError::Unsupported`.
 - **Range extensions:** all range-extension coding tools are implemented: cross-component prediction, implicit and explicit RDPCM, transform-skip rotation and contexts, transform skip up to 32×32, extended precision processing, persistent Rice adaptation, CABAC bypass alignment, chroma QP offset lists, SAO offset scaling, disabled intra smoothing and high-precision weighted-prediction offsets, plus WPP combined with tiles. Screen content coding is rejected with `DecodeError::Unsupported`.
 - **Resource limits:** `Decoder::new()` rejects any SPS whose picture exceeds 35,651,584 luma samples (the Level 6.2 maximum) or an estimated 512 MB of per-picture state, returning `DecodeError::ResourceLimit`. Use `Decoder::with_limits(DecodeLimits { .. })` to change either bound.
-- **Pure Rust, no `unsafe`** in the current codebase. `unsafe` will be reserved for SIMD paths once they land.
+- **Pure Rust, `unsafe` in one module.** Wavefront decoding needs several threads writing disjoint parts of the same picture tables, which safe Rust cannot express; `src/shared.rs` (one small module) implements those shared tables. Its rules are documented there, every table access is checked against them in test builds, and the rest of the crate is safe Rust. Any future SIMD code will follow the same pattern.
 
 ## Usage
 

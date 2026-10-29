@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use crate::cabac::{CabacContexts, CabacReader};
-use crate::cu_tree::{MvField, PictureState, RecycledBuffers, decode_coding_quadtree};
+use crate::cu_tree::{MvField, PictureState, RecycledBuffers};
 use crate::dpb::{
     DecodedPicture, DecodedPictureBuffer, PictureReferenceStatus, ReferencePictureSets,
     apply_ref_pic_list_modification, build_ref_pic_list_temp0, build_ref_pic_list_temp1,
@@ -749,10 +749,19 @@ impl Decoder {
     /// Use up to `threads` threads (at least 1; the default is 1).
     ///
     /// The output is identical for every thread count; only the speed
-    /// changes. For now the loop filters (deblocking and SAO) run in
-    /// parallel over bands of rows; the rest of decoding is still
-    /// sequential. [`std::thread::available_parallelism`] is a reasonable
-    /// value.
+    /// changes. Two parts of decoding run in parallel:
+    ///
+    /// - With wavefront parallel processing (`entropy_coding_sync_enabled_flag`,
+    ///   on by default in x265), the CTB rows of a slice decode on separate
+    ///   threads, each row two CTBs behind the one above. This is where most
+    ///   of the gain is: about 2.2-2.5x with 4 threads on 1080p content.
+    ///   Slices with tiles or chroma QP offset lists decode sequentially.
+    /// - The loop filters (deblocking and SAO) run over bands of rows, for
+    ///   every stream.
+    ///
+    /// Streams without WPP gain only from the loop filters (5-7%).
+    /// [`std::thread::available_parallelism`] is a reasonable value; more
+    /// threads than the machine's performance cores rarely help.
     ///
     /// ```
     /// let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -1202,7 +1211,6 @@ impl Decoder {
         };
         let epb_positions: &[u32] = &nal.epb_positions;
 
-        let ctb_size = 1u32 << sps.ctb_log2_size_y;
         let pic_width_in_ctbs = sps.pic_width_in_ctbs_y();
         let pic_height_in_ctbs = sps.pic_height_in_ctbs_y();
         let total_ctbs = pic_width_in_ctbs * pic_height_in_ctbs;
@@ -1434,120 +1442,128 @@ impl Decoder {
         // The CTB loop, deblock, SAO, and DPB insertion all operate on a
         // generic PictureState<P>. Dispatch once via the enum variant and
         // execute the entire inner body monomorphized for the right P.
+        let slice_ctx = crate::wavefront::SliceContext {
+            sps,
+            pps,
+            sh: &sh,
+            slice_params: &slice_params,
+            recorded_slice_addr,
+        };
+        let substreams = crate::wavefront::Substreams {
+            rbsp: &nal.rbsp,
+            data_start: cabac_byte_offset,
+            nal_data_start: nal_slice_data_start,
+            epb_positions,
+            entry_point_offsets: &sh.entry_point_offsets,
+        };
+        let wavefront =
+            self.threads > 1 && crate::wavefront::applies(sps, pps, &sh, substreams.count());
+        let threads = self.threads;
         type CtbLoopResult = Result<(u32, Option<CabacContexts>, CabacContexts), DecodeError>;
         let ctb_loop_result: CtbLoopResult = with_picture_state!(&mut pic.state, |state| {
-            let mut more_data = true;
-            let mut ctb_addr_ts: u32 = slice_start_ts;
-            let mut substream_idx: u32 = 0;
+            if wavefront {
+                // CTB rows on several threads; same result as the loop below.
+                crate::wavefront::decode_rows(
+                    state,
+                    &slice_ctx,
+                    &substreams,
+                    slice_start_ts,
+                    contexts,
+                    saved_state,
+                    threads,
+                )
+            } else {
+                let mut more_data = true;
+                let mut ctb_addr_ts: u32 = slice_start_ts;
+                let mut substream_idx: u32 = 0;
 
-            while more_data && ctb_addr_ts < total_ctbs {
-                let ctb_addr_rs = tile_tables.ctb_addr_ts_to_rs[ctb_addr_ts as usize];
-                let col = ctb_addr_rs % pic_width_in_ctbs;
-                let is_first_ctb_of_slice = ctb_addr_ts == slice_start_ts;
+                while more_data && ctb_addr_ts < total_ctbs {
+                    let ctb_addr_rs = tile_tables.ctb_addr_ts_to_rs[ctb_addr_ts as usize];
+                    let col = ctb_addr_rs % pic_width_in_ctbs;
+                    let is_first_ctb_of_slice = ctb_addr_ts == slice_start_ts;
 
-                let is_tile_start = if is_first_ctb_of_slice {
-                    false
-                } else {
-                    let prev_ts = ctb_addr_ts - 1;
-                    let prev_rs = tile_tables.ctb_addr_ts_to_rs[prev_ts as usize];
-                    tile_tables.tile_id[ctb_addr_rs as usize]
-                        != tile_tables.tile_id[prev_rs as usize]
-                };
-
-                // First CTB of a CTB row within its tile.
-                let is_row_start = col == tile_col_start[col as usize];
-                let needs_wpp_reinit = wpp && is_row_start && !is_first_ctb_of_slice;
-
-                if is_tile_start || needs_wpp_reinit {
-                    substream_idx += 1;
-                    let ep_idx = substream_idx as usize;
-                    if ep_idx == 0 || ep_idx > sh.entry_point_offsets.len() {
-                        return Err(DecodeError::InvalidSyntax(
-                            "slice missing entry_point_offset for substream",
-                        ));
-                    }
-                    let nal_offset_from_start = sh.entry_point_offsets[ep_idx - 1];
-                    let nal_target = nal_slice_data_start + nal_offset_from_start;
-                    let epbs_in_data_prefix = epb_positions
-                        .iter()
-                        .filter(|&&p| p >= nal_slice_data_start && p < nal_target)
-                        .count() as u32;
-                    let rbsp_offset_from_start = nal_offset_from_start - epbs_in_data_prefix;
-                    let byte_offset = cabac_byte_offset + rbsp_offset_from_start as usize;
-                    cabac.reinit_at(byte_offset)?;
-
-                    // WPP synchronisation (spec 9.3.1): from the state saved
-                    // after the second CTB of the row above when the CTB
-                    // above-right is available (same tile and slice);
-                    // otherwise, and at every tile start, initialise.
-                    let tr_available =
-                        wpp && ctb_addr_rs >= pic_width_in_ctbs && col + 1 < pic_width_in_ctbs && {
-                            let tr = (ctb_addr_rs - pic_width_in_ctbs + 1) as usize;
-                            tile_tables.tile_id[tr] == tile_tables.tile_id[ctb_addr_rs as usize]
-                                && state.tab_slice_addr_rs[tr] == recorded_slice_addr
-                        };
-                    if tr_available {
-                        contexts = *saved_state.as_ref().ok_or(DecodeError::InvalidSyntax(
-                            "WPP row start without a saved context state",
-                        ))?;
+                    let is_tile_start = if is_first_ctb_of_slice {
+                        false
                     } else {
-                        contexts =
-                            CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag);
+                        let prev_ts = ctb_addr_ts - 1;
+                        let prev_rs = tile_tables.ctb_addr_ts_to_rs[prev_ts as usize];
+                        tile_tables.tile_id[ctb_addr_rs as usize]
+                            != tile_tables.tile_id[prev_rs as usize]
+                    };
+
+                    // First CTB of a CTB row within its tile.
+                    let is_row_start = col == tile_col_start[col as usize];
+                    let needs_wpp_reinit = wpp && is_row_start && !is_first_ctb_of_slice;
+
+                    if is_tile_start || needs_wpp_reinit {
+                        substream_idx += 1;
+                        let ep_idx = substream_idx as usize;
+                        if ep_idx == 0 || ep_idx > sh.entry_point_offsets.len() {
+                            return Err(DecodeError::InvalidSyntax(
+                                "slice missing entry_point_offset for substream",
+                            ));
+                        }
+                        let nal_offset_from_start = sh.entry_point_offsets[ep_idx - 1];
+                        let nal_target = nal_slice_data_start + nal_offset_from_start;
+                        let epbs_in_data_prefix = epb_positions
+                            .iter()
+                            .filter(|&&p| p >= nal_slice_data_start && p < nal_target)
+                            .count() as u32;
+                        let rbsp_offset_from_start = nal_offset_from_start - epbs_in_data_prefix;
+                        let byte_offset = cabac_byte_offset + rbsp_offset_from_start as usize;
+                        cabac.reinit_at(byte_offset)?;
+
+                        // WPP synchronisation (spec 9.3.1): from the state saved
+                        // after the second CTB of the row above when the CTB
+                        // above-right is available (same tile and slice);
+                        // otherwise, and at every tile start, initialise.
+                        let tr_available = wpp
+                            && ctb_addr_rs >= pic_width_in_ctbs
+                            && col + 1 < pic_width_in_ctbs
+                            && {
+                                let tr = (ctb_addr_rs - pic_width_in_ctbs + 1) as usize;
+                                tile_tables.tile_id[tr] == tile_tables.tile_id[ctb_addr_rs as usize]
+                                    && state.tab_slice_addr_rs[tr] == recorded_slice_addr
+                            };
+                        if tr_available {
+                            contexts = *saved_state.as_ref().ok_or(DecodeError::InvalidSyntax(
+                                "WPP row start without a saved context state",
+                            ))?;
+                        } else {
+                            contexts = CabacContexts::init(
+                                sh.slice_qp_y,
+                                sh.slice_type,
+                                sh.cabac_init_flag,
+                            );
+                        }
+                        state.first_qp_group = true;
                     }
-                    state.first_qp_group = true;
+
+                    more_data = crate::wavefront::decode_ctb(
+                        &mut cabac,
+                        &mut contexts,
+                        state,
+                        &slice_ctx,
+                        ctb_addr_rs,
+                        ctb_addr_ts,
+                    )?;
+                    ctb_addr_ts += 1;
+
+                    // Storage for WPP (spec 9.3.2.4): after the second CTB of a
+                    // CTB row within its tile.
+                    if wpp && col == tile_col_start[col as usize] + 1 {
+                        saved_state = Some(contexts);
+                    }
                 }
 
-                let x_ctb = col * ctb_size;
-                let y_ctb = (ctb_addr_rs / pic_width_in_ctbs) * ctb_size;
-                let rx = (x_ctb >> sps.ctb_log2_size_y) as usize;
-                let ry = (y_ctb >> sps.ctb_log2_size_y) as usize;
-                state.tab_slice_addr_rs[ctb_addr_rs as usize] = recorded_slice_addr;
-                state.tab_ctb_ts[ctb_addr_rs as usize] = ctb_addr_ts;
-                state.tab_deblock_offsets[ctb_addr_rs as usize] = (
-                    (sh.slice_beta_offset_div2 * 2) as i8,
-                    (sh.slice_tc_offset_div2 * 2) as i8,
-                );
-                state.filter_slice_edges[ctb_addr_rs as usize] =
-                    sh.slice_loop_filter_across_slices_enabled_flag;
-                crate::sao::decode_sao_param(
-                    &mut cabac,
-                    &mut contexts,
-                    state,
-                    sps,
-                    pps,
-                    &sh,
-                    rx,
-                    ry,
-                );
-                more_data = decode_coding_quadtree(
-                    &mut cabac,
-                    &mut contexts,
-                    state,
-                    sps,
-                    pps,
-                    sh.slice_qp_y,
-                    &slice_params,
-                    x_ctb,
-                    y_ctb,
-                    sps.ctb_log2_size_y,
-                    0,
-                )?;
-                ctb_addr_ts += 1;
-
-                // Storage for WPP (spec 9.3.2.4): after the second CTB of a
-                // CTB row within its tile.
-                if wpp && col == tile_col_start[col as usize] + 1 {
-                    saved_state = Some(contexts);
+                if more_data {
+                    return Err(DecodeError::InvalidSyntax(
+                        "slice did not end on terminate bin",
+                    ));
                 }
-            }
 
-            if more_data {
-                return Err(DecodeError::InvalidSyntax(
-                    "slice did not end on terminate bin",
-                ));
+                Ok((ctb_addr_ts, saved_state, contexts))
             }
-
-            Ok((ctb_addr_ts, saved_state, contexts))
         });
 
         let (final_ctb_addr_ts, final_saved_state, final_contexts_state) = ctb_loop_result?;
@@ -4657,6 +4673,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Decode `nals` with `threads` threads; returns each NAL unit's
+    /// result (as text, so errors compare) and every frame, with its POC and
+    /// all sample bytes.
+    fn decode_with_threads(nals: &[NalUnit], threads: usize) -> (Vec<String>, Vec<(i32, Vec<u8>)>) {
+        let mut dec = Decoder::new().with_threads(threads);
+        let (mut results, mut frames) = (Vec::new(), Vec::new());
+        let mut take = |f: Frame| {
+            let mut bytes = Vec::new();
+            for plane in [&f.y, &f.u, &f.v] {
+                match plane {
+                    PixelData::U8(p) => bytes.extend_from_slice(p),
+                    PixelData::U16(p) => bytes.extend(p.iter().flat_map(|s| s.to_le_bytes())),
+                }
+            }
+            frames.push((f.pic_order_cnt, bytes));
+        };
+        for nal in nals {
+            match dec.decode_nal(nal) {
+                Ok(Some(f)) => {
+                    results.push("frame".to_string());
+                    take(f);
+                }
+                Ok(None) => results.push("none".to_string()),
+                Err(e) => results.push(format!("{e:?}")),
+            }
+        }
+        while let Some(f) = dec.flush() {
+            take(f);
+        }
+        (results, frames)
+    }
+
+    /// Wavefront decoding of damaged WPP streams matches sequential
+    /// decoding exactly: per-NAL results (which slices fail, with which
+    /// error) and every sample of every frame. Corrupting slice data at
+    /// different depths makes a row fail, or the slice end early, while
+    /// rows below it are already decoding; those rows must be discarded and
+    /// their tables reset as if they had never been decoded.
+    #[test]
+    fn threaded_wpp_damage_matches_single_thread() {
+        let mut damaged_runs = 0;
+        for name in [
+            "wpp_ctu16.h265",
+            "ctu64_wpp.h265",
+            "rext_rice_wpp_hm_444_96x64.h265",
+        ] {
+            let data = read_fixture(name);
+            let clean = parse_annex_b(&data);
+            let vcl: Vec<usize> = (0..clean.len())
+                .filter(|&i| clean[i].nal_unit_type.is_vcl())
+                .collect();
+            for &k in vcl.iter().take(8) {
+                for tenths in [2, 4, 6, 8, 9] {
+                    let mut nals = parse_annex_b(&data);
+                    let mut b = nals[k].rbsp.to_vec();
+                    let n = b.len();
+                    let at = n * tenths / 10;
+                    for x in &mut b[at..(at + 6).min(n)] {
+                        *x ^= 0xa5;
+                    }
+                    nals[k].rbsp = std::borrow::Cow::Owned(b);
+                    let single = decode_with_threads(&nals, 1);
+                    if single.0.iter().any(|r| r != "frame" && r != "none") {
+                        damaged_runs += 1;
+                    }
+                    for threads in [2, 4] {
+                        assert!(
+                            decode_with_threads(&nals, threads) == single,
+                            "{name}: NAL {k} damaged at {tenths}/10 differs with {threads} threads"
+                        );
+                    }
+                }
+            }
+        }
+        // The damage must actually exercise the error paths.
+        assert!(
+            damaged_runs > 10,
+            "only {damaged_runs} damaged decodes failed"
+        );
+    }
+
+    /// Wavefront decoding of every bitstream in `$RUST_H265_WPP_DIR` (for
+    /// example the extracted JCT-VC conformance vectors) matches sequential
+    /// decoding, with the access checker on (test builds). Not run by
+    /// default: `RUST_H265_WPP_DIR=... cargo test --release -- --ignored
+    /// wavefront_matches_on_directory`.
+    #[test]
+    #[ignore]
+    fn wavefront_matches_on_directory() {
+        let dir = std::env::var("RUST_H265_WPP_DIR").expect("set RUST_H265_WPP_DIR");
+        let mut files = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from(dir)];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p
+                    .extension()
+                    .is_some_and(|x| ["bit", "bin", "h265", "hevc"].iter().any(|e| x == *e))
+                {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        assert!(!files.is_empty());
+        for f in &files {
+            let data = std::fs::read(f).unwrap();
+            let nals = parse_annex_b(&data);
+            let single = decode_with_threads(&nals, 1);
+            assert!(
+                decode_with_threads(&nals, 3) == single,
+                "{} differs with 3 threads",
+                f.display()
+            );
+        }
+        eprintln!("{} bitstreams match", files.len());
     }
 
     fn read_fixture(name: &str) -> Vec<u8> {
