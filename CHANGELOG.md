@@ -133,6 +133,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (rangeTabLps and both state transitions fused into one table) and
   renormalise with a count-leading-zeros instead of a table. About 0.5%
   fewer instructions and cycles.
+- Motion compensation: the interpolation filters accumulate tap by tap in
+  fixed 8-sample chunks held in registers, instead of zero-filling a
+  64-entry accumulator array for every row, and the bi-prediction /
+  weighted-prediction intermediates are 16-bit (as in HM and FFmpeg)
+  instead of 32-bit. 11-16% fewer cycles on the Big Buck Bunny 1080p and
+  720p fixtures, 8-bit and 10-bit.
 
 ## [0.2.0] - 2026-10-28
 

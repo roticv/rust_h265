@@ -6,7 +6,7 @@
 //! - Boundary samples are handled by clamping reference coordinates.
 //! - Bi-prediction averages L0 and L1 predictions: `(L0 + L1 + 1) >> 1`.
 //!
-//! Low-level MC functions (`mc_luma`, `mc_chroma`, `mc_luma_i32`, `mc_chroma_i32`,
+//! Low-level MC functions (`mc_luma`, `mc_chroma`, `mc_luma_i16`, `mc_chroma_i16`,
 //! `ref_sample`) are generic over `P: Pixel` for multi-bit-depth support.
 
 use std::rc::Rc;
@@ -76,17 +76,17 @@ pub(crate) const MC_TMP_LEN: usize = QPEL_TMP_ROWS * MAX_PB_SIZE;
 /// read, so stale contents left by earlier blocks are never observed.
 pub struct McScratch<P: Pixel> {
     /// L0 luma intermediate (bi-pred), or the weighted uni-pred luma.
-    luma0: Vec<i32>,
+    luma0: Vec<i16>,
     /// L1 luma intermediate (bi-pred).
-    luma1: Vec<i32>,
+    luma1: Vec<i16>,
     /// L0 Cb / Cr intermediates (bi-pred), or the weighted uni-pred chroma.
-    cb0: Vec<i32>,
-    cr0: Vec<i32>,
+    cb0: Vec<i16>,
+    cr0: Vec<i16>,
     /// L1 Cb / Cr intermediates (bi-pred).
-    cb1: Vec<i32>,
-    cr1: Vec<i32>,
+    cb1: Vec<i16>,
+    cr1: Vec<i16>,
     /// Separable 2-D filter intermediate, shared by luma and chroma.
-    tmp: Vec<i32>,
+    tmp: Vec<i16>,
     /// Padded copy of the reference window for blocks near the picture
     /// edge (see `ref_window`).
     edge: Vec<P>,
@@ -182,13 +182,14 @@ fn put_weighted<P: Pixel>(
     plane: &mut [P],
     off: usize,
     stride: usize,
-    pred: &[i32],
+    pred: &[i16],
     (w, h): (usize, usize),
     (weight, round, shift, offset): (i32, i32, i32, i32),
     bit_depth: u8,
 ) {
     put_rows(plane, off, stride, w, h, |d, j| {
         for (o, &v) in d.iter_mut().zip(&pred[j * w..][..w]) {
+            let v = v as i32;
             *o = P::from_i32_clamped(((v * weight + round) >> shift) + offset, bit_depth);
         }
     });
@@ -214,7 +215,7 @@ fn mc_block<P: Pixel, const N: usize>(
     w: usize,
     h: usize,
     bit_depth: u8,
-    tmp: &mut [i32],
+    tmp: &mut [i16],
     edge: &mut [P],
     sink: &mut impl RowSink,
 ) {
@@ -261,7 +262,7 @@ fn interp_block<P: Pixel, const N: usize>(
     hf: Option<&[i16; N]>,
     vf: Option<&[i16; N]>,
     bit_depth: u8,
-    tmp: &mut [i32],
+    tmp: &mut [i16],
     sink: &mut impl RowSink,
 ) {
     let shift1 = (bit_depth as u32).saturating_sub(8);
@@ -271,7 +272,7 @@ fn interp_block<P: Pixel, const N: usize>(
             for j in 0..h {
                 let s = &src[org + j * src_stride..][..w];
                 for (o, &p) in sink.row(j, w).iter_mut().zip(s) {
-                    *o = p.to_i32() << shift3;
+                    *o = (p.to_i32() << shift3) as i16;
                 }
                 sink.done(j);
             }
@@ -302,7 +303,7 @@ fn interp_block<P: Pixel, const N: usize>(
             }
             for j in 0..h {
                 let row = sink.row(j, w);
-                filter_v_i32(row, tmp, j * MAX_PB_SIZE, MAX_PB_SIZE, fv, 6);
+                filter_v_i16(row, tmp, j * MAX_PB_SIZE, MAX_PB_SIZE, fv, 6);
                 sink.done(j);
             }
         }
@@ -321,46 +322,69 @@ const _: () = assert!(MAX_FILTER_ABS_SUM * 255 <= i16::MAX as i32);
 /// SIMD lanes per instruction; 16-bit samples accumulate in i32.
 #[inline(always)]
 fn filter_px<'a, P: Pixel, const N: usize>(
-    out: &mut [i32],
+    out: &mut [i16],
     f: &[i16; N],
     shift: u32,
     src: impl Fn(usize) -> &'a [P],
 ) {
     let w = out.len();
+    let rows: [&[P]; N] = std::array::from_fn(|k| &src(k)[..w]);
+    // Tap-major over fixed 8-lane chunks: the accumulators stay in
+    // registers (no per-row array to initialise) and each tap is one
+    // multiply-add across the chunk; the tail handles narrow chroma
+    // blocks (2, 4 or 6 wide).
+    let chunks = w / 8;
     if P::BITS == 8 {
-        let mut acc_buf = [0i16; MAX_PB_SIZE];
-        let acc = &mut acc_buf[..w];
-        for (a, &p) in acc.iter_mut().zip(&src(0)[..w]) {
-            *a = f[0] * p.to_i32() as i16;
-        }
-        for (k, &c) in f.iter().enumerate().skip(1) {
-            for (a, &p) in acc.iter_mut().zip(&src(k)[..w]) {
-                *a += c * p.to_i32() as i16;
+        for c in 0..chunks {
+            let mut acc = [0i16; 8];
+            for (k, row) in rows.iter().enumerate() {
+                let r: &[P; 8] = row[c * 8..c * 8 + 8].try_into().unwrap();
+                for l in 0..8 {
+                    acc[l] += f[k] * r[l].to_i32() as i16;
+                }
+            }
+            let o: &mut [i16; 8] = (&mut out[c * 8..c * 8 + 8]).try_into().unwrap();
+            for l in 0..8 {
+                o[l] = acc[l] >> shift;
             }
         }
-        for (o, &a) in out.iter_mut().zip(acc.iter()) {
-            *o = (a as i32) >> shift;
+        for i in chunks * 8..w {
+            let mut a = 0i16;
+            for k in 0..N {
+                a += f[k] * rows[k][i].to_i32() as i16;
+            }
+            out[i] = a >> shift;
         }
     } else {
-        let c0 = f[0] as i32;
-        for (o, &p) in out.iter_mut().zip(&src(0)[..w]) {
-            *o = c0 * p.to_i32();
-        }
-        for (k, &c) in f.iter().enumerate().skip(1) {
-            let c = c as i32;
-            for (o, &p) in out.iter_mut().zip(&src(k)[..w]) {
-                *o += c * p.to_i32();
+        // Up to 12-bit samples: the sum needs i32, the shifted result
+        // (shift = BitDepth - 8) fits i16.
+        for c in 0..chunks {
+            let mut acc = [0i32; 8];
+            for (k, row) in rows.iter().enumerate() {
+                let coef = f[k] as i32;
+                let r: &[P; 8] = row[c * 8..c * 8 + 8].try_into().unwrap();
+                for l in 0..8 {
+                    acc[l] += coef * r[l].to_i32();
+                }
+            }
+            let o: &mut [i16; 8] = (&mut out[c * 8..c * 8 + 8]).try_into().unwrap();
+            for l in 0..8 {
+                o[l] = (acc[l] >> shift) as i16;
             }
         }
-        for o in out.iter_mut() {
-            *o >>= shift;
+        for i in chunks * 8..w {
+            let mut a = 0i32;
+            for k in 0..N {
+                a += f[k] as i32 * rows[k][i].to_i32();
+            }
+            out[i] = (a >> shift) as i16;
         }
     }
 }
 
 /// Horizontal N-tap filter of one row: `out[i] = (Σ f[k] * src[i + k]) >> shift`.
 #[inline(always)]
-fn filter_h<P: Pixel, const N: usize>(out: &mut [i32], src: &[P], f: &[i16; N], shift: u32) {
+fn filter_h<P: Pixel, const N: usize>(out: &mut [i16], src: &[P], f: &[i16; N], shift: u32) {
     let w = out.len();
     filter_px(out, f, shift, |k| &src[k..k + w]);
 }
@@ -369,7 +393,7 @@ fn filter_h<P: Pixel, const N: usize>(out: &mut [i32], src: &[P], f: &[i16; N], 
 /// `out[i] = (Σ f[k] * src[base + k * stride + i]) >> shift`.
 #[inline(always)]
 fn filter_v_px<P: Pixel, const N: usize>(
-    out: &mut [i32],
+    out: &mut [i16],
     src: &[P],
     base: usize,
     stride: usize,
@@ -380,50 +404,65 @@ fn filter_v_px<P: Pixel, const N: usize>(
     filter_px(out, f, shift, |k| &src[base + k * stride..][..w]);
 }
 
-/// Vertical N-tap filter over i32 intermediate rows (second pass of a 2-D
-/// filter): `out[i] = (Σ f[k] * src[base + k * stride + i]) >> shift`.
+/// Vertical N-tap filter over 16-bit intermediate rows (second pass of a
+/// 2-D filter): `out[i] = (Σ f[k] * src[base + k * stride + i]) >> shift`,
+/// accumulated in i32 and stored as 16 bits, as HM and FFmpeg store it.
 #[inline(always)]
-fn filter_v_i32<const N: usize>(
-    out: &mut [i32],
-    src: &[i32],
+fn filter_v_i16<const N: usize>(
+    out: &mut [i16],
+    src: &[i16],
     base: usize,
     stride: usize,
     f: &[i16; N],
     shift: u32,
 ) {
     let w = out.len();
-    let c0 = f[0] as i32;
-    for (o, &v) in out.iter_mut().zip(&src[base..][..w]) {
-        *o = c0 * v;
-    }
-    for (k, &c) in f.iter().enumerate().skip(1) {
-        let c = c as i32;
-        for (o, &v) in out.iter_mut().zip(&src[base + k * stride..][..w]) {
-            *o += c * v;
+    let rows: [&[i16]; N] = std::array::from_fn(|k| &src[base + k * stride..][..w]);
+    // Tap-major over fixed 8-lane chunks: the i32 accumulators stay in
+    // registers (no per-row array to initialise) and each tap is one
+    // widening multiply-add across the chunk.
+    let chunks = w / 8;
+    for c in 0..chunks {
+        let mut acc = [0i32; 8];
+        for (k, row) in rows.iter().enumerate() {
+            let coef = f[k] as i32;
+            let r: &[i16; 8] = row[c * 8..c * 8 + 8].try_into().unwrap();
+            for l in 0..8 {
+                acc[l] += coef * r[l] as i32;
+            }
+        }
+        let o: &mut [i16; 8] = (&mut out[c * 8..c * 8 + 8]).try_into().unwrap();
+        for l in 0..8 {
+            o[l] = (acc[l] >> shift) as i16;
         }
     }
-    for o in out.iter_mut() {
-        *o >>= shift;
+    // Narrow chroma blocks (2, 4 or 6 wide) and any tail.
+    for i in chunks * 8..w {
+        let mut a = 0i32;
+        for k in 0..N {
+            a += f[k] as i32 * rows[k][i] as i32;
+        }
+        out[i] = (a >> shift) as i16;
     }
 }
 
 /// Destination for the rows `interp_block` produces. `row(j, w)` gives the
 /// buffer to write row `j` into; `done(j)` is called once it is complete.
 trait RowSink {
-    fn row(&mut self, j: usize, w: usize) -> &mut [i32];
+    fn row(&mut self, j: usize, w: usize) -> &mut [i16];
     fn done(&mut self, j: usize);
 }
 
-/// Writes 14-bit intermediates straight into a block of i32s
+/// Writes 14-bit intermediates straight into a block of i16s
 /// (bi-prediction and weighted-prediction inputs), with no extra copy.
-struct I32Sink<'a> {
-    dst: &'a mut [i32],
+struct I16Sink<'a> {
+    dst: &'a mut [i16],
     stride: usize,
 }
 
-impl RowSink for I32Sink<'_> {
+impl RowSink for I16Sink<'_> {
     #[inline(always)]
-    fn row(&mut self, j: usize, w: usize) -> &mut [i32] {
+    fn row(&mut self, j: usize, w: usize) -> &mut [i16] {
         &mut self.dst[j * self.stride..][..w]
     }
     #[inline(always)]
@@ -440,7 +479,7 @@ struct PixelSink<'a, P: Pixel> {
     offset: i32,
     shift: i32,
     bit_depth: u8,
-    buf: [i32; MAX_PB_SIZE],
+    buf: [i16; MAX_PB_SIZE],
     w: usize,
 }
 
@@ -461,7 +500,7 @@ impl<'a, P: Pixel> PixelSink<'a, P> {
 
 impl<P: Pixel> RowSink for PixelSink<'_, P> {
     #[inline(always)]
-    fn row(&mut self, _j: usize, w: usize) -> &mut [i32] {
+    fn row(&mut self, _j: usize, w: usize) -> &mut [i16] {
         self.w = w;
         &mut self.buf[..w]
     }
@@ -471,7 +510,7 @@ impl<P: Pixel> RowSink for PixelSink<'_, P> {
         let (offset, shift, bd) = (self.offset, self.shift, self.bit_depth);
         if let Some(d) = self.dst.get_mut(start..start + self.w) {
             for (o, &v) in d.iter_mut().zip(&self.buf[..self.w]) {
-                *o = P::from_i32_clamped((v + offset) >> shift, bd);
+                *o = P::from_i32_clamped((v as i32 + offset) >> shift, bd);
             }
         }
     }
@@ -566,7 +605,7 @@ pub fn mc_luma<P: Pixel>(
     mv_x: i16,
     mv_y: i16,
     bit_depth: u8,
-    tmp: &mut [i32],
+    tmp: &mut [i16],
     edge: &mut [P],
 ) {
     let x_frac = (mv_x & 3) as usize;
@@ -591,21 +630,20 @@ pub fn mc_luma<P: Pixel>(
     );
 }
 
-/// Luma MC producing i32 intermediates for bi-prediction / weighted prediction
-/// (no final clip).
+/// Luma MC producing the spec's 14-bit intermediates (`predSamplesLX`,
+/// spec 8.5.3.3.3) for bi-prediction / weighted prediction, without the
+/// final rounding and clip. Bi-prediction combines two of them as
+/// `clip((L0 + L1 + bipred_offset) >> bipred_shift)`.
 ///
-/// The output is at "shift-6" precision: for sub-pixel, this is the raw
-/// filter output (H/V-only) or `vert_pass >> 6` (2D). For integer-pel,
-/// the pixel value is left-shifted by 6 to match. Bi-prediction combines
-/// two intermediates as `clip((L0 + L1 + bipred_offset) >> bipred_shift)`.
-///
-/// Uses i32 output (instead of i16) for 10-bit safety: 8-tap on 1023-max
-/// samples left-shifted by 6 can exceed i16 range.
-///
-/// Generic over `P: Pixel` for multi-bit-depth support.
+/// Stored as i16, as HM and FFmpeg store them: a first filter pass is
+/// shifted right by `BitDepth - 8`, so it stays below 112 * 255 (28,560)
+/// for every bit depth up to 12, and integer positions shifted left by
+/// `14 - BitDepth` fit as well. The second pass of a 2-D filter sums in i32
+/// before its shift. Half the memory traffic of i32 and twice the SIMD
+/// lanes in the combine loops.
 #[allow(clippy::too_many_arguments)]
-pub fn mc_luma_i32<P: Pixel>(
-    dst: &mut [i32],
+pub fn mc_luma_i16<P: Pixel>(
+    dst: &mut [i16],
     dst_stride: usize,
     ref_plane: &[P],
     ref_stride: usize,
@@ -618,7 +656,7 @@ pub fn mc_luma_i32<P: Pixel>(
     mv_x: i16,
     mv_y: i16,
     bit_depth: u8,
-    tmp: &mut [i32],
+    tmp: &mut [i16],
     edge: &mut [P],
 ) {
     let x_frac = (mv_x & 3) as usize;
@@ -637,19 +675,18 @@ pub fn mc_luma_i32<P: Pixel>(
         bit_depth,
         tmp,
         edge,
-        &mut I32Sink {
+        &mut I16Sink {
             dst,
             stride: dst_stride,
         },
     );
 }
 
-/// Chroma MC producing i32 intermediates for bi-prediction / weighted prediction.
-///
-/// Uses i32 output for 10-bit safety. Generic over `P: Pixel`.
+/// Chroma MC producing 14-bit i16 intermediates for bi-prediction /
+/// weighted prediction (see `mc_luma_i16`).
 #[allow(clippy::too_many_arguments)]
-pub fn mc_chroma_i32<P: Pixel>(
-    dst: &mut [i32],
+pub fn mc_chroma_i16<P: Pixel>(
+    dst: &mut [i16],
     dst_stride: usize,
     ref_plane: &[P],
     ref_stride: usize,
@@ -662,7 +699,7 @@ pub fn mc_chroma_i32<P: Pixel>(
     mv_x: i32,
     mv_y: i32,
     bit_depth: u8,
-    tmp: &mut [i32],
+    tmp: &mut [i16],
     edge: &mut [P],
 ) {
     // Chroma MV in eighth-chroma-sample units (see `chroma_mv`).
@@ -682,7 +719,7 @@ pub fn mc_chroma_i32<P: Pixel>(
         bit_depth,
         tmp,
         edge,
-        &mut I32Sink {
+        &mut I16Sink {
             dst,
             stride: dst_stride,
         },
@@ -711,7 +748,7 @@ pub fn mc_chroma<P: Pixel>(
     mv_x_c: i32,
     mv_y_c: i32,
     bit_depth: u8,
-    tmp: &mut [i32],
+    tmp: &mut [i16],
     edge: &mut [P],
 ) {
     // Chroma MV in eighth-chroma-sample units (see `chroma_mv`).
@@ -804,8 +841,8 @@ pub fn motion_compensation_pu<P: Pixel>(
     let bit_depth_c = state.bit_depth_c;
 
     if is_bi {
-        // Bi-prediction: compute L0 and L1 intermediates at i32 precision
-        // (before the final clip), then combine as specified by the HEVC spec:
+        // Bi-prediction: compute the 14-bit L0 and L1 intermediates (i16,
+        // before the final clip), then combine as specified by the HEVC spec:
         //   output = clip((L0 + L1 + bipred_offset) >> bipred_shift)
         // For 8-bit: shift = 7, offset = 64. For 10-bit: shift = 5, offset = 16.
         let pred_l0_y = &mut luma0[..];
@@ -825,7 +862,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             let rw = ref_pic_l0.width as i32;
             let rh = ref_pic_l0.height as i32;
             let rs = ref_pic_l0.y_stride;
-            mc_luma_i32::<P>(
+            mc_luma_i16::<P>(
                 pred_l0_y,
                 w,
                 P::extract_slice(&ref_pic_l0.y),
@@ -847,7 +884,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             let rs_c = ref_pic_l0.uv_stride;
             let mv_x_c = chroma_mv(mvf.mv[0].x, csw);
             let mv_y_c = chroma_mv(mvf.mv[0].y, csh);
-            mc_chroma_i32::<P>(
+            mc_chroma_i16::<P>(
                 pred_l0_u,
                 w_c,
                 P::extract_slice(&ref_pic_l0.u),
@@ -864,7 +901,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 &mut tmp[..],
                 &mut edge[..],
             );
-            mc_chroma_i32::<P>(
+            mc_chroma_i16::<P>(
                 pred_l0_v,
                 w_c,
                 P::extract_slice(&ref_pic_l0.v),
@@ -893,7 +930,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             let rw = ref_pic_l1.width as i32;
             let rh = ref_pic_l1.height as i32;
             let rs = ref_pic_l1.y_stride;
-            mc_luma_i32::<P>(
+            mc_luma_i16::<P>(
                 pred_l1_y,
                 w,
                 P::extract_slice(&ref_pic_l1.y),
@@ -915,7 +952,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             let rs_c = ref_pic_l1.uv_stride;
             let mv_x_c = chroma_mv(mvf.mv[1].x, csw);
             let mv_y_c = chroma_mv(mvf.mv[1].y, csh);
-            mc_chroma_i32::<P>(
+            mc_chroma_i16::<P>(
                 pred_l1_u,
                 w_c,
                 P::extract_slice(&ref_pic_l1.u),
@@ -932,7 +969,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 &mut tmp[..],
                 &mut edge[..],
             );
-            mc_chroma_i32::<P>(
+            mc_chroma_i16::<P>(
                 pred_l1_v,
                 w_c,
                 P::extract_slice(&ref_pic_l1.v),
@@ -951,7 +988,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             );
         }
 
-        // Combine at i32 precision: (L0 + L1 + bipred_offset) >> bipred_shift, then clip.
+        // Combine in i32: (L0 + L1 + bipred_offset) >> bipred_shift, then clip.
         let y_off = (y0 as usize) * y_stride + (x0 as usize);
         // Explicit weighted bi-prediction (spec 8.5.3.3.4.3) uses per-list
         // weights and offsets for each plane; otherwise the default average.
@@ -983,7 +1020,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 )
             }
         };
-        let bi = |plane: &mut [P], c: usize, off, stride, a: &[i32], b: &[i32], w, h| {
+        let bi = |plane: &mut [P], c: usize, off, stride, a: &[i16], b: &[i16], w, h| {
             let bit_depth = if c == 0 { bit_depth } else { bit_depth_c };
             let bi_shift = crate::pixel::bipred_shift(bit_depth) as i32;
             let bi_offset = crate::pixel::bipred_offset(bit_depth);
@@ -993,6 +1030,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 put_rows(plane, off, stride, w, h, |d, j| {
                     let (a, b) = (&a[j * w..][..w], &b[j * w..][..w]);
                     for ((o, &x), &y) in d.iter_mut().zip(a).zip(b) {
+                        let (x, y) = (x as i32, y as i32);
                         *o = P::from_i32_clamped(
                             (x * w0 + y * w1 + round) >> (log2wd + 1),
                             bit_depth,
@@ -1003,6 +1041,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 put_rows(plane, off, stride, w, h, |d, j| {
                     let (a, b) = (&a[j * w..][..w], &b[j * w..][..w]);
                     for ((o, &x), &y) in d.iter_mut().zip(a).zip(b) {
+                        let (x, y) = (x as i32, y as i32);
                         *o = P::from_i32_clamped((x + y + bi_offset) >> bi_shift, bit_depth);
                     }
                 })
@@ -1160,9 +1199,9 @@ pub fn motion_compensation_pu<P: Pixel>(
                 )
             };
 
-            // Luma: MC into i32 intermediate, then apply weight.
+            // Luma: MC into the i16 intermediate, then apply weight.
             let pred_y = &mut luma0[..];
-            mc_luma_i32::<P>(
+            mc_luma_i16::<P>(
                 pred_y,
                 w,
                 P::extract_slice(&ref_list.y),
@@ -1184,7 +1223,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             // For 8-bit: log2WD = luma_log2_weight_denom
             // FFmpeg's put_hevc_qpel_uni_w uses:
             //   (((val >> (14 - 8)) * weight + (1 << (log2WD + 14 - 8 - 1))) >> (log2WD + 14 - 8)) + offset
-            // The i32 intermediate from mc_luma_i32 is at (14 - bit_depth)
+            // The intermediate from mc_luma_i16 is at (14 - bit_depth)
             // bits of extra precision. Weighted pred: clip((pred * weight +
             // round) >> (mc_shift + denom)) + offset.
             let mc_sh = crate::pixel::mc_shift(bit_depth) as i32;
@@ -1216,7 +1255,7 @@ pub fn motion_compensation_pu<P: Pixel>(
 
             let pred_u = &mut cb0[..];
             let pred_v = &mut cr0[..];
-            mc_chroma_i32::<P>(
+            mc_chroma_i16::<P>(
                 pred_u,
                 w_c,
                 P::extract_slice(&ref_list.u),
@@ -1233,7 +1272,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 &mut tmp[..],
                 &mut edge[..],
             );
-            mc_chroma_i32::<P>(
+            mc_chroma_i16::<P>(
                 pred_v,
                 w_c,
                 P::extract_slice(&ref_list.v),
@@ -1409,7 +1448,7 @@ mod tests {
             0,
             0,
             8,
-            &mut vec![0i32; MC_TMP_LEN],
+            &mut vec![0i16; MC_TMP_LEN],
             &mut vec![0u8; MC_EDGE_LEN],
         );
 
@@ -1443,7 +1482,7 @@ mod tests {
             2,
             0,
             8,
-            &mut vec![0i32; MC_TMP_LEN],
+            &mut vec![0i16; MC_TMP_LEN],
             &mut vec![0u8; MC_EDGE_LEN],
         );
 
@@ -1475,7 +1514,7 @@ mod tests {
             1,
             3,
             8,
-            &mut vec![0i32; MC_TMP_LEN],
+            &mut vec![0i16; MC_TMP_LEN],
             &mut vec![0u8; MC_EDGE_LEN],
         );
 
@@ -1514,7 +1553,7 @@ mod tests {
             0,
             0,
             8,
-            &mut vec![0i32; MC_TMP_LEN],
+            &mut vec![0i16; MC_TMP_LEN],
             &mut vec![0u8; MC_EDGE_LEN],
         );
 
@@ -1547,7 +1586,7 @@ mod tests {
             3,
             5,
             8,
-            &mut vec![0i32; MC_TMP_LEN],
+            &mut vec![0i16; MC_TMP_LEN],
             &mut vec![0u8; MC_EDGE_LEN],
         );
 
