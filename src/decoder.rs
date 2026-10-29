@@ -29,6 +29,7 @@ use crate::error::DecodeError;
 use crate::nal::{NalUnit, NalUnitType};
 use crate::pixel::{Pixel, PixelData};
 use crate::pps::{Pps, parse_pps};
+use crate::shared::SharedTable;
 use crate::slice::{SliceHeader, SliceType, parse_slice_segment_header};
 use crate::sps::{ShortTermRps, Sps, parse_sps};
 
@@ -516,16 +517,13 @@ impl PicturePool {
         let Ok(pic) = Arc::try_unwrap(pic) else {
             return;
         };
-        match (pic.y, pic.u, pic.v) {
-            (PixelData::U8(y), PixelData::U8(u), PixelData::U8(v))
-                if self.planes_u8.len() < POOLED_PLANE_SETS =>
-            {
-                self.planes_u8.push(([y, u, v], pic.tab_mvf));
+        let mvf = pic.tab_mvf.into_vec();
+        match pic.planes {
+            crate::dpb::PicturePlanes::U8(p) if self.planes_u8.len() < POOLED_PLANE_SETS => {
+                self.planes_u8.push((p.map(SharedTable::into_vec), mvf));
             }
-            (PixelData::U16(y), PixelData::U16(u), PixelData::U16(v))
-                if self.planes_u16.len() < POOLED_PLANE_SETS =>
-            {
-                self.planes_u16.push(([y, u, v], pic.tab_mvf));
+            crate::dpb::PicturePlanes::U16(p) if self.planes_u16.len() < POOLED_PLANE_SETS => {
+                self.planes_u16.push((p.map(SharedTable::into_vec), mvf));
             }
             _ => {}
         }
@@ -1699,7 +1697,7 @@ impl Decoder {
             dp.chroma_shift_w = chroma_shift_w;
             dp.chroma_shift_h = chroma_shift_h;
             dp.slice_ref_pic_list_pocs = std::mem::take(&mut pic.slice_ref_pocs);
-            dp.ctb_slice_addr = std::mem::take(&mut state.tab_slice_addr_rs).into_vec();
+            dp.ctb_slice_addr = std::mem::take(&mut state.tab_slice_addr_rs);
             Arc::new(dp)
         });
         self.pool.recycle_state(pic.state);

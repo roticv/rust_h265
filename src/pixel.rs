@@ -80,6 +80,12 @@ pub trait Pixel: Copy + Clone + Default + Send + Sync + Sized + 'static {
 
     /// Wrap a `Vec<Self>` into the matching `PixelData` variant.
     fn wrap_vec(v: Vec<Self>) -> PixelData;
+
+    /// A decoded picture's planes in this sample type.
+    fn picture_planes(p: &crate::dpb::PicturePlanes) -> &[crate::shared::SharedTable<Self>; 3];
+
+    /// Wrap planes of this sample type.
+    fn wrap_planes(p: [crate::shared::SharedTable<Self>; 3]) -> crate::dpb::PicturePlanes;
 }
 
 impl Pixel for u8 {
@@ -119,6 +125,19 @@ impl Pixel for u8 {
     #[inline(always)]
     fn wrap_vec(v: Vec<Self>) -> PixelData {
         PixelData::U8(v)
+    }
+
+    #[inline(always)]
+    fn picture_planes(p: &crate::dpb::PicturePlanes) -> &[crate::shared::SharedTable<Self>; 3] {
+        match p {
+            crate::dpb::PicturePlanes::U8(planes) => planes,
+            crate::dpb::PicturePlanes::U16(_) => panic!("picture planes accessed as u8"),
+        }
+    }
+
+    #[inline(always)]
+    fn wrap_planes(p: [crate::shared::SharedTable<Self>; 3]) -> crate::dpb::PicturePlanes {
+        crate::dpb::PicturePlanes::U8(p)
     }
 }
 
@@ -160,6 +179,19 @@ impl Pixel for u16 {
     #[inline(always)]
     fn wrap_vec(v: Vec<Self>) -> PixelData {
         PixelData::U16(v)
+    }
+
+    #[inline(always)]
+    fn picture_planes(p: &crate::dpb::PicturePlanes) -> &[crate::shared::SharedTable<Self>; 3] {
+        match p {
+            crate::dpb::PicturePlanes::U16(planes) => planes,
+            crate::dpb::PicturePlanes::U8(_) => panic!("picture planes accessed as u16"),
+        }
+    }
+
+    #[inline(always)]
+    fn wrap_planes(p: [crate::shared::SharedTable<Self>; 3]) -> crate::dpb::PicturePlanes {
+        crate::dpb::PicturePlanes::U16(p)
     }
 }
 

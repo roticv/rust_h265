@@ -542,6 +542,16 @@ fn bi_average_row<P: Pixel>(
     }
 }
 
+/// Plane `c` (0 = luma, 1 = Cb, 2 = Cr) of a reference picture. The
+/// reference is complete: with frame threading the decoding thread waits
+/// for every reference of a slice before decoding it, so no thread writes
+/// the plane any more.
+#[inline(always)]
+fn ref_plane<P: Pixel>(pic: &DecodedPicture, c: usize) -> &[P] {
+    debug_assert!(pic.progress.is_complete());
+    &P::picture_planes(&pic.planes)[c][..]
+}
+
 /// Row stride of the padded edge buffer: a 64-wide block plus the 7-sample
 /// luma filter margin.
 pub(crate) const MC_EDGE_STRIDE: usize = MAX_PB_SIZE + 7;
@@ -891,7 +901,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_luma_i16::<P>(
                 pred_l0_y,
                 w,
-                P::extract_slice(&ref_pic_l0.y),
+                ref_plane::<P>(ref_pic_l0, 0),
                 rs,
                 rw,
                 rh,
@@ -913,7 +923,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_chroma_i16::<P>(
                 pred_l0_u,
                 w_c,
-                P::extract_slice(&ref_pic_l0.u),
+                ref_plane::<P>(ref_pic_l0, 1),
                 rs_c,
                 rw_c,
                 rh_c,
@@ -930,7 +940,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_chroma_i16::<P>(
                 pred_l0_v,
                 w_c,
-                P::extract_slice(&ref_pic_l0.v),
+                ref_plane::<P>(ref_pic_l0, 2),
                 rs_c,
                 rw_c,
                 rh_c,
@@ -959,7 +969,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_luma_i16::<P>(
                 pred_l1_y,
                 w,
-                P::extract_slice(&ref_pic_l1.y),
+                ref_plane::<P>(ref_pic_l1, 0),
                 rs,
                 rw,
                 rh,
@@ -981,7 +991,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_chroma_i16::<P>(
                 pred_l1_u,
                 w_c,
-                P::extract_slice(&ref_pic_l1.u),
+                ref_plane::<P>(ref_pic_l1, 1),
                 rs_c,
                 rw_c,
                 rh_c,
@@ -998,7 +1008,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_chroma_i16::<P>(
                 pred_l1_v,
                 w_c,
-                P::extract_slice(&ref_pic_l1.v),
+                ref_plane::<P>(ref_pic_l1, 2),
                 rs_c,
                 rw_c,
                 rh_c,
@@ -1131,9 +1141,9 @@ pub fn motion_compensation_pu<P: Pixel>(
             // Non-weighted uni-prediction: MC directly into the picture planes.
             // Each destination range ends at the block's last sample, so it
             // stays inside the block's own CTB row (wavefront decoding).
-            let ref_y = P::extract_slice(&ref_list.y);
-            let ref_u = P::extract_slice(&ref_list.u);
-            let ref_v = P::extract_slice(&ref_list.v);
+            let ref_y = ref_plane::<P>(ref_list, 0);
+            let ref_u = ref_plane::<P>(ref_list, 1);
+            let ref_v = ref_plane::<P>(ref_list, 2);
             let y_off = (y0 as usize) * y_stride + (x0 as usize);
             mc_luma::<P>(
                 &mut state.y_plane[y_off..y_off + (h - 1) * y_stride + w],
@@ -1234,7 +1244,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_luma_i16::<P>(
                 pred_y,
                 w,
-                P::extract_slice(&ref_list.y),
+                ref_plane::<P>(ref_list, 0),
                 ref_list.y_stride,
                 pic_w,
                 pic_h,
@@ -1288,7 +1298,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_chroma_i16::<P>(
                 pred_u,
                 w_c,
-                P::extract_slice(&ref_list.u),
+                ref_plane::<P>(ref_list, 1),
                 ref_uv_stride,
                 ref_w_c,
                 ref_h_c,
@@ -1305,7 +1315,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_chroma_i16::<P>(
                 pred_v,
                 w_c,
-                P::extract_slice(&ref_list.v),
+                ref_plane::<P>(ref_list, 2),
                 ref_uv_stride,
                 ref_w_c,
                 ref_h_c,

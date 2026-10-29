@@ -12,8 +12,10 @@
 //! reference lists at once, without indices that compaction would
 //! invalidate, and so worker threads can read reference pictures.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+
+use crate::shared::SharedTable;
 
 use crate::pixel::PixelData;
 
@@ -38,15 +40,121 @@ pub struct SliceRefLists {
     pub is_long_term: [Vec<bool>; 2],
 }
 
+/// A picture's luma, Cb and Cr planes, in its sample type.
+#[derive(Debug)]
+pub enum PicturePlanes {
+    U8([SharedTable<u8>; 3]),
+    U16([SharedTable<u16>; 3]),
+}
+
+impl PicturePlanes {
+    pub fn from_pixel_data(y: PixelData, u: PixelData, v: PixelData) -> Self {
+        match (y, u, v) {
+            (PixelData::U8(y), PixelData::U8(u), PixelData::U8(v)) => {
+                PicturePlanes::U8([y.into(), u.into(), v.into()])
+            }
+            (PixelData::U16(y), PixelData::U16(u), PixelData::U16(v)) => {
+                PicturePlanes::U16([y.into(), u.into(), v.into()])
+            }
+            _ => panic!("planes of different sample types"),
+        }
+    }
+}
+
+/// How far a picture is decoded, for pictures that reference it while it
+/// is still decoding (frame threading). `decoded_ctb_rows`: CTB rows whose
+/// CTBs are decoded (their motion field and slice map are final).
+/// `final_rows`: luma sample rows that are final, after the loop filters
+/// (the matching chroma rows are final too). A finished picture has both
+/// at their maximum.
+#[derive(Debug)]
+pub struct PictureProgress {
+    decoded_ctb_rows: AtomicUsize,
+    final_rows: AtomicUsize,
+    lock: Mutex<()>,
+    wake: Condvar,
+}
+
+impl PictureProgress {
+    /// A finished picture.
+    pub fn complete() -> Self {
+        Self::with(usize::MAX, usize::MAX)
+    }
+
+    /// A picture that is about to be decoded.
+    pub fn started() -> Self {
+        Self::with(0, 0)
+    }
+
+    fn with(decoded: usize, final_rows: usize) -> Self {
+        Self {
+            decoded_ctb_rows: AtomicUsize::new(decoded),
+            final_rows: AtomicUsize::new(final_rows),
+            lock: Mutex::new(()),
+            wake: Condvar::new(),
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.final_rows.load(Ordering::Acquire) == usize::MAX
+            && self.decoded_ctb_rows.load(Ordering::Acquire) == usize::MAX
+    }
+
+    /// Publish progress (`Release`: what the decoding thread wrote before is
+    /// visible to a thread that observes it), waking waiters.
+    pub fn publish(&self, decoded_ctb_rows: usize, final_rows: usize) {
+        self.decoded_ctb_rows
+            .store(decoded_ctb_rows, Ordering::Release);
+        self.final_rows.store(final_rows, Ordering::Release);
+        drop(self.lock.lock().unwrap());
+        self.wake.notify_all();
+    }
+
+    /// The picture is finished (also when it failed: whatever was decoded,
+    /// and the grey fill of the rest, is what references see).
+    pub fn set_complete(&self) {
+        self.publish(usize::MAX, usize::MAX);
+    }
+
+    fn wait_for(&self, ready: impl Fn() -> bool) {
+        if ready() {
+            return;
+        }
+        let mut guard = self.lock.lock().unwrap();
+        while !ready() {
+            guard = self.wake.wait(guard).unwrap();
+        }
+    }
+
+    /// Wait until at least `n` CTB rows are decoded.
+    pub fn wait_decoded_ctb_rows(&self, n: usize) {
+        self.wait_for(|| self.decoded_ctb_rows.load(Ordering::Acquire) >= n);
+    }
+
+    /// Wait until at least `n` luma rows are final.
+    pub fn wait_final_rows(&self, n: usize) {
+        self.wait_for(|| self.final_rows.load(Ordering::Acquire) >= n);
+    }
+
+    /// Wait until the picture is finished.
+    pub fn wait_complete(&self) {
+        self.wait_for(|| self.is_complete());
+    }
+}
+
 /// One decoded picture's planes + metadata.
+///
+/// With frame threading a picture is in the DPB, and referenced, while it
+/// is still being decoded: its planes, motion field and slice map are
+/// `SharedTable`s the decoding thread writes through views, and readers
+/// wait on `progress` before reading. A sequentially decoded picture is
+/// complete when it is created.
 #[derive(Debug)]
 pub struct DecodedPicture {
-    /// Luma plane in raster order.
-    pub y: PixelData,
-    /// Cb plane.
-    pub u: PixelData,
-    /// Cr plane.
-    pub v: PixelData,
+    /// Luma, Cb and Cr planes in raster order, with strides `y_stride` /
+    /// `uv_stride`.
+    pub planes: PicturePlanes,
+    pub progress: PictureProgress,
     pub width: u32,
     pub height: u32,
     /// Signed picture order count (negative for leading pictures that
@@ -62,7 +170,7 @@ pub struct DecodedPicture {
 
     /// per min-PU motion field stored when inserting into the DPB.
     /// Used by temporal merge/AMVP candidate derivation (spec 8.5.3.2.3 / 8.5.3.2.7).
-    pub tab_mvf: Vec<crate::cu_tree::MvField>,
+    pub tab_mvf: SharedTable<crate::cu_tree::MvField>,
     /// `log2_min_pu_size` of this picture (needed to index `tab_mvf`).
     pub log2_min_pu_size: u8,
     /// min-PU width = `width >> log2_min_pu_size`.
@@ -91,7 +199,7 @@ pub struct DecodedPicture {
     pub slice_ref_pic_list_pocs: Vec<(i32, SliceRefLists)>,
     /// Slice address of every CTB in raster order (`tab_slice_addr_rs` of
     /// the decoded picture).
-    pub ctb_slice_addr: Vec<i32>,
+    pub ctb_slice_addr: SharedTable<i32>,
 }
 
 impl DecodedPicture {
@@ -104,15 +212,14 @@ impl DecodedPicture {
         poc: i32,
     ) -> Self {
         Self {
-            y,
-            u,
-            v,
+            planes: PicturePlanes::from_pixel_data(y, u, v),
+            progress: PictureProgress::complete(),
             width,
             height,
             poc,
             reference_status: AtomicU8::new(PictureReferenceStatus::ShortTerm as u8),
             output: AtomicBool::new(false),
-            tab_mvf: Vec::new(),
+            tab_mvf: SharedTable::default(),
             log2_min_pu_size: 2,
             min_pu_width: 0,
             log2_ctb_size: 0,
@@ -122,7 +229,7 @@ impl DecodedPicture {
             chroma_shift_w: 1,
             chroma_shift_h: 1,
             slice_ref_pic_list_pocs: Vec::new(),
-            ctb_slice_addr: Vec::new(),
+            ctb_slice_addr: SharedTable::default(),
         }
     }
 
@@ -143,15 +250,14 @@ impl DecodedPicture {
         ref_pic_list_pocs: [Vec<i32>; 2],
     ) -> Self {
         Self {
-            y,
-            u,
-            v,
+            planes: PicturePlanes::from_pixel_data(y, u, v),
+            progress: PictureProgress::complete(),
             width,
             height,
             poc,
             reference_status: AtomicU8::new(PictureReferenceStatus::ShortTerm as u8),
             output: AtomicBool::new(false),
-            tab_mvf,
+            tab_mvf: tab_mvf.into(),
             log2_min_pu_size,
             min_pu_width,
             log2_ctb_size,
@@ -161,7 +267,7 @@ impl DecodedPicture {
             chroma_shift_w: 1,
             chroma_shift_h: 1,
             slice_ref_pic_list_pocs: Vec::new(),
-            ctb_slice_addr: Vec::new(),
+            ctb_slice_addr: SharedTable::default(),
         }
     }
 
