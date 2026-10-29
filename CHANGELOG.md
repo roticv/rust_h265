@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     threads, each row two CTBs behind the one above.
   - The loop filters of a picture decoded on the calling thread run over
     bands of picture rows.
+  - Pictures run on a persistent pool of `n + 1` worker threads, created
+    with the first picture.
   - With more than one thread, frames and slice-data errors come out of
     later calls than with one; `Decoder::next_error()` returns errors
     found after the last `decode_nal`.

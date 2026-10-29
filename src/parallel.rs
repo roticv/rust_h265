@@ -78,9 +78,126 @@ pub(crate) fn for_each_band<P, F>(
     });
 }
 
+// ---- Persistent worker threads ---------------------------------------------
+
+type Job = Box<dyn FnOnce() + Send>;
+
+/// A fixed set of worker threads running tasks in submission order (frame
+/// threading runs one task per picture). Saves starting an OS thread per
+/// picture. Dropping the pool lets the running tasks finish and joins the
+/// workers.
+pub(crate) struct ThreadPool {
+    jobs: Option<std::sync::mpsc::Sender<Job>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl ThreadPool {
+    pub(crate) fn new(threads: usize, name: &str) -> Self {
+        let (jobs, receiver) = std::sync::mpsc::channel::<Job>();
+        let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
+        let workers = (0..threads.max(1))
+            .map(|_| {
+                let receiver = std::sync::Arc::clone(&receiver);
+                std::thread::Builder::new()
+                    .name(name.to_string())
+                    .spawn(move || {
+                        loop {
+                            // The lock is held only to take the next task.
+                            let job = receiver.lock().unwrap().recv();
+                            match job {
+                                Ok(job) => job(),
+                                Err(_) => break, // the pool was dropped
+                            }
+                        }
+                    })
+                    .expect("spawn a worker thread")
+            })
+            .collect();
+        Self {
+            jobs: Some(jobs),
+            workers,
+        }
+    }
+
+    /// Run `f` on a worker. A panic in `f` is caught (the worker carries
+    /// on) and returned by `TaskHandle::join`, like a thread's.
+    pub(crate) fn spawn<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> TaskHandle<T> {
+        let (result, receiver) = std::sync::mpsc::channel();
+        let job: Job = Box::new(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let _ = result.send(r);
+        });
+        self.jobs
+            .as_ref()
+            .expect("pool alive")
+            .send(job)
+            .expect("worker threads alive");
+        TaskHandle {
+            receiver,
+            result: None,
+        }
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        drop(self.jobs.take());
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
+    }
+}
+
+/// The result of a task run by a `ThreadPool`.
+pub(crate) struct TaskHandle<T> {
+    receiver: std::sync::mpsc::Receiver<std::thread::Result<T>>,
+    result: Option<std::thread::Result<T>>,
+}
+
+impl<T> TaskHandle<T> {
+    /// Whether the task has finished (without waiting).
+    pub(crate) fn is_finished(&mut self) -> bool {
+        if self.result.is_none()
+            && let Ok(r) = self.receiver.try_recv()
+        {
+            self.result = Some(r);
+        }
+        self.result.is_some()
+    }
+
+    /// Wait for the task: its value, or the panic it raised.
+    pub(crate) fn join(mut self) -> std::thread::Result<T> {
+        match self.result.take() {
+            Some(r) => r,
+            None => self
+                .receiver
+                .recv()
+                .unwrap_or_else(|_| Err(Box::new("worker thread lost"))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_runs_tasks_and_returns_panics() {
+        let pool = ThreadPool::new(2, "test");
+        let handles: Vec<_> = (0..8u32).map(|i| pool.spawn(move || i * i)).collect();
+        let values: Vec<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(values, (0..8).map(|i| i * i).collect::<Vec<_>>());
+        let mut bad = pool.spawn(|| -> u32 { panic!("task failed") });
+        while !bad.is_finished() {
+            std::thread::yield_now();
+        }
+        assert!(bad.join().is_err());
+        // The workers survive a panicking task.
+        assert_eq!(pool.spawn(|| 7).join().unwrap(), 7);
+    }
 
     #[test]
     fn split_units_covers_everything_once() {

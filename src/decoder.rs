@@ -202,7 +202,7 @@ enum PictureSide {
     /// On the calling thread, slice by slice as `decode_nal` receives them.
     Local(Box<PictureDecode>),
     /// On its own thread (frame threading).
-    Thread(PictureThread),
+    Thread(Box<PictureThread>),
 }
 
 /// The calling thread's handle on a picture decoding on its own thread.
@@ -210,7 +210,7 @@ struct PictureThread {
     /// Identifies the picture's pending frame in the output queue.
     id: u64,
     jobs: std::sync::mpsc::Sender<PictureMessage>,
-    handle: std::thread::JoinHandle<PictureResult>,
+    handle: crate::parallel::TaskHandle<PictureResult>,
     picture: Arc<DecodedPicture>,
 }
 
@@ -238,7 +238,7 @@ struct PictureResult {
 /// A picture whose last slice has been handed to its thread.
 struct InFlight {
     id: u64,
-    handle: std::thread::JoinHandle<PictureResult>,
+    handle: crate::parallel::TaskHandle<PictureResult>,
     /// PicOutputFlag: whether its frame is output.
     output: bool,
 }
@@ -301,6 +301,7 @@ fn picture_thread(
 /// views of them), so later pictures can reference it while it decodes.
 #[allow(clippy::too_many_arguments)]
 fn start_picture_thread(
+    workers: &crate::parallel::ThreadPool,
     dpb: &mut DecodedPictureBuffer,
     pool: &mut PicturePool,
     id: u64,
@@ -356,10 +357,7 @@ fn start_picture_thread(
         rows_in_parallel,
     };
     let for_thread = Arc::clone(&picture);
-    let handle = std::thread::Builder::new()
-        .name("rust_h265 picture".into())
-        .spawn(move || picture_thread(decode, receiver, for_thread, threads))
-        .expect("spawn a picture thread");
+    let handle = workers.spawn(move || picture_thread(decode, receiver, for_thread, threads));
     PictureThread {
         id,
         jobs,
@@ -876,6 +874,9 @@ pub struct Decoder {
     /// returned by later calls to `decode_nal`.
     deferred_errors: std::collections::VecDeque<DecodeError>,
     next_picture_id: u64,
+    /// Frame threading: the threads pictures decode on (created with the
+    /// first picture).
+    workers: Option<crate::parallel::ThreadPool>,
     output_queue: crate::output::OutputQueue,
     /// Decoding-order mode: frames ready but not yet returned. A call can
     /// finish two pictures (an incomplete earlier one, then its own), and
@@ -1009,13 +1010,15 @@ impl PicturePool {
 }
 
 impl Drop for Decoder {
-    /// Picture threads still running end with the decoder: the current
-    /// picture's thread sees its channel close, the others finish.
+    /// Pictures still decoding end with the decoder: the current picture's
+    /// task sees its channel close, the others finish; then the worker
+    /// threads are joined.
     fn drop(&mut self) {
         self.current_picture = None;
         for f in self.in_flight.drain(..) {
             let _ = f.handle.join();
         }
+        self.workers = None;
     }
 }
 
@@ -1779,7 +1782,12 @@ impl Decoder {
             let side = if self.threads > 1 {
                 let id = self.next_picture_id;
                 self.next_picture_id += 1;
-                PictureSide::Thread(start_picture_thread(
+                // `threads` pictures in flight plus the one receiving slices.
+                let workers = self.workers.get_or_insert_with(|| {
+                    crate::parallel::ThreadPool::new(self.threads + 1, "rust_h265 picture")
+                });
+                PictureSide::Thread(Box::new(start_picture_thread(
+                    workers,
                     &mut self.dpb,
                     &mut self.pool,
                     id,
@@ -1788,7 +1796,7 @@ impl Decoder {
                     sh.poc,
                     (sps, pps),
                     self.in_flight.is_empty(),
-                ))
+                )))
             } else {
                 PictureSide::Local(Box::new(PictureDecode {
                     state: ps_enum,
@@ -2090,7 +2098,7 @@ impl Decoder {
     /// (stopping at the first still decoding, to keep decoding order), or
     /// all of them when `wait` is set.
     fn collect_pictures(&mut self, wait: bool) {
-        while let Some(f) = self.in_flight.front() {
+        while let Some(f) = self.in_flight.front_mut() {
             if !wait && !f.handle.is_finished() {
                 break;
             }
@@ -2105,7 +2113,7 @@ impl Decoder {
                 return self.finish_threaded_picture(
                     pic.last_slice_header,
                     pic.slice_ref_pocs,
-                    thread,
+                    *thread,
                 );
             }
         };

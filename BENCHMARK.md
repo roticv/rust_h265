@@ -491,9 +491,9 @@ Remaining focus, ordered by expected return:
    spot: a 64-bit CABAC refill, batched bypass bins, cheaper neighbour
    availability and leaner per-CU bookkeeping are each worth 1–2%.
 
-4. **Threading** is done (see Threads). Remaining overhead: one OS thread
-   is spawned per picture; a persistent pool would save its start-up
-   cost.
+4. **Threading** is done (see Threads). Pictures run on a persistent pool
+   of `threads + 1` workers rather than one new OS thread each, which
+   measured 1-5% faster at 8 threads.
 
 ## Appendix: tool usage
 
