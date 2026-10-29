@@ -154,6 +154,38 @@ struct PictureDecode {
     ctbs_decoded: u32,
 }
 
+impl PictureDecode {
+    /// The end of the picture's decode: grey out CTBs no slice decoded,
+    /// run the loop filters (with the flags of the picture's last slice
+    /// header `last_sh`, as before) and return the cropped frame.
+    fn finish(
+        &mut self,
+        sps: &Sps,
+        pps: &Pps,
+        last_sh: &SliceHeader,
+        threads: usize,
+    ) -> Result<Frame, DecodeError> {
+        with_picture_state!(&mut self.state, |state| fill_undecoded_ctbs(state));
+        with_picture_state!(&mut self.state, |state| {
+            // Per-slice: CUs of slices with deblocking disabled have no
+            // boundary strengths, so this only filters enabled slices.
+            crate::deblock::deblock_picture(state, sps, pps, last_sh, threads);
+            crate::sao::apply_sao_picture(state, sps, last_sh, threads);
+            crop_frame(
+                state,
+                sps.pic_width_in_luma_samples,
+                sps.pic_height_in_luma_samples,
+                sps.cropped_width(),
+                sps.cropped_height(),
+                sps.conf_win_left_offset,
+                sps.conf_win_top_offset,
+                last_sh.poc,
+                sps.bit_depth_luma,
+            )
+        })
+    }
+}
+
 /// One slice segment, parsed and set up by the calling thread, with
 /// everything its CTB decode needs, owned (frame threading runs the decode
 /// on the picture's thread).
@@ -857,9 +889,9 @@ fn crop_frame<P: Pixel>(
         luma_left == 0 && luma_top == 0 && cw == stride_y && ch == state.y_plane.len() / stride_y;
     if no_crop {
         return Ok(Frame {
-            y: P::wrap_vec(state.y_plane.to_vec()),
-            u: P::wrap_vec(state.u_plane.to_vec()),
-            v: P::wrap_vec(state.v_plane.to_vec()),
+            y: P::wrap_vec(state.y_plane[0..state.y_plane.len()].to_vec()),
+            u: P::wrap_vec(state.u_plane[0..state.u_plane.len()].to_vec()),
+            v: P::wrap_vec(state.v_plane[0..state.v_plane.len()].to_vec()),
             width: cropped_w,
             height: cropped_h,
             pic_order_cnt: poc,
@@ -879,8 +911,9 @@ fn crop_frame<P: Pixel>(
             .checked_add(cw)
             .ok_or(DecodeError::InvalidSyntax("invalid luma crop range"))?;
         y.extend_from_slice(
-            state.y_plane[..]
-                .get(start..end)
+            state
+                .y_plane
+                .get_range(start..end)
                 .ok_or(DecodeError::InvalidSyntax("invalid luma crop range"))?,
         );
     }
@@ -902,13 +935,15 @@ fn crop_frame<P: Pixel>(
             .checked_add(cw_c)
             .ok_or(DecodeError::InvalidSyntax("invalid chroma crop range"))?;
         u.extend_from_slice(
-            state.u_plane[..]
-                .get(start..end)
+            state
+                .u_plane
+                .get_range(start..end)
                 .ok_or(DecodeError::InvalidSyntax("invalid chroma crop range"))?,
         );
         v.extend_from_slice(
-            state.v_plane[..]
-                .get(start..end)
+            state
+                .v_plane
+                .get_range(start..end)
                 .ok_or(DecodeError::InvalidSyntax("invalid chroma crop range"))?,
         );
     }
@@ -1676,43 +1711,12 @@ impl Decoder {
             .pps
             .as_ref()
             .ok_or(DecodeError::InvalidSyntax("picture without active PPS"))?;
-        with_picture_state!(&mut pic.decode.state, |state| fill_undecoded_ctbs(state));
         let last_sh = &pic.last_slice_header;
-
-        // Phase 3b-1: in-loop deblocking filter.
-        let last_sh_for_filters = last_sh.clone();
-
-        // Phase 3d-1: snapshot everything we need from the SPS and the
-        // completed slice header so we can release the outstanding borrows.
-        let pic_width = sps.pic_width_in_luma_samples;
-        let pic_height = sps.pic_height_in_luma_samples;
+        let emitted_frame = pic.decode.finish(sps, pps, last_sh, threads)?;
         let last_sh_cloned = last_sh.clone();
         let picture_poc = last_sh_cloned.poc;
-        let cropped_w = sps.cropped_width();
-        let cropped_h = sps.cropped_height();
-        let conf_left = sps.conf_win_left_offset;
-        let conf_top = sps.conf_win_top_offset;
-        let bd = sps.bit_depth_luma;
-
-        // Run deblock + SAO + crop + DPB insert, dispatching on pixel type.
-        let emitted_frame = with_picture_state!(&mut pic.decode.state, |state| {
-            // Per-slice: CUs of slices with deblocking disabled have no
-            // boundary strengths, so this only filters enabled slices.
-            crate::deblock::deblock_picture(state, sps, pps, &last_sh_for_filters, threads);
-            crate::sao::apply_sao_picture(state, sps, &last_sh_for_filters, threads);
-
-            crop_frame(
-                state,
-                pic_width,
-                pic_height,
-                cropped_w,
-                cropped_h,
-                conf_left,
-                conf_top,
-                picture_poc,
-                bd,
-            )
-        })?;
+        let pic_width = sps.pic_width_in_luma_samples;
+        let pic_height = sps.pic_height_in_luma_samples;
 
         // The borrows `sps` / `pps` / `tile_tables` / `last_sh` are no
         // longer used beyond this point — NLL will release them here so

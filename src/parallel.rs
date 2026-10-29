@@ -9,6 +9,8 @@
 
 use std::ops::Range;
 
+use crate::shared::SharedTable;
+
 /// One band of the three planes: for each plane, the band's samples and
 /// the plane row they start at (indices into the band are
 /// `(row - row0) * stride + x`).
@@ -28,33 +30,36 @@ pub(crate) fn split_units(units: usize, threads: usize) -> Vec<Range<usize>> {
 /// of band `i` in each plane; band `i` runs up to the next band's start
 /// (the last to the end of the plane), so `starts[0]` must be all zeros
 /// and each plane's starts must be non-decreasing.
-pub(crate) fn for_each_band<P, D, F>(
-    planes: &mut [D; 3],
+pub(crate) fn for_each_band<P, F>(
+    planes: &mut [SharedTable<P>; 3],
     strides: [usize; 3],
     starts: &[[usize; 3]],
     work: F,
 ) where
     P: Send,
-    D: std::ops::DerefMut<Target = [P]>,
     F: Fn(usize, Band<'_, P>) + Sync,
 {
-    let mut bands: Vec<Band<'_, P>> = Vec::with_capacity(starts.len());
-    let [y, u, v] = planes;
-    let mut rest: [&mut [P]; 3] = [&mut **y, &mut **u, &mut **v];
-    for (i, start) in starts.iter().enumerate() {
-        let next = starts.get(i + 1);
-        let band: Band<'_, P> = std::array::from_fn(|p| {
-            let plane = std::mem::take(&mut rest[p]);
-            let len = match next {
-                Some(n) => ((n[p] - start[p]) * strides[p]).min(plane.len()),
-                None => plane.len(),
-            };
-            let (head, tail) = plane.split_at_mut(len);
-            rest[p] = tail;
-            (head, start[p])
-        });
-        bands.push(band);
-    }
+    // Each plane cut into its bands, as ranges of exactly their samples
+    // (the planes may be views of a picture other threads read).
+    let mut cut: Vec<std::vec::IntoIter<&mut [P]>> = planes
+        .iter_mut()
+        .enumerate()
+        .map(|(p, plane)| {
+            let len = plane.len();
+            let mut cuts: Vec<usize> = starts
+                .iter()
+                .map(|s| (s[p] * strides[p]).min(len))
+                .collect();
+            cuts.push(len);
+            plane.split_mut(&cuts).into_iter()
+        })
+        .collect();
+    let mut bands: Vec<Band<'_, P>> = starts
+        .iter()
+        .map(|start| {
+            std::array::from_fn(|p| (cut[p].next().expect("one slice per band"), start[p]))
+        })
+        .collect();
     if bands.len() == 1 {
         let band = bands.pop().unwrap();
         work(0, band);
@@ -95,7 +100,8 @@ mod tests {
         // its own rows, and every row ends up written exactly once.
         let strides = [4, 2, 2];
         let rows = [12, 6, 6];
-        let mut planes: [Vec<u16>; 3] = std::array::from_fn(|p| vec![0; strides[p] * rows[p]]);
+        let mut planes: [SharedTable<u16>; 3] =
+            std::array::from_fn(|p| vec![0; strides[p] * rows[p]].into());
         let starts = [[0, 0, 0], [4, 2, 2], [9, 4, 5]];
         for_each_band(&mut planes, strides, &starts, |i, band| {
             for (p, (slice, row0)) in band.into_iter().enumerate() {

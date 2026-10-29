@@ -21,6 +21,7 @@ use crate::cabac::{CabacContexts, CabacReader};
 use crate::cabac_tables::ctx;
 use crate::cu_tree::PictureState;
 use crate::pixel::Pixel;
+use crate::shared::SharedTable;
 use crate::slice::SliceHeader;
 use crate::sps::Sps;
 
@@ -490,12 +491,15 @@ pub fn apply_sao_picture<P: Pixel>(
         .iter()
         .map(|r| [r.start * ctb_size, r.start * ctb_c_h, r.start * ctb_c_h])
         .collect();
-    let mut snapshot = std::mem::take(&mut state.sao_snapshot);
-    for (snap, plane) in snapshot.iter_mut().zip(&planes) {
-        // Same length as last picture (the usual case): no reallocation and
-        // no fill; every sample is overwritten below.
-        snap.resize(plane.len(), P::zero());
-    }
+    let mut snapshot: [SharedTable<P>; 3] = {
+        let mut vecs = std::mem::take(&mut state.sao_snapshot);
+        for (snap, plane) in vecs.iter_mut().zip(&planes) {
+            // Same length as last picture (the usual case): no reallocation
+            // and no fill; every sample is overwritten below.
+            snap.resize(plane.len(), P::zero());
+        }
+        vecs.map(SharedTable::from)
+    };
     crate::parallel::for_each_band(&mut snapshot, strides, &starts, |_, band| {
         for ((dst, row0), (plane, &stride)) in band.into_iter().zip(planes.iter().zip(&strides)) {
             let start = row0 * stride;
@@ -647,28 +651,20 @@ pub fn apply_sao_picture<P: Pixel>(
                 let (x, y) = (bx * 4, by * 4);
                 for r in y..y + 4 {
                     let o = r * ys + x;
-                    if let (Some(d), Some(sr)) =
-                        (state.y_plane[..].get_mut(o..o + 4), y_src.get(o..o + 4))
-                    {
-                        d.copy_from_slice(sr);
+                    if o + 4 <= state.y_plane.len() {
+                        state.y_plane[o..o + 4].copy_from_slice(&y_src[o..o + 4]);
                     }
                 }
                 let (cx, cy, cw, ch) = (x >> csw, y >> csh, 4 >> csw, 4 >> csh);
                 for r in cy..cy + ch {
                     let o = r * uvs + cx;
-                    if let (Some(d), Some(sr)) =
-                        (state.u_plane[..].get_mut(o..o + cw), u_src.get(o..o + cw))
-                    {
-                        d.copy_from_slice(sr);
-                    }
-                    if let (Some(d), Some(sr)) =
-                        (state.v_plane[..].get_mut(o..o + cw), v_src.get(o..o + cw))
-                    {
-                        d.copy_from_slice(sr);
+                    if o + cw <= state.u_plane.len() {
+                        state.u_plane[o..o + cw].copy_from_slice(&u_src[o..o + cw]);
+                        state.v_plane[o..o + cw].copy_from_slice(&v_src[o..o + cw]);
                     }
                 }
             }
         }
     }
-    state.sao_snapshot = snapshot;
+    state.sao_snapshot = snapshot.map(SharedTable::into_vec);
 }

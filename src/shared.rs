@@ -148,6 +148,17 @@ impl<T> SharedTable<T> {
         }
     }
 
+    /// Elements `r`, or `None` when the range is out of bounds. Works on
+    /// views (covers exactly the range).
+    #[inline]
+    pub fn get_range(&self, r: Range<usize>) -> Option<&[T]> {
+        if r.start <= r.end && r.end <= self.len {
+            Some(&self[r])
+        } else {
+            None
+        }
+    }
+
     /// Element `i` for writing, or `None` when out of range.
     #[inline]
     pub fn get_mut(&mut self, i: usize) -> Option<&mut T> {
@@ -158,6 +169,34 @@ impl<T> SharedTable<T> {
         } else {
             None
         }
+    }
+
+    /// Disjoint mutable ranges `cuts[i]..cuts[i + 1]` of the buffer (the
+    /// last up to `cuts`' final value). Works on views: each slice covers
+    /// exactly its range. Panics unless `cuts` is non-decreasing and ends
+    /// within the table.
+    pub fn split_mut(&mut self, cuts: &[usize]) -> Vec<&mut [T]> {
+        assert!(
+            cuts.windows(2).all(|w| w[0] <= w[1]),
+            "cuts must not decrease"
+        );
+        if let Some(&end) = cuts.last() {
+            assert!(
+                end <= self.len,
+                "cut {end} past the end of a table of length {}",
+                self.len
+            );
+        }
+        cuts.windows(2)
+            .map(|w| {
+                self.check_write(w[0]..w[1]);
+                // SAFETY: the ranges are in bounds and pairwise disjoint (the
+                // cuts do not decrease), and `&mut self` is held for the
+                // lifetime of the returned slices, so no other access
+                // through this table overlaps them.
+                unsafe { std::slice::from_raw_parts_mut(self.ptr.add(w[0]), w[1] - w[0]) }
+            })
+            .collect()
     }
 
     #[inline(always)]
