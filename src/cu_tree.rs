@@ -333,6 +333,9 @@ pub struct PictureState<P: Pixel> {
     /// Motion compensation scratch buffers, reused by every inter block of
     /// this picture (see `inter_pred::McScratch`).
     pub mc_scratch: crate::inter_pred::McScratch<P>,
+    /// Frame threading: the loop filters run row by row as this picture
+    /// decodes (`crate::rowfilter`); `None` otherwise.
+    pub row_filter: Option<Box<crate::rowfilter::RowFilter<P>>>,
 }
 
 /// Buffers of earlier pictures that `PictureState::new_recycled` reuses.
@@ -453,6 +456,7 @@ impl<P: Pixel> PictureState<P> {
             min_tb_addr_zs_stride: self.min_tb_addr_zs_stride,
             min_tb_width: self.min_tb_width,
             mc_scratch: crate::inter_pred::McScratch::new(),
+            row_filter: None,
         }
     }
 
@@ -894,6 +898,7 @@ impl<P: Pixel> PictureState<P> {
                 Some(scratch) => scratch,
                 None => crate::inter_pred::McScratch::new(),
             },
+            row_filter: None,
         }
     }
 
@@ -1879,6 +1884,12 @@ fn temporal_luma_motion_vector<P: Pixel>(
     if col_ref.tab_mvf.is_empty() {
         return None;
     }
+    // Frame threading: the collocated picture may still be decoding. Both
+    // candidates lie in this block's CTB row (the bottom-right one is used
+    // only inside it), so that many of its CTB rows must be decoded.
+    col_ref
+        .progress
+        .wait_decoded_ctb_rows((y0 as usize >> state.log2_ctb_size) + 1);
 
     let col_pic_poc = col_ref.poc;
     let min_pu_width = col_ref.min_pu_width;

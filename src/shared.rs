@@ -1,10 +1,15 @@
 //! Picture tables shared between the threads decoding one picture.
 //!
 //! This is the only module of the crate with `unsafe` code. It exists so
-//! that several CTB rows of one picture can be decoded at the same time
-//! (wavefront parallel processing): each row writes its own part of the
-//! sample planes and per-picture tables while reading what the rows above
-//! have already finished.
+//! that picture tables can be read by one thread while another thread
+//! writes other parts of them:
+//!
+//! - Wavefront parallel processing: several CTB rows of one picture decode
+//!   at the same time, each writing its own part of the sample planes and
+//!   per-picture tables while reading what the rows above have finished.
+//! - Frame threading: a picture is referenced by later pictures (motion
+//!   compensation, temporal MV prediction) while its own thread is still
+//!   decoding and filtering its lower rows.
 //!
 //! # The tables
 //!
@@ -38,6 +43,17 @@
 //! In test builds each view checks every access against that rule (see
 //! [`AccessCheck`]), so the decode path cannot silently step outside it:
 //! the threaded decoding tests run every WPP fixture with checking on.
+//!
+//! Frame threading follows a second, simpler rule, per picture: rows
+//! become final (decoded, deblocked and SAO-filtered) in order, top to
+//! bottom, and a final row is never written again (`crate::rowfilter`
+//! rejects a slice that would). The picture's DPB entry owns its planes,
+//! motion field and slice map; the picture's thread writes them through
+//! views, and other pictures read them through the owner, only with range
+//! indexing ending at the rows `DecodedPicture::progress` reports final
+//! (`Release` / `Acquire`), never through a reference to the whole table.
+//! In test builds motion compensation asserts it never reads a reference
+//! row it did not wait for.
 
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut, Index, IndexMut, Range};
@@ -97,11 +113,12 @@ impl<T> SharedTable<T> {
     ///
     /// # Safety
     ///
-    /// The view must be dropped before this table is accessed, moved out
-    /// of, or dropped again, and every access made through views of the
-    /// same table must follow the wavefront protocol (module
-    /// documentation): no element accessed by one thread while another
-    /// writes it.
+    /// The view must be dropped before this table is dropped (moving the
+    /// table is fine: its buffer stays where it is). While views exist,
+    /// this table may be used only through element and range indexing, not
+    /// as a whole slice (`Deref`), and every access made through it or its
+    /// views must follow the protocol (module documentation): no element
+    /// accessed by one thread while another writes it.
     pub unsafe fn view(&self) -> SharedTable<T> {
         SharedTable {
             ptr: self.ptr,

@@ -549,7 +549,7 @@ pub fn deblock_picture<P: Pixel>(
 
 /// Luma vertical edges in luma rows `rows` (multiples of 8). `plane` holds
 /// the plane from row `row0` on.
-fn luma_vertical_edges<P: Pixel>(
+pub(crate) fn luma_vertical_edges<P: Pixel>(
     state: &PictureState<P>,
     sps: &Sps,
     plane: &mut [P],
@@ -607,7 +607,7 @@ fn luma_vertical_edges<P: Pixel>(
 
 /// Luma horizontal edges at luma rows in `rows` (the first picture row has
 /// none). `plane` holds the plane from row `row0` on.
-fn luma_horizontal_edges<P: Pixel>(
+pub(crate) fn luma_horizontal_edges<P: Pixel>(
     state: &PictureState<P>,
     sps: &Sps,
     plane: &mut [P],
@@ -664,7 +664,7 @@ fn luma_horizontal_edges<P: Pixel>(
 /// is every `8 << SubWidthC-shift` columns / `8 << SubHeightC-shift` rows,
 /// and the two boundary-strength probes along an edge sit `4 << shift` luma
 /// samples apart (4:2:0 → the 16-luma grid; 4:4:4 → the 8-luma grid).
-fn chroma_edges<P: Pixel, const VERT: bool>(
+pub(crate) fn chroma_edges<P: Pixel, const VERT: bool>(
     state: &PictureState<P>,
     sps: &Sps,
     pps: &Pps,

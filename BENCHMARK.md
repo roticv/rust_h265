@@ -82,28 +82,28 @@ All six fixtures are byte-exact against FFmpeg.
 
 `Decoder::with_threads(n)` against FFmpeg 9.0.2 with `-threads N`, frames
 per second (`bench_decode` best of 3; FFmpeg `-benchmark` rtime best of
-3). The machine was loaded during this run (load average 5-5.6, from
-other work), so the threaded figures are conservative: an earlier run at
-load ~2.4 measured 674 fps for `medium` and 530 for `10bit_medium` at 4
-threads.
+3; load average about 4 from other work, which affects both).
 
-| Fixture | WPP | ours, 1 | 2 | 4 | 8 | FFmpeg, 1 | 4 | default |
-|---|:-:|---:|---:|---:|---:|---:|---:|---:|
-| `bbb_1080p_5s_safe` | no | 375 | 387 | 390 | 387 | 563 | 1500 | 2000 |
-| `bbb_720p_10s_safe` | no | 684 | 718 | 705 | 679 | 1071 | 2927 | 3810 |
-| `bbb_1080p_5s_medium` | yes | 281 | 466 | 530 | 482 | 393 | 822 | 1122 |
-| `bbb_1080p_5s_slow` | yes | 271 | 446 | 536 | 497 | 440 | 857 | 1111 |
-| `bbb_1080p_5s_10bit_safe` | no | 279 | 302 | 292 | 305 | 226 | 645 | 938 |
-| `bbb_1080p_5s_10bit_medium` | yes | 225 | 366 | 430 | 418 | 148 | 404 | 550 |
+| Fixture | ours, 1 | 2 | 4 | 8 | FFmpeg, 1 | 4 | default |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `bbb_1080p_5s_safe` | 387 | 864 | 1157 | 1414 | 600 | 1482 | 2143 |
+| `bbb_720p_10s_safe` | 705 | 1725 | 2223 | 2626 | 1086 | 2927 | 4210 |
+| `bbb_1080p_5s_medium` | 298 | 599 | 769 | 892 | 469 | 952 | 1250 |
+| `bbb_1080p_5s_slow` | 293 | 576 | 765 | 884 | 458 | 923 | 1224 |
+| `bbb_1080p_5s_10bit_safe` | 298 | 703 | 914 | 1076 | 234 | 686 | 1101 |
+| `bbb_1080p_5s_10bit_medium` | 238 | 501 | 586 | 714 | 152 | 456 | 606 |
 
-- **WPP streams** (x265's default; the `safe` fixtures disable it): CTB
-  rows decode in parallel, 1.9-2.5x with 4 threads (2.2-2.5x on a quieter
-  machine). The machine has 4 performance cores; 8 threads is slower than
-  4. 10-bit `medium` with 4 threads is faster than FFmpeg with 4.
-- **Streams without WPP** only parallelise the loop filters (a few
-  percent). FFmpeg's frame threading parallelises any stream, which is
-  why it is far ahead on the `safe` fixtures; frame threading is the next
-  step for those (see Priorities).
+- Frame threading with row-level progress: each picture decodes on its
+  own thread, and a picture referencing one still decoding waits only
+  for the rows its motion vectors reach. 2.5-3.8x with 4 threads; the
+  machine has 4 performance cores and 6 efficiency cores, so 8 threads
+  still helps.
+- With 4 threads we are at about 0.8x FFmpeg's speed on 8-bit and 1.3x on
+  10-bit; with 8, 10-bit matches or beats FFmpeg's default (all cores).
+- Decoding the CTB rows of WPP pictures in parallel inside each picture
+  thread as well was measured slower than frame threading alone (it
+  delays publishing a picture's rows until it is finished), so it is
+  used only for a picture with nothing to overlap with.
 
 ### What changed in this round
 
@@ -491,12 +491,9 @@ Remaining focus, ordered by expected return:
    spot: a 64-bit CABAC refill, batched bypass bins, cheaper neighbour
    availability and leaner per-CU bookkeeping are each worth 1–2%.
 
-4. **Frame threading** (wall-clock). WPP row parallelism is done (see
-   Threads); streams without WPP still decode on one thread apart from the
-   loop filters. Frame-level parallelism (a picture decodes while its
-   references are still finishing, waiting on their row progress) would
-   cover every stream and combine with WPP. It builds on the same shared
-   tables and progress counters.
+4. **Threading** is done (see Threads). Remaining overhead: one OS thread
+   is spawned per picture; a persistent pool would save its start-up
+   cost.
 
 ## Appendix: tool usage
 

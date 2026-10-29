@@ -148,6 +148,13 @@ fn ref_sample<P: Pixel>(plane: &[P], stride: usize, x: i32, y: i32, w: i32, h: i
     let cx = x.clamp(0, w - 1) as usize;
     let cy = y.clamp(0, h - 1) as usize;
     let idx = cy * stride + cx;
+    // `plane` ends at the rows `ref_rows` asked for; a clamped in-picture
+    // sample past its end means that row count was too small.
+    #[cfg(test)]
+    assert!(
+        idx < plane.len(),
+        "MC reads reference row {cy}, past the rows it waited for"
+    );
     if idx >= plane.len() {
         return 0;
     }
@@ -542,14 +549,33 @@ fn bi_average_row<P: Pixel>(
     }
 }
 
-/// Plane `c` (0 = luma, 1 = Cb, 2 = Cr) of a reference picture. The
-/// reference is complete: with frame threading the decoding thread waits
-/// for every reference of a slice before decoding it, so no thread writes
-/// the plane any more.
+/// Luma rows of a reference that motion compensation of a block at
+/// `y0` of height `h` with vertical MV `mv_y` (quarter samples) may read,
+/// for luma and chroma: the block, its MV, and the interpolation taps
+/// below it (4 luma rows; 2 chroma rows, i.e. 4 luma rows in 4:2:0), with
+/// margin. Clamped to the picture by `ref_plane`.
 #[inline(always)]
-fn ref_plane<P: Pixel>(pic: &DecodedPicture, c: usize) -> &[P] {
-    debug_assert!(pic.progress.is_complete());
-    &P::picture_planes(&pic.planes)[c][..]
+fn ref_rows(y0: u32, h: usize, mv_y: i16) -> usize {
+    (y0 as i64 + h as i64 + (mv_y as i64 >> 2) + 8).max(1) as usize
+}
+
+/// Plane `c` (0 = luma, 1 = Cb, 2 = Cr) of a reference picture, up to luma
+/// row `rows` (see `ref_rows`). With frame threading the reference may
+/// still be decoding: this waits until those rows are final (deblocked
+/// and SAO-filtered, never written again) and returns a slice ending
+/// there, so the block never sees a row still changing. A block whose MV
+/// reaches past the picture's bottom waits for the whole picture.
+#[inline(always)]
+fn ref_plane<P: Pixel>(pic: &DecodedPicture, c: usize, rows: usize) -> &[P] {
+    let rows = rows.clamp(1, pic.height as usize);
+    pic.progress.wait_final_rows(rows);
+    let plane = &P::picture_planes(&pic.planes)[c];
+    let (stride, rows) = if c == 0 {
+        (pic.y_stride, rows)
+    } else {
+        (pic.uv_stride, rows.div_ceil(1 << pic.chroma_shift_h))
+    };
+    &plane[0..(rows * stride).min(plane.len())]
 }
 
 /// Row stride of the padded edge buffer: a 64-wide block plus the 7-sample
@@ -852,8 +878,6 @@ pub fn motion_compensation_pu<P: Pixel>(
         return;
     }
 
-    let pic_w = state.width as i32;
-    let pic_h = state.height as i32;
     let y_stride = state.y_stride;
     let uv_stride = state.uv_stride;
     let w = n_pb_w as usize;
@@ -901,7 +925,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_luma_i16::<P>(
                 pred_l0_y,
                 w,
-                ref_plane::<P>(ref_pic_l0, 0),
+                ref_plane::<P>(ref_pic_l0, 0, ref_rows(y0, h, mvf.mv[0].y)),
                 rs,
                 rw,
                 rh,
@@ -923,7 +947,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_chroma_i16::<P>(
                 pred_l0_u,
                 w_c,
-                ref_plane::<P>(ref_pic_l0, 1),
+                ref_plane::<P>(ref_pic_l0, 1, ref_rows(y0, h, mvf.mv[0].y)),
                 rs_c,
                 rw_c,
                 rh_c,
@@ -940,7 +964,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_chroma_i16::<P>(
                 pred_l0_v,
                 w_c,
-                ref_plane::<P>(ref_pic_l0, 2),
+                ref_plane::<P>(ref_pic_l0, 2, ref_rows(y0, h, mvf.mv[0].y)),
                 rs_c,
                 rw_c,
                 rh_c,
@@ -969,7 +993,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_luma_i16::<P>(
                 pred_l1_y,
                 w,
-                ref_plane::<P>(ref_pic_l1, 0),
+                ref_plane::<P>(ref_pic_l1, 0, ref_rows(y0, h, mvf.mv[1].y)),
                 rs,
                 rw,
                 rh,
@@ -991,7 +1015,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_chroma_i16::<P>(
                 pred_l1_u,
                 w_c,
-                ref_plane::<P>(ref_pic_l1, 1),
+                ref_plane::<P>(ref_pic_l1, 1, ref_rows(y0, h, mvf.mv[1].y)),
                 rs_c,
                 rw_c,
                 rh_c,
@@ -1008,7 +1032,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_chroma_i16::<P>(
                 pred_l1_v,
                 w_c,
-                ref_plane::<P>(ref_pic_l1, 2),
+                ref_plane::<P>(ref_pic_l1, 2, ref_rows(y0, h, mvf.mv[1].y)),
                 rs_c,
                 rw_c,
                 rh_c,
@@ -1141,17 +1165,17 @@ pub fn motion_compensation_pu<P: Pixel>(
             // Non-weighted uni-prediction: MC directly into the picture planes.
             // Each destination range ends at the block's last sample, so it
             // stays inside the block's own CTB row (wavefront decoding).
-            let ref_y = ref_plane::<P>(ref_list, 0);
-            let ref_u = ref_plane::<P>(ref_list, 1);
-            let ref_v = ref_plane::<P>(ref_list, 2);
+            let ref_y = ref_plane::<P>(ref_list, 0, ref_rows(y0, h, mv.y));
+            let ref_u = ref_plane::<P>(ref_list, 1, ref_rows(y0, h, mv.y));
+            let ref_v = ref_plane::<P>(ref_list, 2, ref_rows(y0, h, mv.y));
             let y_off = (y0 as usize) * y_stride + (x0 as usize);
             mc_luma::<P>(
                 &mut state.y_plane[y_off..y_off + (h - 1) * y_stride + w],
                 y_stride,
                 ref_y,
                 ref_list.y_stride,
-                pic_w,
-                pic_h,
+                ref_list.width as i32,
+                ref_list.height as i32,
                 x0 as i32,
                 y0 as i32,
                 w,
@@ -1244,10 +1268,10 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_luma_i16::<P>(
                 pred_y,
                 w,
-                ref_plane::<P>(ref_list, 0),
+                ref_plane::<P>(ref_list, 0, ref_rows(y0, h, mv.y)),
                 ref_list.y_stride,
-                pic_w,
-                pic_h,
+                ref_list.width as i32,
+                ref_list.height as i32,
                 x0 as i32,
                 y0 as i32,
                 w,
@@ -1298,7 +1322,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_chroma_i16::<P>(
                 pred_u,
                 w_c,
-                ref_plane::<P>(ref_list, 1),
+                ref_plane::<P>(ref_list, 1, ref_rows(y0, h, mv.y)),
                 ref_uv_stride,
                 ref_w_c,
                 ref_h_c,
@@ -1315,7 +1339,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             mc_chroma_i16::<P>(
                 pred_v,
                 w_c,
-                ref_plane::<P>(ref_list, 2),
+                ref_plane::<P>(ref_list, 2, ref_rows(y0, h, mv.y)),
                 ref_uv_stride,
                 ref_w_c,
                 ref_h_c,

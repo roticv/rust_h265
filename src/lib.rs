@@ -74,9 +74,11 @@
 //! # Threads
 //!
 //! [`Decoder::with_threads`] decodes on several threads with output
-//! identical to single-threaded decoding. Streams coded with wavefront
-//! parallel processing (x265's default) decode their CTB rows in parallel;
-//! for others only the loop filters run in parallel. The default is one
+//! identical to single-threaded decoding: each picture on its own thread,
+//! overlapping with the pictures it references (it waits only for the
+//! reference rows it reads). Frames, and errors in slice data, come out of
+//! later calls than with one thread; [`Decoder::next_error`] returns the
+//! errors still waiting after the last NAL unit. The default is one
 //! thread.
 //!
 //! # Resource limits
@@ -115,6 +117,7 @@ mod pps;
 mod profile_tier_level;
 #[allow(dead_code)]
 mod residual_coding;
+mod rowfilter;
 #[allow(dead_code)]
 mod sao;
 #[allow(dead_code)]

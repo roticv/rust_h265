@@ -154,6 +154,10 @@ struct PictureDecode {
     saved_wpp_cabac_state: Option<CabacContexts>,
     /// CTBs decoded so far, in tile scan.
     ctbs_decoded: u32,
+    /// Frame threading: decode WPP slices' CTB rows in parallel even though
+    /// the picture is filtered row by row (set for a picture that started
+    /// with no other picture in flight, such as a still image).
+    rows_in_parallel: bool,
 }
 
 impl PictureDecode {
@@ -171,8 +175,13 @@ impl PictureDecode {
         with_picture_state!(&mut self.state, |state| {
             // Per-slice: CUs of slices with deblocking disabled have no
             // boundary strengths, so this only filters enabled slices.
-            crate::deblock::deblock_picture(state, sps, pps, last_sh, threads);
-            crate::sao::apply_sao_picture(state, sps, last_sh, threads);
+            if let Some(filter) = state.row_filter.take() {
+                // Frame threading: the rest of the rows (after the grey fill).
+                filter.finish(state);
+            } else {
+                crate::deblock::deblock_picture(state, sps, pps, last_sh, threads);
+                crate::sao::apply_sao_picture(state, sps, threads);
+            }
             crop_frame(
                 state,
                 sps.pic_width_in_luma_samples,
@@ -234,9 +243,9 @@ struct InFlight {
     output: bool,
 }
 
-/// The body of a picture thread: decode the slices it receives, each once
-/// the pictures it references are complete, then finish the picture and
-/// mark it complete for the pictures that reference it.
+/// The body of a picture thread: decode the slices it receives (the loop
+/// filters follow row by row, publishing final rows to the pictures that
+/// reference this one), then finish the picture and mark it complete.
 fn picture_thread(
     mut decode: PictureDecode,
     jobs: std::sync::mpsc::Receiver<PictureMessage>,
@@ -257,11 +266,9 @@ fn picture_thread(
     for message in jobs {
         match message {
             PictureMessage::Slice(job) => {
-                let params = &job.slice_params;
-                let refs = params.ref_frames_l0.iter().chain(&params.ref_frames_l1);
-                for r in refs.chain(params.collocated_ref.iter()) {
-                    r.progress.wait_complete();
-                }
+                // References are read as their rows become final (motion
+                // compensation and temporal MV prediction wait for the rows
+                // they need).
                 if let Err(e) = decode.decode_slice(&job, threads) {
                     errors.push(e);
                 }
@@ -292,6 +299,7 @@ fn picture_thread(
 /// Start decoding a new picture on its own thread: the picture enters the
 /// DPB now, owning its planes, motion field and slice map (the state keeps
 /// views of them), so later pictures can reference it while it decodes.
+#[allow(clippy::too_many_arguments)]
 fn start_picture_thread(
     dpb: &mut DecodedPictureBuffer,
     pool: &mut PicturePool,
@@ -299,14 +307,21 @@ fn start_picture_thread(
     threads: usize,
     mut state: PictureStateEnum,
     poc: i32,
+    (sps, pps): (&Arc<Sps>, &Arc<Pps>),
+    rows_in_parallel: bool,
 ) -> PictureThread {
-    fn in_progress<P: Pixel>(st: &mut PictureState<P>, poc: i32) -> Arc<DecodedPicture> {
+    fn in_progress<P: Pixel>(
+        st: &mut PictureState<P>,
+        poc: i32,
+        sps: &Arc<Sps>,
+        pps: &Arc<Pps>,
+    ) -> Arc<DecodedPicture> {
         // SAFETY: the decoded picture owns the lent tables; the picture
         // thread holds an `Arc` of it until after `release_lent` has
         // dropped the state's views, and other pictures read it only once
         // it is complete (they wait on its progress first).
         let (planes, mvf, slice_addr) = unsafe { st.lend_shared() };
-        Arc::new(DecodedPicture::in_progress(
+        let picture = Arc::new(DecodedPicture::in_progress(
             P::wrap_planes(planes),
             mvf,
             slice_addr,
@@ -315,9 +330,17 @@ fn start_picture_thread(
             (st.log2_min_pu_size, st.min_pu_width, st.log2_ctb_size),
             (st.y_stride, st.uv_stride),
             (st.chroma_shift_w, st.chroma_shift_h),
-        ))
+        ));
+        let filter = crate::rowfilter::RowFilter::new(
+            st,
+            Arc::clone(&picture),
+            Arc::clone(sps),
+            Arc::clone(pps),
+        );
+        st.row_filter = Some(Box::new(filter));
+        picture
     }
-    let picture = with_picture_state!(&mut state, |st| in_progress(st, poc));
+    let picture = with_picture_state!(&mut state, |st| in_progress(st, poc, sps, pps));
     picture.mark(PictureReferenceStatus::ShortTerm);
     picture.set_output();
     dpb.insert(Arc::clone(&picture));
@@ -330,6 +353,7 @@ fn start_picture_thread(
         saved_cabac_state: None,
         saved_wpp_cabac_state: None,
         ctbs_decoded: 0,
+        rows_in_parallel,
     };
     let for_thread = Arc::clone(&picture);
     let handle = std::thread::Builder::new()
@@ -465,7 +489,12 @@ impl PictureDecode {
         let wavefront = threads > 1 && crate::wavefront::applies(sps, pps, sh, substreams.count());
         type CtbLoopResult = Result<(u32, Option<CabacContexts>, CabacContexts), DecodeError>;
         let ctb_loop_result: CtbLoopResult = with_picture_state!(&mut self.state, |state| {
-            if wavefront {
+            // A picture filtered row by row (frame threading) decodes its CTB
+            // rows in order, the row filter following, so that the pictures
+            // referencing it can start early; unless it has none to overlap
+            // with (`rows_in_parallel`), when its rows decode in parallel
+            // and it is filtered at its end.
+            if wavefront && (state.row_filter.is_none() || self.rows_in_parallel) {
                 // CTB rows on several threads; same result as the loop below.
                 crate::wavefront::decode_rows(
                     state,
@@ -543,14 +572,30 @@ impl PictureDecode {
                         state.first_qp_group = true;
                     }
 
-                    more_data = crate::wavefront::decode_ctb(
+                    // Frame threading: rows already published may be read
+                    // by other pictures' threads and must not change.
+                    if state
+                        .row_filter
+                        .as_ref()
+                        .is_some_and(|f| f.frozen(ctb_addr_rs as usize))
+                    {
+                        return Err(DecodeError::InvalidSyntax(
+                            "slice segment overlaps CTB rows already decoded",
+                        ));
+                    }
+                    let result = crate::wavefront::decode_ctb(
                         &mut cabac,
                         &mut contexts,
                         state,
                         &slice_ctx,
                         ctb_addr_rs,
                         ctb_addr_ts,
-                    )?;
+                    );
+                    if let Some(mut filter) = state.row_filter.take() {
+                        filter.ctb_decoded(state, ctb_addr_rs as usize);
+                        state.row_filter = Some(filter);
+                    }
+                    more_data = result?;
                     ctb_addr_ts += 1;
 
                     // Storage for WPP (spec 9.3.2.4): after the second CTB of a
@@ -1196,13 +1241,14 @@ impl Decoder {
     /// thread count; only the speed and the timing change:
     ///
     /// - Frame threading: each picture decodes on its own thread, up to
-    ///   `threads` at a time, as soon as the pictures it references are
-    ///   decoded. Works for every stream.
+    ///   `threads` at a time. A picture's loop filters run row by row as its
+    ///   CTB rows finish, so the pictures referencing it start right away:
+    ///   motion compensation and temporal MV prediction wait only for the
+    ///   rows they read. Works for every stream.
     /// - With wavefront parallel processing (`entropy_coding_sync_enabled_flag`,
-    ///   on by default in x265), the CTB rows of a picture's slices also
-    ///   decode in parallel, each row two CTBs behind the one above. Slices
-    ///   with tiles or chroma QP offset lists decode their rows in order.
-    /// - The loop filters (deblocking and SAO) run over bands of rows.
+    ///   on by default in x265), a picture with no other picture to overlap
+    ///   with (the first one, or a still image) decodes its CTB rows in
+    ///   parallel, each row two CTBs behind the one above.
     ///
     /// With more than one thread the decoder works ahead of the caller: a
     /// frame comes out of a later `decode_nal` / [`next_output`](Self::next_output)
@@ -1740,6 +1786,8 @@ impl Decoder {
                     self.threads,
                     ps_enum,
                     sh.poc,
+                    (sps, pps),
+                    self.in_flight.is_empty(),
                 ))
             } else {
                 PictureSide::Local(Box::new(PictureDecode {
@@ -1747,6 +1795,7 @@ impl Decoder {
                     saved_cabac_state: None,
                     saved_wpp_cabac_state: None,
                     ctbs_decoded: 0,
+                    rows_in_parallel: false,
                 }))
             };
             self.current_picture = Some(PictureInProgress {
@@ -2374,9 +2423,12 @@ impl Decoder {
             None => return Err(DecodeError::InvalidSyntax("PPS refers to a missing SPS")),
         };
         // A bit-depth change invalidates every picture in the DPB.
-        let bit_depths = |s: &Sps| (s.bit_depth_luma, s.bit_depth_chroma);
-        let old_bd = self.sps.as_deref().map(bit_depths);
-        if old_bd.is_some() && old_bd != Some(bit_depths(&sps)) {
+        // References must share the sample type and chroma geometry of
+        // the pictures predicted from them (motion compensation reads them
+        // with the current picture's chroma subsampling).
+        let format = |s: &Sps| (s.bit_depth_luma, s.bit_depth_chroma, s.chroma_format_idc);
+        let old_format = self.sps.as_deref().map(format);
+        if old_format.is_some() && old_format != Some(format(&sps)) {
             self.dpb.clear();
             self.current_picture = None;
         }

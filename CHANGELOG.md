@@ -10,19 +10,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Multithreaded decoding:** `Decoder::with_threads(n)` (default 1).
-  - Frame threading: each picture decodes on its own thread (up to `n` at
-    a time) once the pictures it references are decoded, for every
-    stream. With more than one thread, frames and slice-data errors come
-    out of later calls than with one; `Decoder::next_error()` returns
-    errors found after the last `decode_nal`.
-  - Wavefront parallel processing: in streams coded with
-    `entropy_coding_sync_enabled_flag` (x265's default) the CTB rows of a
-    slice decode on separate threads, each row two CTBs behind the row
-    above. About 2.2-2.5x the single-threaded speed with 4 threads on the
-    1080p benchmark fixtures. Slices with tiles or chroma QP offset lists
-    decode sequentially.
-  - The loop filters (deblocking and SAO) run over bands of picture rows,
-    for every stream (5-7% with 4 threads on their own).
+  With 4 threads, 2.5-3.8x the single-threaded speed on the Big Buck
+  Bunny fixtures (1080p `safe` 387 -> 1157 fps, `medium` 298 -> 769,
+  10-bit `medium` 238 -> 586); about 0.8x FFmpeg's speed with 4 threads
+  on 8-bit, 1.3x on 10-bit.
+  - Frame threading: each picture decodes on its own thread, up to `n` at
+    a time. Pictures that reference one still decoding start right away:
+    its loop filters run row by row as its CTB rows finish, and motion
+    compensation and temporal MV prediction wait only for the rows they
+    read. Works for every stream.
+  - Wavefront parallel processing (`entropy_coding_sync_enabled_flag`,
+    x265's default): a picture with no other picture to overlap with (the
+    first one, or a still image) decodes its CTB rows on separate
+    threads, each row two CTBs behind the one above.
+  - The loop filters of a picture decoded on the calling thread run over
+    bands of picture rows.
+  - With more than one thread, frames and slice-data errors come out of
+    later calls than with one; `Decoder::next_error()` returns errors
+    found after the last `decode_nal`.
   - The output is identical for every thread count, including for
     damaged streams: tested on every fixture with 1-7 threads, on
     corrupted WPP streams, and on both conformance suites.
@@ -33,10 +38,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The crate has `unsafe` code for the first time, confined to one module
-  (`src/shared.rs`): wavefront decoding needs several threads writing
-  disjoint parts of the same picture tables, which safe Rust cannot
-  express. The module documents the rules that make it sound, and in test
-  builds every table access is checked against them.
+  (`src/shared.rs`): multithreaded decoding has one thread reading parts
+  of picture tables another thread is writing, which safe Rust cannot
+  express. The module documents the rules that make it sound; in test
+  builds every wavefront table access is checked against them, and
+  motion compensation asserts it reads only reference rows it waited for.
+- SAO is enabled per CTB, by the CTB's own slice (spec 8.7.3), instead of
+  by the flags of the picture's last slice header.
+- The DPB is also emptied when the chroma format changes (as for a bit
+  depth change).
+
+### Fixed
+
+- Uni-prediction clamped reference sample positions to the current
+  picture's size instead of the reference's (only differs for a
+  reference of another size, in a broken stream).
 - The published crate no longer includes the test fixtures (`testdata/`),
   the conformance tooling, CI configuration or `CLAUDE.md`: 256 KB
   instead of 1.06 MB. The tests run from a repository checkout.

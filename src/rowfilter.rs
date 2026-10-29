@@ -1,0 +1,284 @@
+//! Loop filters row by row while a picture decodes (frame threading).
+//!
+//! With frame threading a picture is referenced while it is still being
+//! decoded, so its rows must become final (deblocked and SAO-filtered) as
+//! decoding goes, not only at the end. [`RowFilter`] runs both filters one
+//! CTB row at a time as rows finish decoding, and publishes the rows that
+//! are final in the picture's progress:
+//!
+//! - Deblocking CTB row `r` (luma rows `[y0, y1)`) waits until row `r + 1`
+//!   is decoded: intra prediction of row `r + 1` reads row `r`'s bottom
+//!   samples, and the horizontal edge at the top of row `r` changes the
+//!   bottom of row `r - 1`, both before loop filtering. Then its vertical
+//!   edges, then its horizontal edges `y0 <= y < y1`.
+//!   A horizontal edge at row `y` reads rows `y - 4 ..= y + 3` and writes
+//!   `y - 3 ..= y + 2` (chroma `yc - 2 ..= yc + 1`), so it sees exactly what
+//!   the whole-picture order (all vertical edges, then all horizontal ones)
+//!   would show it.
+//! - SAO of row `r` reads deblocked samples one row beyond it, which are
+//!   final once row `r + 1` is deblocked, so it runs then (or at the end,
+//!   for the last row). The SAO input is a snapshot of the deblocked rows,
+//!   copied just before SAO changes them.
+//! - After SAO of row `r`, rows `< y1` never change again: the next
+//!   deblocking step writes rows from `y1(r + 1) - 3` on. They are
+//!   published as final.
+//!
+//! A slice segment that would write into a row already published (only a
+//! corrupt stream does that) is rejected: other threads may be reading it.
+
+use std::sync::Arc;
+
+use crate::cu_tree::PictureState;
+use crate::dpb::DecodedPicture;
+use crate::pixel::Pixel;
+use crate::pps::Pps;
+use crate::shared::SharedTable;
+use crate::sps::Sps;
+
+/// The row-by-row loop filter of one picture.
+pub(crate) struct RowFilter<P: Pixel> {
+    picture: Arc<DecodedPicture>,
+    sps: Arc<Sps>,
+    pps: Arc<Pps>,
+    ctb: usize,
+    w_ctbs: usize,
+    h_ctbs: usize,
+    /// Which CTBs are decoded, and how many per CTB row.
+    decoded: Vec<bool>,
+    row_done: Vec<usize>,
+    /// CTB rows decoded (a prefix: every CTB in them), deblocked, and
+    /// through SAO (final).
+    decoded_rows: usize,
+    deblocked_rows: usize,
+    sao_rows: usize,
+    sao: bool,
+    /// Deblocked samples for SAO (whole planes, filled row by row).
+    snapshot: [SharedTable<P>; 3],
+}
+
+impl<P: Pixel> RowFilter<P> {
+    /// A row filter for the picture `state` decodes into (`picture` is its
+    /// DPB entry, whose progress it publishes). Takes the SAO snapshot
+    /// buffers of `state` (returned by `finish`).
+    pub(crate) fn new(
+        state: &mut PictureState<P>,
+        picture: Arc<DecodedPicture>,
+        sps: Arc<Sps>,
+        pps: Arc<Pps>,
+    ) -> Self {
+        let ctb = 1usize << state.log2_ctb_size;
+        let w_ctbs = state.width_in_ctbs;
+        let h_ctbs = (state.height as usize).div_ceil(ctb);
+        let sao = sps.sample_adaptive_offset_enabled_flag;
+        let lens = [
+            state.y_plane.len(),
+            state.u_plane.len(),
+            state.v_plane.len(),
+        ];
+        let mut snapshot = std::mem::take(&mut state.sao_snapshot);
+        if sao {
+            for (s, &n) in snapshot.iter_mut().zip(&lens) {
+                s.resize(n, P::zero());
+            }
+        }
+        Self {
+            picture,
+            sps,
+            pps,
+            ctb,
+            w_ctbs,
+            h_ctbs,
+            decoded: vec![false; w_ctbs * h_ctbs],
+            row_done: vec![0; h_ctbs],
+            decoded_rows: 0,
+            deblocked_rows: 0,
+            sao_rows: 0,
+            sao,
+            snapshot: snapshot.map(SharedTable::from),
+        }
+    }
+
+    /// Whether CTB `rs` (raster address) lies in a row already published:
+    /// decoding it would change samples other threads may be reading.
+    pub(crate) fn frozen(&self, rs: usize) -> bool {
+        rs / self.w_ctbs < self.decoded_rows
+    }
+
+    /// CTB `rs` has been decoded (or failed: its samples are what they
+    /// are). Runs the filters and publishes progress when that completes a
+    /// row.
+    pub(crate) fn ctb_decoded(&mut self, state: &mut PictureState<P>, rs: usize) {
+        if rs >= self.decoded.len() || self.decoded[rs] {
+            return;
+        }
+        self.decoded[rs] = true;
+        self.row_done[rs / self.w_ctbs] += 1;
+        let before = self.decoded_rows;
+        while self.decoded_rows < self.h_ctbs && self.row_done[self.decoded_rows] == self.w_ctbs {
+            self.decoded_rows += 1;
+        }
+        if self.decoded_rows > before {
+            self.advance(state, false);
+        }
+    }
+
+    /// Filter what can be filtered (everything when `finishing`: the CTBs
+    /// no slice decoded have been filled by then) and publish progress.
+    fn advance(&mut self, state: &mut PictureState<P>, finishing: bool) {
+        // Row r is deblocked once row r + 1 is decoded (see the module
+        // documentation), all of them when finishing.
+        let target = if finishing {
+            self.h_ctbs
+        } else {
+            self.decoded_rows.saturating_sub(1)
+        };
+        while self.deblocked_rows < target {
+            self.deblock_row(state, self.deblocked_rows);
+            self.deblocked_rows += 1;
+        }
+        while self.sao_rows < self.deblocked_rows
+            && (self.sao_rows + 1 < self.deblocked_rows || self.deblocked_rows == self.h_ctbs)
+        {
+            self.sao_row(state, self.sao_rows);
+            self.sao_rows += 1;
+        }
+        let final_rows = (self.sao_rows * self.ctb).min(state.height as usize);
+        self.picture.progress.publish(self.decoded_rows, final_rows);
+    }
+
+    /// Finish the picture's filtering (after `fill_undecoded_ctbs`) and
+    /// give `state` its SAO snapshot buffers back.
+    pub(crate) fn finish(mut self, state: &mut PictureState<P>) {
+        self.advance(state, true);
+        state.sao_snapshot = std::mem::take(&mut self.snapshot).map(SharedTable::into_vec);
+    }
+
+    /// Luma rows `[y0, y1)` of CTB row `r`.
+    fn rows(&self, state: &PictureState<P>, r: usize) -> (usize, usize) {
+        let y0 = r * self.ctb;
+        (y0, ((r + 1) * self.ctb).min(state.height as usize))
+    }
+
+    /// Cut each plane at `[start, end)` (in its own rows; `None`: to the
+    /// end of the plane) and run `f` on the three slices.
+    fn with_bands(
+        state: &mut PictureState<P>,
+        rows: [(usize, Option<usize>); 3],
+        f: impl FnOnce(&PictureState<P>, [&mut [P]; 3]),
+    ) {
+        let strides = [state.y_stride, state.uv_stride, state.uv_stride];
+        let mut planes = [
+            std::mem::take(&mut state.y_plane),
+            std::mem::take(&mut state.u_plane),
+            std::mem::take(&mut state.v_plane),
+        ];
+        {
+            let mut cut = planes.iter_mut().enumerate().map(|(p, plane)| {
+                let len = plane.len();
+                let (start, end) = rows[p];
+                let a = (start * strides[p]).min(len);
+                let b = end.map_or(len, |e| (e * strides[p]).clamp(a, len));
+                plane.split_mut(&[a, b]).pop().expect("one slice")
+            });
+            let (y, u, v) = (
+                cut.next().unwrap(),
+                cut.next().unwrap(),
+                cut.next().unwrap(),
+            );
+            f(state, [y, u, v]);
+        }
+        let [y, u, v] = planes;
+        state.y_plane = y;
+        state.u_plane = u;
+        state.v_plane = v;
+    }
+
+    fn deblock_row(&self, state: &mut PictureState<P>, r: usize) {
+        let (y0, y1) = self.rows(state, r);
+        let last = r + 1 == self.h_ctbs;
+        let sh = state.chroma_shift_h as usize;
+        let (sps, pps) = (&*self.sps, &*self.pps);
+        let end = |luma_row: usize, margin: usize| (!last).then(|| luma_row - margin);
+        let end_c = |luma_row: usize, margin: usize| (!last).then(|| (luma_row >> sh) - margin);
+        // Vertical edges: the row's own samples.
+        Self::with_bands(
+            state,
+            [
+                (y0, end(y1, 0)),
+                (y0 >> sh, end_c(y1, 0)),
+                (y0 >> sh, end_c(y1, 0)),
+            ],
+            |st, [y, u, v]| {
+                crate::deblock::luma_vertical_edges(st, sps, y, y0, y0..y1);
+                crate::deblock::chroma_edges::<P, true>(st, sps, pps, [u, v], y0 >> sh, y0..y1);
+            },
+        );
+        // Horizontal edges y0 <= y < y1: rows [y0 - 4, y1 - 4) (see the
+        // module documentation).
+        let (hy, hc) = if r == 0 {
+            (0, 0)
+        } else {
+            (y0 - 4, (y0 >> sh) - 4)
+        };
+        Self::with_bands(
+            state,
+            [(hy, end(y1, 4)), (hc, end_c(y1, 4)), (hc, end_c(y1, 4))],
+            |st, [y, u, v]| {
+                crate::deblock::luma_horizontal_edges(st, sps, y, hy, y0..y1);
+                crate::deblock::chroma_edges::<P, false>(st, sps, pps, [u, v], hc, y0..y1);
+            },
+        );
+    }
+
+    fn sao_row(&mut self, state: &mut PictureState<P>, r: usize) {
+        if !self.sao {
+            return;
+        }
+        let (y0, y1) = self.rows(state, r);
+        let last = r + 1 == self.h_ctbs;
+        let sh = state.chroma_shift_h as usize;
+        let strides = [state.y_stride, state.uv_stride, state.uv_stride];
+        // Snapshot the deblocked rows SAO of this row reads, including the
+        // first row below (the row above was copied with the previous row,
+        // before its SAO).
+        for (p, snap) in self.snapshot.iter_mut().enumerate() {
+            let (r0, r1) = if p == 0 {
+                (y0, y1 + 1)
+            } else {
+                (y0 >> sh, (y1 >> sh) + 1)
+            };
+            let len = snap.len();
+            let (a, b) = ((r0 * strides[p]).min(len), (r1 * strides[p]).min(len));
+            let plane = match p {
+                0 => &state.y_plane,
+                1 => &state.u_plane,
+                _ => &state.v_plane,
+            };
+            snap[a..b].copy_from_slice(&plane[a..b]);
+        }
+        let src = [
+            &self.snapshot[0][..],
+            &self.snapshot[1][..],
+            &self.snapshot[2][..],
+        ];
+        let sps = &*self.sps;
+        let end = (!last).then_some(y1);
+        let end_c = (!last).then_some(y1 >> sh);
+        Self::with_bands(
+            state,
+            [(y0, end), (y0 >> sh, end_c), (y0 >> sh, end_c)],
+            |st, [y, u, v]| {
+                crate::sao::sao_ctb_rows(
+                    st,
+                    sps,
+                    src,
+                    [(y, y0), (u, y0 >> sh), (v, y0 >> sh)],
+                    r..r + 1,
+                );
+            },
+        );
+        let block_rows = state.tab_no_filter.len() / state.min_pu_width.max(1);
+        let b1 = if last { block_rows } else { y1 >> 2 };
+        crate::sao::restore_no_filter(state, src, (y0 >> 2)..b1.min(block_rows));
+    }
+}
