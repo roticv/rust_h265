@@ -318,27 +318,47 @@ fn sao_edge_filter<P: Pixel>(
     let off_by_sum: [i32; 5] = std::array::from_fn(|k| offset_val[EDGE_IDX[k]] as i32);
     let edge = |c: i32, a: i32, b: i32| c + off_by_sum[(2 + cmp(c, a) + cmp(c, b)) as usize];
 
+    let edge_ok =
+        |x: isize, y: isize| neighbour_ok(x, y, a_dx, a_dy) && neighbour_ok(x, y, b_dx, b_dy);
     for y in 0..height {
         let yi = y as isize;
         // Interior samples (x in 1..width-1) have both neighbours in this
-        // CTB column, so only the CTB rows above / below matter: one check
-        // for the whole run, then a tight loop over row slices.
-        if width > 2 && avail[region(yi + a_dy, h)][1] && avail[region(yi + b_dy, h)][1] {
-            let n = width - 2;
-            let row = (y0 + y) * stride_src + x0 + 1;
+        // CTB column, so only the CTB rows above / below matter. The first
+        // and last sample may reach into the CTB to the left / right or
+        // diagonally; when their neighbours are available too (the usual
+        // case) they join the same run, so a 64-wide row is one vectorised
+        // call with no scalar tail.
+        let interior_ok =
+            width > 2 && avail[region(yi + a_dy, h)][1] && avail[region(yi + b_dy, h)][1];
+        let first_ok = edge_ok(0, yi);
+        let last_ok = width > 1 && edge_ok(width as isize - 1, yi);
+        let (start, end) = if interior_ok {
+            (
+                if first_ok { 0 } else { 1 },
+                if last_ok { width } else { width - 1 },
+            )
+        } else {
+            (0, 0)
+        };
+        if start < end {
+            let n = end - start;
+            let row = (y0 + y) * stride_src + x0 + start;
             let cur = &src[row..row + n];
             let a = &src[(row as isize + a_off) as usize..][..n];
             let b = &src[(row as isize + b_off) as usize..][..n];
-            let drow = (y0 + y) * stride_dst + x0 + 1;
+            let drow = (y0 + y) * stride_dst + x0 + start;
             let out = &mut dst[drow..drow + n];
             edge_offset_row(out, cur, a, b, &off_by_sum, bit_depth);
         }
-        // The first and last sample of the row may reach into the CTB to
-        // the left / right or diagonally: check per sample.
+        // Edge samples not covered by the run (no interior run, or a run
+        // that had to stop short of them) take the per-sample path.
         let edges: &[usize] = if width == 1 { &[0] } else { &[0, width - 1] };
         for &x in edges {
+            if x >= start && x < end {
+                continue;
+            }
             let xi = x as isize;
-            if neighbour_ok(xi, yi, a_dx, a_dy) && neighbour_ok(xi, yi, b_dx, b_dy) {
+            if edge_ok(xi, yi) {
                 let si = (y0 + y) * stride_src + x0 + x;
                 let cur = src[si].to_i32();
                 let a = src[(si as isize + a_off) as usize].to_i32();
@@ -363,24 +383,41 @@ fn edge_offset_row<P: Pixel>(
     off_by_sum: &[i32; 5],
     bit_depth: u8,
 ) {
-    let [o_m2, o_m1, _, o_p1, o_p2] = *off_by_sum;
-    let max = (1i32 << bit_depth) - 1;
+    // Everything fits i16 (samples at most 12-bit, offsets at most 31 << 2),
+    // so the loop runs in 16-bit lanes: twice the samples per vector
+    // instruction of i32.
+    let [o_m2, o_m1, _, o_p1, o_p2] = off_by_sum.map(|o| o as i16);
+    let max = ((1i32 << bit_depth) - 1) as i16;
     for (((o, &c), &a), &b) in out.iter_mut().zip(cur).zip(a).zip(b) {
-        let (c, a, b) = (c.to_i32(), a.to_i32(), b.to_i32());
-        let s = (c > a) as i32 - (c < a) as i32 + (c > b) as i32 - (c < b) as i32;
-        let off = if s == -2 {
-            o_m2
-        } else if s == -1 {
-            o_m1
-        } else if s == 1 {
-            o_p1
-        } else if s == 2 {
-            o_p2
-        } else {
-            0
-        };
-        *o = P::from_i32_clamped((c + off).clamp(0, max), bit_depth);
+        let v = edge_offset_px(
+            c.to_i32() as i16,
+            a.to_i32() as i16,
+            b.to_i32() as i16,
+            [o_m2, o_m1, o_p1, o_p2],
+            max,
+        );
+        *o = P::from_i32_clamped(v as i32, bit_depth);
     }
+}
+
+/// One edge-offset sample: `clip(c + offset)`, the offset picked by
+/// `sign(c - a) + sign(c - b)` through selects (vectorisable), with
+/// `offs = [offset(-2), offset(-1), offset(+1), offset(+2)]`.
+#[inline(always)]
+fn edge_offset_px(c: i16, a: i16, b: i16, offs: [i16; 4], max: i16) -> i16 {
+    let s = (c > a) as i16 - (c < a) as i16 + (c > b) as i16 - (c < b) as i16;
+    let off = if s == -2 {
+        offs[0]
+    } else if s == -1 {
+        offs[1]
+    } else if s == 1 {
+        offs[2]
+    } else if s == 2 {
+        offs[3]
+    } else {
+        0
+    };
+    (c + off).clamp(0, max)
 }
 
 /// Check if two adjacent CTBs (by raster address) are separated by a tile

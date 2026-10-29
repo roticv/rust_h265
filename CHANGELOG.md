@@ -145,6 +145,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Intra prediction builds its reference samples in fixed-size stack arrays
   instead of up to nine heap vectors per transform block. 1-4% fewer
   cycles (up to 8.7% fewer instructions on SAO-heavy content).
+- SAO edge offset runs in 16-bit lanes (twice the samples per vector
+  instruction) and folds a row's first and last sample into the same
+  vectorised run whenever their neighbours are available, so a full CTB
+  row has no scalar tail. 6-7% fewer cycles on SAO-heavy 8-bit content
+  (x265 `medium` / `slow` fixtures), 3% on 10-bit.
 
 ## [0.2.0] - 2026-10-28
 
