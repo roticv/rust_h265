@@ -683,6 +683,9 @@ impl Decoder {
     /// A decoder in decoding-order mode with the default
     /// [`DecodeLimits`]: Level 6.2's maximum picture size and an estimated
     /// 512 MB of state per picture.
+    ///
+    /// Most callers should chain [`with_display_order`](Self::with_display_order):
+    /// decoding order is the default only for compatibility.
     pub fn new() -> Self {
         Self::default()
     }
@@ -697,7 +700,10 @@ impl Decoder {
     }
 
     /// Output frames in display order, as the spec's output process does
-    /// (C.5.2, "bumping"), instead of in decoding order.
+    /// (C.5.2, "bumping"), instead of in decoding order. This is the
+    /// recommended mode: it handles reordering, `pic_output_flag` and
+    /// sequence boundaries that a caller sorting decoding-order frames by
+    /// POC would have to get right itself.
     ///
     /// In this mode `decode_nal` always returns `Ok(None)`. Take the frames
     /// released so far with [`next_output`](Self::next_output) after each

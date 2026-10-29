@@ -21,7 +21,8 @@
 //! # Quick start
 //!
 //! [`Decoder::with_display_order`] returns frames in display order, as the
-//! spec's output process does. Take frames with
+//! spec's output process does. It is the recommended mode; decoding order
+//! remains the default only for compatibility (see below). Take frames with
 //! [`next_output`](Decoder::next_output) after each NAL unit, and call
 //! [`flush`](Decoder::flush) until it returns `None` at the end of the
 //! stream:
@@ -54,11 +55,11 @@
 //!
 //! # Decoding order
 //!
-//! A decoder made with [`Decoder::new`] returns each picture from
-//! [`decode_nal`](Decoder::decode_nal) as soon as it is decoded, in
-//! decoding order, and returns every decoded picture, including those the
-//! spec does not output. This suits callers that pair each frame with the
-//! container packet it came from. To display such frames, sort them by
+//! Prefer display order. A decoder made with [`Decoder::new`] alone
+//! returns each picture from [`decode_nal`](Decoder::decode_nal) as soon as
+//! it is decoded, in decoding order, and returns every decoded picture,
+//! including those the spec does not output. This suits callers that pair
+//! each frame with the container packet it came from. To display such frames, sort them by
 //! [`pic_order_cnt`](Frame::pic_order_cnt) within each coded video
 //! sequence: POC restarts at every IDR or BLA picture, and at a CRA
 //! picture that follows an end-of-sequence NAL unit.

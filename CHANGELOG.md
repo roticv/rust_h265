@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-29
+
 ### Added
 
 - **Range extensions (HEVC v2).** Every range-extension coding tool is
@@ -28,8 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the remaining ones one per call. Pictures the spec does not output are
   dropped, including those still waiting when an IRAP picture with
   `NoOutputOfPriorPicsFlag = 1` starts a new sequence. The default mode is
-  unchanged (decoding order). `dump_frames` and `play` now use display
-  order; `dump_frames --decode-order` keeps the old path.
+  unchanged (decoding order), but display order is the recommended mode
+  for new code: it is what a player or transcoder needs, and it handles
+  reordering, `pic_output_flag` and sequence boundaries that a caller
+  sorting by POC would otherwise have to get right. `dump_frames` and
+  `play` now use display order; `dump_frames --decode-order` keeps the old
+  path.
 
 ### Fixed
 
@@ -112,6 +118,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GHSA-g2rg-wj66-w594; here it caused no memory-safety issue.
 
 ### Performance
+
+Single-threaded, real-world content, Apple M4 (`bench_decode`, best of
+three interleaved rounds of each release on the same machine):
+
+| Fixture | 0.2.0 | 0.3.0 | Speedup |
+|---|---:|---:|---:|
+| 1080p `safe` preset | 245 fps | 379 fps | 1.55× |
+| 720p `safe` preset | 440 fps | 685 fps | 1.56× |
+| 1080p `medium` preset | 182 fps | 296 fps | 1.63× |
+| 1080p `slow` preset | 181 fps | 291 fps | 1.61× |
+| 1080p 10-bit `safe` | 207 fps | 297 fps | 1.44× |
+| 1080p 10-bit `medium` | 157 fps | 235 fps | 1.50× |
+
+Single-threaded FFmpeg 9.0.2 is now 1.5-1.6× faster on 8-bit (2.5× for
+0.2.0), and `rust_h265` is 1.3-1.5× faster on 10-bit (about parity for
+0.2.0). See `BENCHMARK.md`. The individual changes:
 
 - The decode-time regression since 0.2.0 is gone. The per-sample
   neighbour check added to SAO edge offset (for CTB corners) cost 3-4% on

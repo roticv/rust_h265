@@ -13,8 +13,9 @@ A pure Rust H.265 / HEVC video decoder.
 >   open-GOP CRA, WPP, tiles, dependent slice segments, SAO, deblocking,
 >   `cu_qp_delta`, scaling lists, sign-data hiding, weighted prediction,
 >   transform skip, transquant bypass, constrained intra prediction, PCM.
-> - **Output:** decoding order, or display order following the spec's output
->   process (`Decoder::with_display_order`).
+> - **Output:** display order following the spec's output process
+>   (`Decoder::with_display_order`, recommended), or decoding order (the
+>   default).
 > - **Robustness:** damaged or missing slices cost the affected pictures, not
 >   the rest of the stream. Fuzzed.
 > - **Range extensions:** every range-extension coding tool, in 4:2:0 and
@@ -35,7 +36,7 @@ A pure Rust H.264 decoder ([`rust_h264`](https://github.com/roticv/rust_h264)) a
 ## Design
 
 - **Input:** Both **Annex B** (start-code delimited, `.h265` raw files) and **HVCC** (length-prefixed, MP4/MKV containers) formats via `parse_annex_b()` and `parse_hvcc()`.
-- **Streaming:** `Decoder::decode_nal(&NalUnit) -> Result<Option<Frame>, DecodeError>` plus `flush()`. NAL units are fed incrementally. Frames come out in **decoding order** by default, or in **display order** with `Decoder::new().with_display_order()` and `next_output()` (see [frame ordering](#important-frame-ordering)).
+- **Streaming:** `Decoder::decode_nal(&NalUnit) -> Result<Option<Frame>, DecodeError>` plus `flush()`. NAL units are fed incrementally. Use **display order**, `Decoder::new().with_display_order()` with `next_output()`, unless you need decoding order, which is the default for compatibility (see [frame ordering](#important-frame-ordering)).
 - **Performance:** The decoder aims to be fast, with FFmpeg's software HEVC decoder as the target benchmark. Against single-threaded FFmpeg on real 1080p content: about 1.5–1.6× slower on 8-bit and 1.3–1.5× faster on 10-bit (see [`BENCHMARK.md`](BENCHMARK.md)). Motion compensation, SAO and the inverse transform are compiler-vectorised; there are no hand-written NEON / SSE kernels yet.
 - **Multi-bit-depth:** 8-bit and 10-bit (Main / Main 10 profile) via a generic `Pixel` trait. 12-bit decodes (the 12-bit range-extensions conformance vectors pass); deeper streams are rejected with `DecodeError::Unsupported`. Pixel planes are `PixelData::U8(Vec<u8>)` or `PixelData::U16(Vec<u16>)` — check `frame.bit_depth` to determine which.
 - **Chroma formats:** 4:2:0 and 4:4:4, intra and inter. Check `frame.chroma_format_idc` (1 = 4:2:0, 3 = 4:4:4) to size the `u`/`v` planes: half width and height for 4:2:0, full size for 4:4:4. 4:2:2 and monochrome streams are rejected with `DecodeError::Unsupported`.
@@ -51,30 +52,29 @@ The public API mirrors `rust_h264`:
 use rust_h265::{Decoder, parse_annex_b};
 
 let h265_data = std::fs::read("input.h265").unwrap();
-let nals = parse_annex_b(&h265_data);
-let mut decoder = Decoder::new();
+// Display order (recommended): frames come out in the order to show them.
+let mut decoder = Decoder::new().with_display_order();
 
-for nal in &nals {
-    match decoder.decode_nal(nal) {
-        Ok(Some(frame)) => {
-            // `frame` is a decoded YUV picture:
-            //   frame.y, frame.u, frame.v  — PixelData (U8 or U16)
-            //   frame.width, frame.height  — luma dimensions
-            //   frame.bit_depth            — 8 or 10
-            //   frame.chroma_format_idc    — 1 = 4:2:0, 3 = 4:4:4
-            //   frame.pic_order_cnt        — display order index
-            //
-            // Access pixels:
-            //   frame.y.as_u8()  -> Option<&[u8]>   (8-bit)
-            //   frame.y.as_u16() -> Option<&[u16]>  (10-bit)
-        }
-        Ok(None) => {} // NAL consumed, no frame ready yet (e.g. VPS/SPS/PPS)
-        Err(e) => eprintln!("decode error: {:?}", e),
+for nal in parse_annex_b(&h265_data) {
+    if let Err(e) = decoder.decode_nal(&nal) {
+        eprintln!("decode error: {:?}", e);
+    }
+    while let Some(frame) = decoder.next_output() {
+        // `frame` is a decoded YUV picture:
+        //   frame.y, frame.u, frame.v  — PixelData (U8 or U16)
+        //   frame.width, frame.height  — luma dimensions
+        //   frame.bit_depth            — 8, 10 or 12
+        //   frame.chroma_format_idc    — 1 = 4:2:0, 3 = 4:4:4
+        //   frame.pic_order_cnt        — display order index
+        //
+        // Access pixels:
+        //   frame.y.as_u8()  -> Option<&[u8]>   (8-bit)
+        //   frame.y.as_u16() -> Option<&[u16]>  (10- and 12-bit)
     }
 }
-// Flush the last buffered frame
-if let Some(frame) = decoder.flush() {
-    // handle final frame
+// At the end of the stream, take the pictures still waiting.
+while let Some(frame) = decoder.flush() {
+    // handle frame
 }
 ```
 
@@ -85,7 +85,7 @@ For container-demuxed content (length-prefixed NALs instead of Annex B start cod
 ```rust
 use rust_h265::{Decoder, parse_hvcc};
 
-let mut decoder = Decoder::new();
+let mut decoder = Decoder::new().with_display_order();
 
 // length_size comes from HEVCDecoderConfigurationRecord (typically 4)
 let length_size = 4u8;
@@ -95,6 +95,12 @@ for packet in demuxer.video_packets() {
     for nal in parse_hvcc(&packet.data, length_size) {
         decoder.decode_nal(&nal)?;
     }
+    while let Some(frame) = decoder.next_output() {
+        // display `frame`
+    }
+}
+while let Some(frame) = decoder.flush() {
+    // display `frame`
 }
 ```
 
@@ -104,7 +110,8 @@ for packet in demuxer.video_packets() {
 order.** With B-frames, pictures are decoded before earlier pictures they
 are shown after.
 
-For display order, create the decoder with `with_display_order()`. It runs
+**Use display order unless you need decoding order.** Create the decoder
+with `with_display_order()`. It runs
 the spec's output process (C.5.2, "bumping"): frames are released in display
 order as soon as the stream's reorder and DPB limits allow, and pictures the
 spec never outputs are dropped. In this mode `decode_nal` always returns
@@ -132,11 +139,14 @@ pictures, and pictures still waiting when an IRAP picture with
 passes all 147 JCT-VC HEVC_v1 conformance vectors, including the ones that
 test output order.
 
-In the default decoding-order mode every decoded picture is returned, and
-the caller sorts by `pic_order_cnt` within each coded video sequence (POC
-restarts at every IDR or BLA picture, and at a CRA after an end-of-sequence
-NAL). `examples/dump_frames.rs --decode-order` shows how. That mode suits
-callers that pair each frame with the container packet it came from.
+Decoding order stays the default so that existing code keeps working. In
+that mode every decoded picture is returned, including ones the spec does
+not output, and the caller sorts by `pic_order_cnt` within each coded
+video sequence (POC restarts at every IDR or BLA picture, and at a CRA
+after an end-of-sequence NAL). `examples/dump_frames.rs --decode-order`
+shows how. It suits callers that pair each frame with the container packet
+it came from; everyone else should use display order, which gets these
+rules right for you.
 
 ## Differences from H.264
 
