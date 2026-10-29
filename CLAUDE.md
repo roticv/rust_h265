@@ -7,12 +7,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Complete for Main and Main 10, and for the 4:2:0 / 4:4:4 range-extension
 profiles up to 12 bits with every RExt coding tool.** Conformance
 (`tools/conformance/`): JCT-VC HEVC_v1 147 / 147, JCT-VC-RExt 34 / 34 of
-the vectors in supported formats. Byte-exact against FFmpeg on all in-tree
-fixtures plus 6 real-world Big Buck Bunny 1080p transcodes (8-bit and
-10-bit). Rejected with `DecodeError::Unsupported` rather than decoded
-wrongly: 4:2:2, monochrome, bit depth > 12, SCC. Display-order output
-(`with_display_order`) and recovery from damaged slices are in place. No
-threading or SIMD yet.
+the vectors in supported formats. Byte-exact against FFmpeg on the in-tree
+fixtures and the 6 Big Buck Bunny benchmark transcodes (720p / 1080p,
+8-bit and 10-bit); the RExt HM fixtures are checked against HM's
+reconstruction instead, since FFmpeg lacks bypass alignment and differs
+on lossless rotation / RDPCM. Rejected with `DecodeError::Unsupported`
+rather than decoded wrongly: 4:2:2, monochrome, bit depth > 12, SCC.
+Display-order output (`with_display_order`) and recovery from damaged
+slices are in place. Single-threaded, no hand-written SIMD (MC, SAO and
+the inverse transform are compiler-vectorised): about 1.5-1.6x slower
+than single-threaded FFmpeg on 8-bit, 1.3-1.5x faster on 10-bit
+(`BENCHMARK.md`).
 
 ## Build Commands
 
