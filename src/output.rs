@@ -40,8 +40,20 @@ impl OutputLimits {
     }
 }
 
+/// A picture's frame as the output process holds it. With frame threading
+/// a picture enters the output process when its last slice has been
+/// handed to its thread, before its samples exist: its frame is `Pending`
+/// until the thread finishes (`OutputQueue::resolve`).
+enum Slot {
+    Ready(Frame),
+    Pending(u64),
+    /// The picture's thread produced no frame (it failed); output skips it.
+    Gone,
+}
+
 struct Waiting {
-    frame: Frame,
+    poc: i32,
+    slot: Slot,
     /// PicLatencyCount (spec C.5.2.3).
     latency: u32,
 }
@@ -52,19 +64,18 @@ pub(crate) struct OutputQueue {
     /// Pictures marked "needed for output".
     waiting: Vec<Waiting>,
     /// Frames released by bumping, in output order, not yet taken.
-    ready: VecDeque<Frame>,
+    ready: VecDeque<Slot>,
 }
 
 impl OutputQueue {
     /// The bumping process (C.5.2.4): output the waiting picture with the
     /// smallest POC. Returns false when nothing is waiting.
     fn bump(&mut self) -> bool {
-        let Some(i) = (0..self.waiting.len()).min_by_key(|&i| self.waiting[i].frame.pic_order_cnt)
-        else {
+        let Some(i) = (0..self.waiting.len()).min_by_key(|&i| self.waiting[i].poc) else {
             return false;
         };
         let w = self.waiting.remove(i);
-        self.ready.push_back(w.frame);
+        self.ready.push_back(w.slot);
         true
     }
 
@@ -106,7 +117,7 @@ impl OutputQueue {
             let waiting_only = self
                 .waiting
                 .iter()
-                .filter(|w| !is_referenced(w.frame.pic_order_cnt))
+                .filter(|w| !is_referenced(w.poc))
                 .count();
             let fullness = referenced + waiting_only;
             let must_bump = self.waiting.len() > limits.max_num_reorder
@@ -121,23 +132,68 @@ impl OutputQueue {
     /// C.5.2.3, once the current picture is decoded: `frame` is the picture
     /// when PicOutputFlag = 1, `None` otherwise ("not needed for output").
     pub(crate) fn after_picture(&mut self, limits: &OutputLimits, frame: Option<Frame>) {
-        if let Some(frame) = frame {
-            let poc = frame.pic_order_cnt;
+        let entry = frame.map(|f| (f.pic_order_cnt, Slot::Ready(f)));
+        self.add_picture(limits, entry);
+    }
+
+    /// As `after_picture`, for a picture still decoding on its thread
+    /// (frame threading): its frame is filled in by `resolve(id, ..)`.
+    pub(crate) fn after_picture_pending(&mut self, limits: &OutputLimits, id: u64, poc: i32) {
+        self.add_picture(limits, Some((poc, Slot::Pending(id))));
+    }
+
+    /// The frame of pending picture `id` (`None`: it has none).
+    pub(crate) fn resolve(&mut self, id: u64, frame: Option<Frame>) {
+        let mut frame = Some(frame);
+        let slots = self
+            .waiting
+            .iter_mut()
+            .map(|w| &mut w.slot)
+            .chain(self.ready.iter_mut());
+        for slot in slots {
+            if matches!(slot, Slot::Pending(p) if *p == id) {
+                *slot = match frame.take().flatten() {
+                    Some(f) => Slot::Ready(f),
+                    None => Slot::Gone,
+                };
+                return;
+            }
+        }
+    }
+
+    fn add_picture(&mut self, limits: &OutputLimits, entry: Option<(i32, Slot)>) {
+        if let Some((poc, slot)) = entry {
             for w in &mut self.waiting {
-                if w.frame.pic_order_cnt > poc {
+                if w.poc > poc {
                     w.latency += 1;
                 }
             }
-            self.waiting.push(Waiting { frame, latency: 0 });
+            self.waiting.push(Waiting {
+                poc,
+                slot,
+                latency: 0,
+            });
         }
         while (self.waiting.len() > limits.max_num_reorder || self.latency_exceeded(limits))
             && self.bump()
         {}
     }
 
-    /// Take the next frame released for output.
+    /// Take the next frame released for output. `None` also while the next
+    /// one is still decoding on its thread.
     pub(crate) fn pop(&mut self) -> Option<Frame> {
-        self.ready.pop_front()
+        loop {
+            match self.ready.front()? {
+                Slot::Pending(_) => return None,
+                Slot::Gone => {
+                    self.ready.pop_front();
+                }
+                Slot::Ready(_) => match self.ready.pop_front() {
+                    Some(Slot::Ready(f)) => return Some(f),
+                    _ => unreachable!(),
+                },
+            }
+        }
     }
 }
 
@@ -227,6 +283,22 @@ mod tests {
         }
         q.start_new_sequence(false);
         assert_eq!(drain(&mut q), vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn pending_frames_keep_output_order() {
+        // POC 2 is still decoding when it is bumped: POC 4 behind it waits,
+        // and a picture that fails (no frame) is skipped.
+        let (l, mut q) = (limits(0, 16), OutputQueue::default());
+        q.after_picture_pending(&l, 7, 2);
+        q.after_picture(&l, Some(frame(4)));
+        q.after_picture_pending(&l, 8, 6);
+        assert_eq!(drain(&mut q), Vec::<i32>::new());
+        q.resolve(7, Some(frame(2)));
+        assert_eq!(drain(&mut q), vec![2, 4]);
+        q.resolve(8, None);
+        q.after_picture(&l, Some(frame(8)));
+        assert_eq!(drain(&mut q), vec![8]);
     }
 
     #[test]

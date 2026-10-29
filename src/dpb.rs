@@ -13,7 +13,7 @@
 //! invalidate, and so worker threads can read reference pictures.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::shared::SharedTable;
 
@@ -196,7 +196,10 @@ pub struct DecodedPicture {
     /// by slice address. Temporal MV prediction needs the lists of the slice
     /// that contains the collocated block (spec 8.5.3.2.9), which differ
     /// between slices when they use different reference list setups.
-    pub slice_ref_pic_list_pocs: Vec<(i32, SliceRefLists)>,
+    /// Set once the picture's last slice is known (with frame threading,
+    /// when its thread has all its slices; before any later picture reads
+    /// it).
+    pub slice_ref_pic_list_pocs: OnceLock<Vec<(i32, SliceRefLists)>>,
     /// Slice address of every CTB in raster order (`tab_slice_addr_rs` of
     /// the decoded picture).
     pub ctb_slice_addr: SharedTable<i32>,
@@ -228,7 +231,7 @@ impl DecodedPicture {
             uv_stride: (width / 2) as usize,
             chroma_shift_w: 1,
             chroma_shift_h: 1,
-            slice_ref_pic_list_pocs: Vec::new(),
+            slice_ref_pic_list_pocs: OnceLock::new(),
             ctb_slice_addr: SharedTable::default(),
         }
     }
@@ -266,8 +269,45 @@ impl DecodedPicture {
             uv_stride: (width / 2) as usize,
             chroma_shift_w: 1,
             chroma_shift_h: 1,
-            slice_ref_pic_list_pocs: Vec::new(),
+            slice_ref_pic_list_pocs: OnceLock::new(),
             ctb_slice_addr: SharedTable::default(),
+        }
+    }
+
+    /// A picture about to be decoded on its own thread (frame threading):
+    /// it owns its planes, motion field and slice map, which the decoding
+    /// thread writes through views (`PictureState::lend_shared`), and starts
+    /// with no progress.
+    #[allow(clippy::too_many_arguments)]
+    pub fn in_progress(
+        planes: PicturePlanes,
+        tab_mvf: SharedTable<crate::cu_tree::MvField>,
+        ctb_slice_addr: SharedTable<i32>,
+        (width, height): (u32, u32),
+        poc: i32,
+        (log2_min_pu_size, min_pu_width, log2_ctb_size): (u8, usize, u8),
+        (y_stride, uv_stride): (usize, usize),
+        (chroma_shift_w, chroma_shift_h): (u32, u32),
+    ) -> Self {
+        Self {
+            planes,
+            progress: PictureProgress::started(),
+            width,
+            height,
+            poc,
+            reference_status: AtomicU8::new(PictureReferenceStatus::ShortTerm as u8),
+            output: AtomicBool::new(false),
+            tab_mvf,
+            log2_min_pu_size,
+            min_pu_width,
+            log2_ctb_size,
+            ref_pic_list_pocs: [Vec::new(), Vec::new()],
+            y_stride,
+            uv_stride,
+            chroma_shift_w,
+            chroma_shift_h,
+            slice_ref_pic_list_pocs: OnceLock::new(),
+            ctb_slice_addr,
         }
     }
 
@@ -279,6 +319,7 @@ impl DecodedPicture {
         let rs = ((y / ctb) * w_ctbs + x / ctb) as usize;
         let addr = self.ctb_slice_addr.get(rs)?;
         self.slice_ref_pic_list_pocs
+            .get()?
             .iter()
             .find(|(a, _)| a == addr)
             .map(|(_, l)| l)

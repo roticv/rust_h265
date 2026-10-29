@@ -104,6 +104,7 @@ fn main() {
     while let Some(f) = dec.flush() {
         frames.push((cvs, f));
     }
+    exit_on_late_error(&mut dec, frames.len());
 
     // Display order: by sequence, then by POC within the sequence.
     frames.sort_by_key(|(cvs, f)| (*cvs, f.pic_order_cnt));
@@ -129,7 +130,18 @@ fn decode_display_order(data: &[u8], threads: usize) -> Vec<Frame> {
     while let Some(f) = dec.flush() {
         frames.push(f);
     }
+    exit_on_late_error(&mut dec, frames.len());
     frames
+}
+
+/// With `--threads` above 1 an error in a picture's slice data can surface
+/// only after the last `decode_nal` (it is found on the picture's thread);
+/// treat it like one `decode_nal` returned.
+fn exit_on_late_error(dec: &mut rust_h265::decoder::Decoder, frames: usize) {
+    if let Some(e) = dec.next_error() {
+        eprintln!("decode error after {frames} frames: {e:?}");
+        std::process::exit(1);
+    }
 }
 
 fn write_frames(out: &mut impl Write, frames: &[Frame], path: &str) {

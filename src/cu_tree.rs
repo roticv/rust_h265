@@ -456,6 +456,45 @@ impl<P: Pixel> PictureState<P> {
         }
     }
 
+    /// Hand this state's planes, motion field and slice map to a picture
+    /// that later pictures reference while this state decodes it (frame
+    /// threading), keeping views of them for the decode.
+    ///
+    /// # Safety
+    ///
+    /// The returned tables must stay alive (and not be accessed mutably)
+    /// until `release_lent` drops the views, and other threads may read
+    /// them only where the picture's progress says they are final.
+    pub(crate) unsafe fn lend_shared(
+        &mut self,
+    ) -> ([SharedTable<P>; 3], SharedTable<MvField>, SharedTable<i32>) {
+        fn lend<T>(t: &mut SharedTable<T>) -> SharedTable<T> {
+            let owner = std::mem::take(t);
+            // SAFETY: forwarded to the caller of `lend_shared`.
+            *t = unsafe { owner.view() };
+            owner
+        }
+        (
+            [
+                lend(&mut self.y_plane),
+                lend(&mut self.u_plane),
+                lend(&mut self.v_plane),
+            ],
+            lend(&mut self.tab_mvf),
+            lend(&mut self.tab_slice_addr_rs),
+        )
+    }
+
+    /// Drop the views `lend_shared` left (keeping the other tables, which
+    /// stay owned and are recycled with the state).
+    pub(crate) fn release_lent(&mut self) {
+        self.y_plane = SharedTable::default();
+        self.u_plane = SharedTable::default();
+        self.v_plane = SharedTable::default();
+        self.tab_mvf = SharedTable::default();
+        self.tab_slice_addr_rs = SharedTable::default();
+    }
+
     /// Drop a worker state's table views (replacing them with empty owned
     /// tables), keeping its per-thread decoding state. Every worker calls
     /// this before the picture state it views is used again.

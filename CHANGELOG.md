@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Multithreaded decoding:** `Decoder::with_threads(n)` (default 1).
+  - Frame threading: each picture decodes on its own thread (up to `n` at
+    a time) once the pictures it references are decoded, for every
+    stream. With more than one thread, frames and slice-data errors come
+    out of later calls than with one; `Decoder::next_error()` returns
+    errors found after the last `decode_nal`.
   - Wavefront parallel processing: in streams coded with
     `entropy_coding_sync_enabled_flag` (x265's default) the CTB rows of a
     slice decode on separate threads, each row two CTBs behind the row

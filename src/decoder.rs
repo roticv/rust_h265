@@ -109,7 +109,9 @@ macro_rules! with_picture_state {
 /// In-flight picture state: the reconstruction buffers plus the bookkeeping
 /// needed to stitch multi-slice decode back together.
 struct PictureInProgress {
-    decode: PictureDecode,
+    /// Where the picture decodes: on the calling thread, or on its own
+    /// thread (frame threading).
+    side: PictureSide,
     /// Header of the most recently decoded slice segment. Phase 3c-1 uses
     /// it for deblock/SAO finalization — in the common case all slices in a
     /// picture share the same filter flags, which this approximation
@@ -183,6 +185,162 @@ impl PictureDecode {
                 sps.bit_depth_luma,
             )
         })
+    }
+}
+
+/// Where a picture in progress is decoded.
+enum PictureSide {
+    /// On the calling thread, slice by slice as `decode_nal` receives them.
+    Local(Box<PictureDecode>),
+    /// On its own thread (frame threading).
+    Thread(PictureThread),
+}
+
+/// The calling thread's handle on a picture decoding on its own thread.
+struct PictureThread {
+    /// Identifies the picture's pending frame in the output queue.
+    id: u64,
+    jobs: std::sync::mpsc::Sender<PictureMessage>,
+    handle: std::thread::JoinHandle<PictureResult>,
+    picture: Arc<DecodedPicture>,
+}
+
+enum PictureMessage {
+    Slice(Box<SliceJob>),
+    /// No more slices: finish the picture (loop filters, crop) with these
+    /// parameter sets and the picture's last slice header, as a sequential
+    /// decode does.
+    Finish {
+        sps: Arc<Sps>,
+        pps: Arc<Pps>,
+        last_sh: Box<SliceHeader>,
+    },
+}
+
+/// What a picture thread returns.
+struct PictureResult {
+    frame: Result<Frame, DecodeError>,
+    /// Errors from the picture's slice data, in slice order.
+    errors: Vec<DecodeError>,
+    /// The picture state, for recycling (its lent tables released).
+    state: PictureStateEnum,
+}
+
+/// A picture whose last slice has been handed to its thread.
+struct InFlight {
+    id: u64,
+    handle: std::thread::JoinHandle<PictureResult>,
+    /// PicOutputFlag: whether its frame is output.
+    output: bool,
+}
+
+/// The body of a picture thread: decode the slices it receives, each once
+/// the pictures it references are complete, then finish the picture and
+/// mark it complete for the pictures that reference it.
+fn picture_thread(
+    mut decode: PictureDecode,
+    jobs: std::sync::mpsc::Receiver<PictureMessage>,
+    picture: Arc<DecodedPicture>,
+    threads: usize,
+) -> PictureResult {
+    // A picture that stops early (a panic, or the decoder dropped) must
+    // still release the pictures waiting on it.
+    struct CompleteOnDrop(Arc<DecodedPicture>);
+    impl Drop for CompleteOnDrop {
+        fn drop(&mut self) {
+            self.0.progress.set_complete();
+        }
+    }
+    let guard = CompleteOnDrop(picture);
+    let mut errors = Vec::new();
+    let mut finish = None;
+    for message in jobs {
+        match message {
+            PictureMessage::Slice(job) => {
+                let params = &job.slice_params;
+                let refs = params.ref_frames_l0.iter().chain(&params.ref_frames_l1);
+                for r in refs.chain(params.collocated_ref.iter()) {
+                    r.progress.wait_complete();
+                }
+                if let Err(e) = decode.decode_slice(&job, threads) {
+                    errors.push(e);
+                }
+            }
+            PictureMessage::Finish { sps, pps, last_sh } => {
+                finish = Some((sps, pps, last_sh));
+                break;
+            }
+        }
+    }
+    let frame = match finish {
+        Some((sps, pps, last_sh)) => decode.finish(&sps, &pps, &last_sh, threads),
+        None => Err(DecodeError::InvalidSyntax(
+            "picture abandoned before its end",
+        )),
+    };
+    // The views of the picture's planes end before it is marked complete
+    // (and others read it).
+    with_picture_state!(&mut decode.state, |s| s.release_lent());
+    drop(guard);
+    PictureResult {
+        frame,
+        errors,
+        state: decode.state,
+    }
+}
+
+/// Start decoding a new picture on its own thread: the picture enters the
+/// DPB now, owning its planes, motion field and slice map (the state keeps
+/// views of them), so later pictures can reference it while it decodes.
+fn start_picture_thread(
+    dpb: &mut DecodedPictureBuffer,
+    pool: &mut PicturePool,
+    id: u64,
+    threads: usize,
+    mut state: PictureStateEnum,
+    poc: i32,
+) -> PictureThread {
+    fn in_progress<P: Pixel>(st: &mut PictureState<P>, poc: i32) -> Arc<DecodedPicture> {
+        // SAFETY: the decoded picture owns the lent tables; the picture
+        // thread holds an `Arc` of it until after `release_lent` has
+        // dropped the state's views, and other pictures read it only once
+        // it is complete (they wait on its progress first).
+        let (planes, mvf, slice_addr) = unsafe { st.lend_shared() };
+        Arc::new(DecodedPicture::in_progress(
+            P::wrap_planes(planes),
+            mvf,
+            slice_addr,
+            (st.width, st.height),
+            poc,
+            (st.log2_min_pu_size, st.min_pu_width, st.log2_ctb_size),
+            (st.y_stride, st.uv_stride),
+            (st.chroma_shift_w, st.chroma_shift_h),
+        ))
+    }
+    let picture = with_picture_state!(&mut state, |st| in_progress(st, poc));
+    picture.mark(PictureReferenceStatus::ShortTerm);
+    picture.set_output();
+    dpb.insert(Arc::clone(&picture));
+    for retired in dpb.cleanup_unused() {
+        pool.recycle_picture(retired);
+    }
+    let (jobs, receiver) = std::sync::mpsc::channel();
+    let decode = PictureDecode {
+        state,
+        saved_cabac_state: None,
+        saved_wpp_cabac_state: None,
+        ctbs_decoded: 0,
+    };
+    let for_thread = Arc::clone(&picture);
+    let handle = std::thread::Builder::new()
+        .name("rust_h265 picture".into())
+        .spawn(move || picture_thread(decode, receiver, for_thread, threads))
+        .expect("spawn a picture thread");
+    PictureThread {
+        id,
+        jobs,
+        handle,
+        picture,
     }
 }
 
@@ -576,8 +734,10 @@ type ZscanKey = (u32, u32, u8, u8);
 ///
 /// # Errors and damaged streams
 ///
-/// An error from `decode_nal` concerns that NAL unit only; keep feeding the
-/// stream. A picture that loses slices (failed or missing) is still
+/// An error from `decode_nal` concerns that NAL unit only (with
+/// [`with_threads`](Self::with_threads) above 1, an error in a picture's
+/// slice data may also come from a later call, or from
+/// [`next_error`](Self::next_error)); keep feeding the stream. A picture that loses slices (failed or missing) is still
 /// finished when the next picture starts, with the CTBs no slice decoded
 /// filled mid-grey, and is output and used as a reference. A reference
 /// picture that is missing altogether is replaced by a mid-grey stand-in
@@ -664,6 +824,13 @@ pub struct Decoder {
     /// Set by `with_threads`: threads the picture-level passes may use (0
     /// from `Default` means 1).
     threads: usize,
+    /// Frame threading (`threads > 1`): pictures whose last slice has been
+    /// handed to their thread, oldest first.
+    in_flight: std::collections::VecDeque<InFlight>,
+    /// Errors from the slice data of pictures decoded on their own threads,
+    /// returned by later calls to `decode_nal`.
+    deferred_errors: std::collections::VecDeque<DecodeError>,
+    next_picture_id: u64,
     output_queue: crate::output::OutputQueue,
     /// Decoding-order mode: frames ready but not yet returned. A call can
     /// finish two pictures (an incomplete earlier one, then its own), and
@@ -792,6 +959,17 @@ impl PicturePool {
                 self.planes_u16.push((p.map(SharedTable::into_vec), mvf));
             }
             _ => {}
+        }
+    }
+}
+
+impl Drop for Decoder {
+    /// Picture threads still running end with the decoder: the current
+    /// picture's thread sees its channel close, the others finish.
+    fn drop(&mut self) {
+        self.current_picture = None;
+        for f in self.in_flight.drain(..) {
+            let _ = f.handle.join();
         }
     }
 }
@@ -973,10 +1151,9 @@ impl Decoder {
     /// A decoder in decoding-order mode with custom resource limits. An SPS
     /// that exceeds them is rejected with [`DecodeError::ResourceLimit`].
     pub fn with_limits(limits: DecodeLimits) -> Self {
-        Self {
-            limits,
-            ..Self::default()
-        }
+        let mut decoder = Self::default();
+        decoder.limits = limits;
+        decoder
     }
 
     /// Output frames in display order, as the spec's output process does
@@ -1015,18 +1192,26 @@ impl Decoder {
 
     /// Use up to `threads` threads (at least 1; the default is 1).
     ///
-    /// The output is identical for every thread count; only the speed
-    /// changes. Two parts of decoding run in parallel:
+    /// The frames, their order and every sample are identical for every
+    /// thread count; only the speed and the timing change:
     ///
+    /// - Frame threading: each picture decodes on its own thread, up to
+    ///   `threads` at a time, as soon as the pictures it references are
+    ///   decoded. Works for every stream.
     /// - With wavefront parallel processing (`entropy_coding_sync_enabled_flag`,
-    ///   on by default in x265), the CTB rows of a slice decode on separate
-    ///   threads, each row two CTBs behind the one above. This is where most
-    ///   of the gain is: about 2.2-2.5x with 4 threads on 1080p content.
-    ///   Slices with tiles or chroma QP offset lists decode sequentially.
-    /// - The loop filters (deblocking and SAO) run over bands of rows, for
-    ///   every stream.
+    ///   on by default in x265), the CTB rows of a picture's slices also
+    ///   decode in parallel, each row two CTBs behind the one above. Slices
+    ///   with tiles or chroma QP offset lists decode their rows in order.
+    /// - The loop filters (deblocking and SAO) run over bands of rows.
     ///
-    /// Streams without WPP gain only from the loop filters (5-7%).
+    /// With more than one thread the decoder works ahead of the caller: a
+    /// frame comes out of a later `decode_nal` / [`next_output`](Self::next_output)
+    /// call than with one thread (and the rest from [`flush`](Self::flush)),
+    /// and an error in a picture's slice data is returned by a later
+    /// `decode_nal` call, or by [`next_error`](Self::next_error) after the
+    /// last one. Errors in NAL unit headers, slice headers and parameter
+    /// sets still come from the call that received them.
+    ///
     /// [`std::thread::available_parallelism`] is a reasonable value; more
     /// threads than the machine's performance cores rarely help.
     ///
@@ -1042,9 +1227,25 @@ impl Decoder {
 
     /// Next frame released for display, in display-order mode (see
     /// [`with_display_order`](Self::with_display_order)). Always `None` in
-    /// the default decoding-order mode.
+    /// the default decoding-order mode. With
+    /// [`with_threads`](Self::with_threads) above 1 it is also `None` while
+    /// the next frame in display order is still decoding: keep calling
+    /// after each NAL unit, and [`flush`](Self::flush) at the end.
     pub fn next_output(&mut self) -> Option<Frame> {
+        self.collect_pictures(false);
         self.output_queue.pop()
+    }
+
+    /// The next error from a picture decoded on its own thread that no
+    /// `decode_nal` call has returned yet. With
+    /// [`with_threads`](Self::with_threads) above 1, errors in a picture's
+    /// slice data are found after the call that fed the slice;
+    /// `decode_nal` returns them on later calls, and this returns those
+    /// still waiting, for example after [`flush`](Self::flush). Always
+    /// `None` with one thread.
+    pub fn next_error(&mut self) -> Option<DecodeError> {
+        self.collect_pictures(false);
+        self.deferred_errors.pop_front()
     }
 
     fn validate_picture_limits(&self, sps: &Sps) -> Result<(), DecodeError> {
@@ -1106,6 +1307,17 @@ impl Decoder {
     /// call (or by `flush`), so frames stay in decoding order.
     pub fn decode_nal(&mut self, nal: &NalUnit<'_>) -> Result<Option<Frame>, DecodeError> {
         let result = self.decode_nal_inner(nal);
+        self.collect_pictures(false);
+        // An error from a picture decoded on its own thread (frame
+        // threading) comes out after this NAL unit's own error.
+        if result.is_ok()
+            && let Some(e) = self.deferred_errors.pop_front()
+        {
+            if let Ok(Some(frame)) = result {
+                self.pending_frames.push_back(frame);
+            }
+            return Err(e);
+        }
         if self.pending_frames.is_empty() {
             return result;
         }
@@ -1206,6 +1418,8 @@ impl Decoder {
         {
             self.pending_frames.push_back(frame);
         }
+        // Frame threading: every picture still decoding finishes first.
+        self.collect_pictures(true);
         if self.display_order {
             self.output_queue.output_all();
             return self.output_queue.pop();
@@ -1516,13 +1730,27 @@ impl Decoder {
                 ps.last_qp_y = sh.slice_qp_y;
                 ps.first_qp_group = !sh.dependent_slice_segment_flag;
             });
-            self.current_picture = Some(PictureInProgress {
-                decode: PictureDecode {
+            let side = if self.threads > 1 {
+                let id = self.next_picture_id;
+                self.next_picture_id += 1;
+                PictureSide::Thread(start_picture_thread(
+                    &mut self.dpb,
+                    &mut self.pool,
+                    id,
+                    self.threads,
+                    ps_enum,
+                    sh.poc,
+                ))
+            } else {
+                PictureSide::Local(Box::new(PictureDecode {
                     state: ps_enum,
                     saved_cabac_state: None,
                     saved_wpp_cabac_state: None,
                     ctbs_decoded: 0,
-                },
+                }))
+            };
+            self.current_picture = Some(PictureInProgress {
+                side,
                 last_slice_header: sh.clone(),
                 last_independent_slice_header: sh.clone(),
                 total_ctbs,
@@ -1682,11 +1910,21 @@ impl Decoder {
             pic.last_independent_slice_header = sh.clone();
         }
         pic.last_slice_header = sh;
-        pic.decode.decode_slice(&job, self.threads)?;
-
-        if pic.decode.ctbs_decoded != total_ctbs {
-            // More slice segments still to come for this picture.
-            return Ok(None);
+        match &mut pic.side {
+            PictureSide::Local(decode) => {
+                decode.decode_slice(&job, self.threads)?;
+                if decode.ctbs_decoded != total_ctbs {
+                    // More slice segments still to come for this picture.
+                    return Ok(None);
+                }
+            }
+            PictureSide::Thread(t) => {
+                // The picture ends when the next one starts (or at flush):
+                // only its thread knows how far its CTBs got. A send fails
+                // only if the thread panicked, which joining it reports.
+                let _ = t.jobs.send(PictureMessage::Slice(Box::new(job)));
+                return Ok(None);
+            }
         }
 
         // Picture complete — run in-loop filters and emit the frame.
@@ -1701,7 +1939,127 @@ impl Decoder {
     /// failed), run the in-loop filters, store it in the DPB and hand the
     /// frame to the output (decoding-order return value or display-order
     /// queue).
+    /// Spec 8.3.1: prevTid0Pic is simply the previous TemporalId-0 picture
+    /// that is not RASL/RADL/sub-layer non-reference. IRAP pictures qualify
+    /// like any other, so store their actual POC (a mid-stream CRA keeps a
+    /// non-zero POC; a BLA's POC is its LSB).
+    fn update_prev_tid0(&mut self, last_sh: &SliceHeader) {
+        let is_tid0 = last_sh.temporal_id == 0
+            && !matches!(
+                last_sh.nal_unit_type,
+                NalUnitType::TrailN
+                    | NalUnitType::TsaN
+                    | NalUnitType::StsaN
+                    | NalUnitType::RadlN
+                    | NalUnitType::RadlR
+                    | NalUnitType::RaslN
+                    | NalUnitType::RaslR
+            );
+        if is_tid0 {
+            self.prev_tid0_poc = last_sh.poc;
+        }
+    }
+
+    /// The calling thread's end of a picture decoding on its own thread:
+    /// hand it the finish, and do now what a sequential decode does after
+    /// the picture (prevTid0Pic, the output process, with its frame
+    /// pending until the thread delivers it). The picture is in the DPB
+    /// already.
+    fn finish_threaded_picture(
+        &mut self,
+        last_sh: SliceHeader,
+        slice_ref_pocs: Vec<(i32, crate::dpb::SliceRefLists)>,
+        thread: PictureThread,
+    ) -> Result<Option<Frame>, DecodeError> {
+        let sps = self
+            .sps
+            .clone()
+            .ok_or(DecodeError::InvalidSyntax("picture without active SPS"))?;
+        let pps = self
+            .pps
+            .clone()
+            .ok_or(DecodeError::InvalidSyntax("picture without active PPS"))?;
+        let _ = thread.picture.slice_ref_pic_list_pocs.set(slice_ref_pocs);
+        let limits = crate::output::OutputLimits::from_sps(&sps);
+        let _ = thread.jobs.send(PictureMessage::Finish {
+            sps,
+            pps,
+            last_sh: Box::new(last_sh.clone()),
+        });
+        self.update_prev_tid0(&last_sh);
+        let output = last_sh.pic_output_flag;
+        if self.display_order {
+            if output {
+                self.output_queue
+                    .after_picture_pending(&limits, thread.id, last_sh.poc);
+            } else {
+                self.output_queue.after_picture(&limits, None);
+            }
+        }
+        self.in_flight.push_back(InFlight {
+            id: thread.id,
+            handle: thread.handle,
+            output,
+        });
+        // At most `threads` pictures in flight: wait for the oldest.
+        while self.in_flight.len() > self.threads {
+            self.collect_picture();
+        }
+        Ok(None)
+    }
+
+    /// Join the oldest in-flight picture (waiting for it) and deliver its
+    /// frame and errors.
+    fn collect_picture(&mut self) {
+        let Some(f) = self.in_flight.pop_front() else {
+            return;
+        };
+        let result = match f.handle.join() {
+            Ok(r) => r,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        self.pool.recycle_state(result.state);
+        self.deferred_errors.extend(result.errors);
+        let frame = match result.frame {
+            Ok(frame) => Some(frame),
+            Err(e) => {
+                self.deferred_errors.push_back(e);
+                None
+            }
+        };
+        if !f.output {
+            return;
+        }
+        if self.display_order {
+            self.output_queue.resolve(f.id, frame);
+        } else if let Some(frame) = frame {
+            self.pending_frames.push_back(frame);
+        }
+    }
+
+    /// Collect the in-flight pictures that have finished, oldest first
+    /// (stopping at the first still decoding, to keep decoding order), or
+    /// all of them when `wait` is set.
+    fn collect_pictures(&mut self, wait: bool) {
+        while let Some(f) = self.in_flight.front() {
+            if !wait && !f.handle.is_finished() {
+                break;
+            }
+            self.collect_picture();
+        }
+    }
+
     fn finish_picture(&mut self, mut pic: PictureInProgress) -> Result<Option<Frame>, DecodeError> {
+        let mut decode = match pic.side {
+            PictureSide::Local(decode) => decode,
+            PictureSide::Thread(thread) => {
+                return self.finish_threaded_picture(
+                    pic.last_slice_header,
+                    pic.slice_ref_pocs,
+                    thread,
+                );
+            }
+        };
         let threads = self.threads.max(1);
         let sps = self
             .sps
@@ -1712,7 +2070,7 @@ impl Decoder {
             .as_ref()
             .ok_or(DecodeError::InvalidSyntax("picture without active PPS"))?;
         let last_sh = &pic.last_slice_header;
-        let emitted_frame = pic.decode.finish(sps, pps, last_sh, threads)?;
+        let emitted_frame = decode.finish(sps, pps, last_sh, threads)?;
         let last_sh_cloned = last_sh.clone();
         let picture_poc = last_sh_cloned.poc;
         let pic_width = sps.pic_width_in_luma_samples;
@@ -1722,31 +2080,13 @@ impl Decoder {
         // longer used beyond this point — NLL will release them here so
         // we can take mutable borrows of `self.*` below.
 
-        let nut_for_tid0 = last_sh_cloned.nal_unit_type;
-        let is_tid0 = last_sh_cloned.temporal_id == 0
-            && !matches!(
-                nut_for_tid0,
-                NalUnitType::TrailN
-                    | NalUnitType::TsaN
-                    | NalUnitType::StsaN
-                    | NalUnitType::RadlN
-                    | NalUnitType::RadlR
-                    | NalUnitType::RaslN
-                    | NalUnitType::RaslR
-            );
-        // Spec 8.3.1: prevTid0Pic is simply the previous TemporalId-0
-        // picture that is not RASL/RADL/sub-layer non-reference. IRAP
-        // pictures qualify like any other, so store their actual POC (a
-        // mid-stream CRA keeps a non-zero POC; a BLA's POC is its LSB).
-        if is_tid0 {
-            self.prev_tid0_poc = last_sh_cloned.poc;
-        }
+        self.update_prev_tid0(&last_sh_cloned);
 
         // Insert the fresh picture into the DPB.
         let ref_list_l0_pocs: Vec<i32> = self.current_ref_list_l0.iter().map(|p| p.poc).collect();
         let ref_list_l1_pocs: Vec<i32> = self.current_ref_list_l1.iter().map(|p| p.poc).collect();
 
-        let decoded_pic = with_picture_state!(&mut pic.decode.state, |state| {
+        let decoded_pic = with_picture_state!(&mut decode.state, |state| {
             // The planes keep the CTU-aligned stride and chroma geometry of
             // the picture state; motion compensation reads them through
             // these fields rather than assuming `stride == width`.
@@ -1775,11 +2115,13 @@ impl Decoder {
             dp.uv_stride = uv_stride;
             dp.chroma_shift_w = chroma_shift_w;
             dp.chroma_shift_h = chroma_shift_h;
-            dp.slice_ref_pic_list_pocs = std::mem::take(&mut pic.slice_ref_pocs);
+            let _ = dp
+                .slice_ref_pic_list_pocs
+                .set(std::mem::take(&mut pic.slice_ref_pocs));
             dp.ctb_slice_addr = std::mem::take(&mut state.tab_slice_addr_rs);
             Arc::new(dp)
         });
-        self.pool.recycle_state(pic.decode.state);
+        self.pool.recycle_state(decode.state);
         decoded_pic.mark(PictureReferenceStatus::ShortTerm);
         decoded_pic.set_output();
         self.dpb.insert(decoded_pic);
@@ -4752,9 +5094,10 @@ mod tests {
         }
     }
 
-    /// Decode `nals` with `threads` threads; returns each NAL unit's
-    /// result (as text, so errors compare) and every frame, with its POC and
-    /// all sample bytes.
+    /// Decode `nals` with `threads` threads; returns the errors (as text, so
+    /// they compare; sorted, as frame threading reports slice-data errors
+    /// on a later call than sequential decoding does) and every frame,
+    /// with its POC and all sample bytes.
     fn decode_with_threads(nals: &[NalUnit], threads: usize) -> (Vec<String>, Vec<(i32, Vec<u8>)>) {
         let mut dec = Decoder::new().with_threads(threads);
         let (mut results, mut frames) = (Vec::new(), Vec::new());
@@ -4770,17 +5113,19 @@ mod tests {
         };
         for nal in nals {
             match dec.decode_nal(nal) {
-                Ok(Some(f)) => {
-                    results.push("frame".to_string());
-                    take(f);
-                }
-                Ok(None) => results.push("none".to_string()),
+                Ok(Some(f)) => take(f),
+                Ok(None) => {}
                 Err(e) => results.push(format!("{e:?}")),
             }
         }
         while let Some(f) = dec.flush() {
             take(f);
         }
+        // Errors from the last pictures' threads, found during flush.
+        while let Some(e) = dec.next_error() {
+            results.push(format!("{e:?}"));
+        }
+        results.sort();
         (results, frames)
     }
 
@@ -4814,7 +5159,7 @@ mod tests {
                     }
                     nals[k].rbsp = std::borrow::Cow::Owned(b);
                     let single = decode_with_threads(&nals, 1);
-                    if single.0.iter().any(|r| r != "frame" && r != "none") {
+                    if !single.0.is_empty() {
                         damaged_runs += 1;
                     }
                     for threads in [2, 4] {
