@@ -11,6 +11,8 @@
 
 use std::sync::Arc;
 
+use crate::shared::SharedTable;
+
 use crate::cu_tree::PictureState;
 use crate::dpb::DecodedPicture;
 use crate::pixel::Pixel;
@@ -158,19 +160,21 @@ fn ref_sample<P: Pixel>(plane: &[P], stride: usize, x: i32, y: i32, w: i32, h: i
 /// well-formed block lies inside the CTU-aligned plane.
 #[inline(always)]
 fn put_rows<P: Pixel>(
-    plane: &mut [P],
+    plane: &mut SharedTable<P>,
     off: usize,
     stride: usize,
     w: usize,
     h: usize,
     mut f: impl FnMut(&mut [P], usize),
 ) {
+    // One reference per output row, covering exactly the block's samples:
+    // with wavefront decoding other threads use the rest of the plane.
     for j in 0..h {
         let start = off + j * stride;
-        let Some(row) = plane.get_mut(start..start + w) else {
+        if start + w > plane.len() {
             break;
-        };
-        f(row, j);
+        }
+        f(&mut plane[start..start + w], j);
     }
 }
 
@@ -179,7 +183,7 @@ fn put_rows<P: Pixel>(
 /// `(weight, round, shift, offset)`.
 #[inline(always)]
 fn put_weighted<P: Pixel>(
-    plane: &mut [P],
+    plane: &mut SharedTable<P>,
     off: usize,
     stride: usize,
     pred: &[i16],
@@ -1042,7 +1046,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 )
             }
         };
-        let bi = |plane: &mut [P], c: usize, off, stride, a: &[i16], b: &[i16], w, h| {
+        let bi = |plane: &mut SharedTable<P>, c: usize, off, stride, a: &[i16], b: &[i16], w, h| {
             let bit_depth = if c == 0 { bit_depth } else { bit_depth_c };
             let bi_shift = crate::pixel::bipred_shift(bit_depth) as i32;
             let bi_offset = crate::pixel::bipred_offset(bit_depth);
@@ -1125,13 +1129,14 @@ pub fn motion_compensation_pu<P: Pixel>(
 
         if !weighted_pred_flag {
             // Non-weighted uni-prediction: MC directly into the picture planes.
-            // Write luma MC result directly to state.y_plane at the PU offset.
+            // Each destination range ends at the block's last sample, so it
+            // stays inside the block's own CTB row (wavefront decoding).
             let ref_y = P::extract_slice(&ref_list.y);
             let ref_u = P::extract_slice(&ref_list.u);
             let ref_v = P::extract_slice(&ref_list.v);
             let y_off = (y0 as usize) * y_stride + (x0 as usize);
             mc_luma::<P>(
-                &mut state.y_plane[y_off..],
+                &mut state.y_plane[y_off..y_off + (h - 1) * y_stride + w],
                 y_stride,
                 ref_y,
                 ref_list.y_stride,
@@ -1155,7 +1160,7 @@ pub fn motion_compensation_pu<P: Pixel>(
             let mv_y_c = chroma_mv(mv.y, csh);
 
             mc_chroma::<P>(
-                &mut state.u_plane[c_off..],
+                &mut state.u_plane[c_off..c_off + (h_c - 1) * uv_stride + w_c],
                 uv_stride,
                 ref_u,
                 ref_uv_stride,
@@ -1172,7 +1177,7 @@ pub fn motion_compensation_pu<P: Pixel>(
                 &mut edge[..],
             );
             mc_chroma::<P>(
-                &mut state.v_plane[c_off..],
+                &mut state.v_plane[c_off..c_off + (h_c - 1) * uv_stride + w_c],
                 uv_stride,
                 ref_v,
                 ref_uv_stride,

@@ -54,8 +54,8 @@ const ANGULAR_REF_LEN: usize = 3 * 32 + 4;
 /// (per spec 8.4.4.2.2). For each unavailable group, the substitution rule
 /// fills it from the nearest available sample.
 #[allow(clippy::too_many_arguments)]
-pub fn build_reference_samples<P: Pixel>(
-    plane: &[P],
+pub fn build_reference_samples<P: Pixel, S: std::ops::Index<usize, Output = P> + ?Sized>(
+    plane: &S,
     stride: usize,
     pic_w: usize,
     pic_h: usize,
