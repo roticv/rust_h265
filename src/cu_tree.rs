@@ -253,6 +253,8 @@ pub struct PictureState<P: Pixel> {
     /// Coefficient / residual buffer lent to each transform block in turn,
     /// so residual decoding does not allocate per block.
     pub coeff_buf: Vec<i16>,
+    /// Deblocked Y / Cb / Cr copy that SAO reads from (reused per picture).
+    pub sao_snapshot: [Vec<P>; 3],
 
     /// Phase 2c-3 sentinel — most recently decoded luma residual block.
     pub last_luma_residual: Option<ResidualBlock>,
@@ -486,6 +488,7 @@ impl<P: Pixel> PictureState<P> {
             cu_origin: (0, 0),
             ccp_luma_residual: reuse!(ccp_luma_residual).unwrap_or_default(),
             coeff_buf: reuse!(coeff_buf).unwrap_or_default(),
+            sao_snapshot: reuse!(sao_snapshot).unwrap_or_default(),
             last_luma_residual: None,
             tab_qp_y: refill(reuse!(tab_qp_y), min_cb_width * min_cb_height, 0i8),
             bs_vertical: refill(

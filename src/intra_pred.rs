@@ -32,6 +32,16 @@ pub struct ReferenceAvailability {
     pub bottom_left: bool,
 }
 
+/// Reference samples per side for the largest intra block (32x32): the
+/// corner plus 2 * 32 samples. Fixed-size, so building references for a
+/// transform block does not allocate; only the first `2 * size + 1`
+/// entries are meaningful.
+pub const MAX_REF_LEN: usize = 2 * 32 + 1;
+/// A `top` or `left` reference array (see `MAX_REF_LEN`).
+pub type RefSamples<P> = [P; MAX_REF_LEN];
+/// Extended reference row of angular prediction: `3 * size + 4` at 32x32.
+const ANGULAR_REF_LEN: usize = 3 * 32 + 4;
+
 /// Build the `top` and `left` reference sample arrays for a TU at `(x0, y0)`
 /// of size `size = 1 << log2_size`. Returns `(top, left)` each of length
 /// `2 * size + 1`, where index 0 is the corner.
@@ -55,16 +65,15 @@ pub fn build_reference_samples<P: Pixel>(
     bit_depth: u8,
     avail: ReferenceAvailability,
     intra_only: Option<(&[bool], &[bool])>,
-) -> (Vec<P>, Vec<P>) {
+) -> (RefSamples<P>, RefSamples<P>) {
     let size = 1usize << log2_size;
-    let len = 2 * size + 1;
-    let mut top = vec![P::zero(); len];
-    let mut left = vec![P::zero(); len];
+    let mut top = [P::zero(); MAX_REF_LEN];
+    let mut left = [P::zero(); MAX_REF_LEN];
 
     // Track per-sample availability so we can substitute the unavailable
     // ones afterwards. `top_avail[i]` covers `top[i]` (i = 0 is the corner).
-    let mut top_avail = vec![false; len];
-    let mut left_avail = vec![false; len];
+    let mut top_avail = [false; MAX_REF_LEN];
+    let mut left_avail = [false; MAX_REF_LEN];
 
     // Corner (p[-1][-1]).
     if avail.up_left && x0 > 0 && y0 > 0 {
@@ -147,8 +156,8 @@ pub fn build_reference_samples<P: Pixel>(
     //   [2*size]          = corner
     //   [2*size+1..4*size+1] = top[1..2*size+1]
     let total = 4 * size + 1;
-    let mut ref_array = vec![P::zero(); total];
-    let mut ref_avail = vec![false; total];
+    let mut ref_array = [P::zero(); 2 * MAX_REF_LEN - 1];
+    let mut ref_avail = [false; 2 * MAX_REF_LEN - 1];
     // left, reversed: index 0 = left[2*size], index 2*size-1 = left[1]
     for i in 0..2 * size {
         ref_array[i] = left[2 * size - i];
@@ -319,7 +328,7 @@ pub fn predict_angular<P: Pixel>(
 
     if mode >= 18 {
         // ---- Horizontal-like: iterate y (rows), index into top ref ----
-        let mut ref_buf = vec![P::zero(); 3 * size + 4];
+        let mut ref_buf = [P::zero(); ANGULAR_REF_LEN];
         let ref_origin = size;
 
         ref_buf[ref_origin] = corner;
@@ -363,7 +372,7 @@ pub fn predict_angular<P: Pixel>(
         }
     } else {
         // ---- Vertical-like (modes 2..17): iterate x (cols), index into left ref ----
-        let mut ref_buf = vec![P::zero(); 3 * size + 4];
+        let mut ref_buf = [P::zero(); ANGULAR_REF_LEN];
         let ref_origin = size;
 
         ref_buf[ref_origin] = corner;
@@ -423,8 +432,8 @@ pub fn predict_angular<P: Pixel>(
 /// (it's not even exposed in the SPS we parse).
 #[allow(clippy::too_many_arguments)]
 pub fn filter_reference_samples<P: Pixel>(
-    top: &mut Vec<P>,
-    left: &mut Vec<P>,
+    top: &mut RefSamples<P>,
+    left: &mut RefSamples<P>,
     log2_size: u8,
     mode: u8,
     strong_intra_smoothing_enabled: bool,
@@ -466,7 +475,7 @@ pub fn filter_reference_samples<P: Pixel>(
             < threshold;
         if top_smooth && left_smooth {
             // Strong smoothing: linear interpolation between corner and edge.
-            let mut filtered_top = vec![P::zero(); 2 * size + 1];
+            let mut filtered_top = [P::zero(); MAX_REF_LEN];
             filtered_top[0] = top[0]; // corner
             filtered_top[2 * size] = top[2 * size]; // far end
             for i in 0..(2 * size - 1) {
@@ -495,8 +504,8 @@ pub fn filter_reference_samples<P: Pixel>(
     }
 
     // Normal [1,2,1]/4 smoothing.
-    let mut filtered_top = vec![P::zero(); 2 * size + 1];
-    let mut filtered_left = vec![P::zero(); 2 * size + 1];
+    let mut filtered_top = [P::zero(); MAX_REF_LEN];
+    let mut filtered_left = [P::zero(); MAX_REF_LEN];
 
     // Last element stays unchanged.
     filtered_top[2 * size] = top[2 * size];
@@ -556,8 +565,9 @@ mod tests {
         let plane = vec![0u8; 0];
         let avail = ReferenceAvailability::default();
         let (top, left) = build_reference_samples(&plane, 0, 0, 0, 0, 0, 4, 8, avail, None);
-        assert_eq!(top.len(), 33); // 2 * 16 + 1
-        assert_eq!(left.len(), 33);
+        // Fixed-size arrays; the first 2 * 16 + 1 entries are meaningful.
+        assert_eq!(top.len(), MAX_REF_LEN);
+        assert_eq!(left.len(), MAX_REF_LEN);
         assert!(top.iter().all(|&p| p == 128));
         assert!(left.iter().all(|&p| p == 128));
     }

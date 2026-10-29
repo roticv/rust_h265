@@ -331,9 +331,7 @@ fn sao_edge_filter<P: Pixel>(
             let b = &src[(row as isize + b_off) as usize..][..n];
             let drow = (y0 + y) * stride_dst + x0 + 1;
             let out = &mut dst[drow..drow + n];
-            for (((o, &c), &a), &b) in out.iter_mut().zip(cur).zip(a).zip(b) {
-                *o = P::from_i32_clamped(edge(c.to_i32(), a.to_i32(), b.to_i32()), bit_depth);
-            }
+            edge_offset_row(out, cur, a, b, &off_by_sum, bit_depth);
         }
         // The first and last sample of the row may reach into the CTB to
         // the left / right or diagonally: check per sample.
@@ -349,6 +347,39 @@ fn sao_edge_filter<P: Pixel>(
                     P::from_i32_clamped(edge(cur, a, b), bit_depth);
             }
         }
+    }
+}
+
+/// Edge offset over one run of interior samples: `out[i] = clip(cur[i] +
+/// offset)`, the offset chosen by `sign(cur - a) + sign(cur - b)`. Written
+/// as comparisons and selects rather than a table lookup so LLVM can
+/// vectorise it (SAO edge offset was 9% of decode time as a scalar loop).
+#[inline(always)]
+fn edge_offset_row<P: Pixel>(
+    out: &mut [P],
+    cur: &[P],
+    a: &[P],
+    b: &[P],
+    off_by_sum: &[i32; 5],
+    bit_depth: u8,
+) {
+    let [o_m2, o_m1, _, o_p1, o_p2] = *off_by_sum;
+    let max = (1i32 << bit_depth) - 1;
+    for (((o, &c), &a), &b) in out.iter_mut().zip(cur).zip(a).zip(b) {
+        let (c, a, b) = (c.to_i32(), a.to_i32(), b.to_i32());
+        let s = (c > a) as i32 - (c < a) as i32 + (c > b) as i32 - (c < b) as i32;
+        let off = if s == -2 {
+            o_m2
+        } else if s == -1 {
+            o_m1
+        } else if s == 1 {
+            o_p1
+        } else if s == 2 {
+            o_p2
+        } else {
+            0
+        };
+        *o = P::from_i32_clamped((c + off).clamp(0, max), bit_depth);
     }
 }
 
@@ -389,9 +420,19 @@ pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &
     let pic_h_in_ctbs = pic_h.div_ceil(ctb_size);
 
     // Snapshot the deblocked planes for SAO source reads.
-    let y_src = state.y_plane.clone();
-    let u_src = state.u_plane.clone();
-    let v_src = state.v_plane.clone();
+    // SAO reads deblocked samples of neighbouring CTBs that it has already
+    // modified, so it works from a snapshot. The snapshot buffers are kept
+    // in the picture state (and recycled with it) instead of cloning three
+    // fresh planes for every picture.
+    let mut snapshot = std::mem::take(&mut state.sao_snapshot);
+    for (snap, plane) in snapshot
+        .iter_mut()
+        .zip([&state.y_plane, &state.u_plane, &state.v_plane])
+    {
+        snap.clear();
+        snap.extend_from_slice(plane);
+    }
+    let [y_src, u_src, v_src] = &snapshot;
 
     for ry in 0..pic_h_in_ctbs {
         for rx in 0..pic_w_in_ctbs {
@@ -420,7 +461,7 @@ pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &
                 match sao.type_idx[0] {
                     SaoType::Band => sao_band_filter::<P>(
                         &mut state.y_plane,
-                        &y_src,
+                        y_src,
                         state.y_stride,
                         state.y_stride,
                         &sao.offset_val[0],
@@ -433,7 +474,7 @@ pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &
                     ),
                     SaoType::Edge => sao_edge_filter::<P>(
                         &mut state.y_plane,
-                        &y_src,
+                        y_src,
                         state.y_stride,
                         state.y_stride,
                         &sao.offset_val[0],
@@ -463,9 +504,9 @@ pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &
                         continue;
                     }
                     let (dst_plane, src_plane) = if c_idx == 1 {
-                        (&mut state.u_plane, &u_src)
+                        (&mut state.u_plane, u_src)
                     } else {
-                        (&mut state.v_plane, &v_src)
+                        (&mut state.v_plane, v_src)
                     };
                     let bit_depth_c = sps.bit_depth_chroma;
                     match sao.type_idx[c_idx] {
@@ -539,4 +580,5 @@ pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &
             }
         }
     }
+    state.sao_snapshot = snapshot;
 }

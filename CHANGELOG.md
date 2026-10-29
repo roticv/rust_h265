@@ -139,6 +139,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   weighted-prediction intermediates are 16-bit (as in HM and FFmpeg)
   instead of 32-bit. 11-16% fewer cycles on the Big Buck Bunny 1080p and
   720p fixtures, 8-bit and 10-bit.
+- SAO edge offset chooses the offset with comparisons and selects instead
+  of a table lookup, so the interior loop vectorises, and works from a
+  reused snapshot buffer instead of cloning three planes per picture.
+  Intra prediction builds its reference samples in fixed-size stack arrays
+  instead of up to nine heap vectors per transform block. 1-4% fewer
+  cycles (up to 8.7% fewer instructions on SAO-heavy content).
 
 ## [0.2.0] - 2026-10-28
 
