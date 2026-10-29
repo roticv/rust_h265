@@ -109,7 +109,7 @@ macro_rules! with_picture_state {
 /// In-flight picture state: the reconstruction buffers plus the bookkeeping
 /// needed to stitch multi-slice decode back together.
 struct PictureInProgress {
-    state: PictureStateEnum,
+    decode: PictureDecode,
     /// Header of the most recently decoded slice segment. Phase 3c-1 uses
     /// it for deblock/SAO finalization — in the common case all slices in a
     /// picture share the same filter flags, which this approximation
@@ -123,22 +123,6 @@ struct PictureInProgress {
     /// picture that doesn't use dependent slice segments this is simply a
     /// copy of `last_slice_header` after every slice.
     last_independent_slice_header: SliceHeader,
-    /// Phase 3c-4: CABAC contexts snapshot at the end of the previous
-    /// slice segment (after the slice's final `end_of_slice_flag = 1`
-    /// terminate bin). A dependent slice segment restores its contexts
-    /// from this snapshot instead of re-initializing from the slice QP
-    /// when the slice does NOT start on a WPP row boundary. `None`
-    /// before any slice has finished.
-    saved_cabac_state: Option<CabacContexts>,
-    /// Phase 3c-4: WPP context state snapshot (state after the 2nd CTB
-    /// of a row). For WPP + dependent slice segments (one slice per row
-    /// layout), the dependent slice at the start of a new row loads this
-    /// state instead of `saved_cabac_state`. Mirrors FFmpeg's
-    /// `common_cabac_state->state` save/load used by `load_states`.
-    saved_wpp_cabac_state: Option<CabacContexts>,
-    /// Number of CTBs already decoded in this picture (sum across all
-    /// slice segments seen so far).
-    ctbs_decoded: u32,
     /// Total CTBs in the picture = `pic_width_in_ctbs * pic_height_in_ctbs`.
     total_ctbs: u32,
     /// Reference POC lists of each independent slice, keyed by its slice
@@ -155,6 +139,256 @@ struct PictureInProgress {
 ///
 /// Single-tile (`num_tile_columns = 1 && num_tile_rows = 1`) degenerates to
 /// identity tables and `tile_id` = 0 everywhere, preserving raster scan.
+/// The decode side of a picture in progress: its state and what its CTB
+/// decode carries from one slice segment to the next. With frame threading
+/// it lives on the picture's thread.
+struct PictureDecode {
+    state: PictureStateEnum,
+    /// CABAC context state at the end of the most recently decoded slice
+    /// segment, for a following dependent slice segment.
+    saved_cabac_state: Option<CabacContexts>,
+    /// WPP context state saved after the second CTB of the latest CTB row,
+    /// for a dependent slice segment that starts a row.
+    saved_wpp_cabac_state: Option<CabacContexts>,
+    /// CTBs decoded so far, in tile scan.
+    ctbs_decoded: u32,
+}
+
+/// One slice segment, parsed and set up by the calling thread, with
+/// everything its CTB decode needs, owned (frame threading runs the decode
+/// on the picture's thread).
+struct SliceJob {
+    rbsp: Vec<u8>,
+    epb_positions: Vec<u32>,
+    sh: SliceHeader,
+    sps: Arc<Sps>,
+    pps: Arc<Pps>,
+    tile_tables: Arc<TileScanTables>,
+    slice_params: crate::cu_tree::SliceParams,
+    /// The slice address CTBs record: that of the independent slice
+    /// segment (the segment's own when it is independent).
+    recorded_slice_addr: i32,
+    slice_start_ts: u32,
+    slice_starts_tile: bool,
+    tile_col_start: Vec<u32>,
+    /// The segment starts a QP prediction chain (spec 8.6.1).
+    segment_starts_qp_chain: bool,
+    /// RBSP byte offset of the slice data.
+    cabac_byte_offset: usize,
+    /// NAL-unit byte offset of the slice data (entry points count EPBs).
+    nal_slice_data_start: u32,
+}
+
+impl PictureDecode {
+    /// CTB decode of one slice segment (spec 7.3.8): CABAC set-up, then the
+    /// CTB loop, sequential or wavefront.
+    fn decode_slice(&mut self, job: &SliceJob, threads: usize) -> Result<(), DecodeError> {
+        let (sps, pps, sh) = (&*job.sps, &*job.pps, &job.sh);
+        let tile_tables = &*job.tile_tables;
+        let pic_width_in_ctbs_for_init = sps.pic_width_in_ctbs_y();
+        let wpp_for_init = pps.entropy_coding_sync_enabled_flag;
+        let slice_starts_tile = job.slice_starts_tile;
+        let tile_col_start = &job.tile_col_start;
+        let slice_start_ts = job.slice_start_ts;
+        let cabac_byte_offset = job.cabac_byte_offset;
+        let nal_slice_data_start = job.nal_slice_data_start;
+        let epb_positions: &[u32] = &job.epb_positions;
+        let recorded_slice_addr = job.recorded_slice_addr;
+        let pic_width_in_ctbs = sps.pic_width_in_ctbs_y();
+        let total_ctbs = pic_width_in_ctbs * sps.pic_height_in_ctbs_y();
+
+        let mut contexts = if sh.dependent_slice_segment_flag && slice_starts_tile {
+            // The first CTB of a tile always starts from initialised contexts
+            // (spec 9.3.1), even in a dependent slice segment.
+            CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag)
+        } else if sh.dependent_slice_segment_flag {
+            // Does the dependent slice's first CTB start a CTB row of its
+            // tile? Then WPP synchronises from the row above when the CTB
+            // above-right is available (same tile and slice), and
+            // initialises otherwise (spec 9.3.1).
+            let w = pic_width_in_ctbs_for_init;
+            let addr = sh.slice_segment_address;
+            let col = addr % w;
+            let on_row_start = col == tile_col_start[col as usize];
+            if wpp_for_init && on_row_start {
+                let parent_addr = job.recorded_slice_addr;
+                let tr_available = addr >= w && col + 1 < w && {
+                    let tr = (addr - w + 1) as usize;
+                    let tr_slice = match &self.state {
+                        PictureStateEnum::U8(st) => st.tab_slice_addr_rs[tr],
+                        PictureStateEnum::U16(st) => st.tab_slice_addr_rs[tr],
+                    };
+                    tile_tables.tile_id[tr] == tile_tables.tile_id[addr as usize]
+                        && tr_slice == parent_addr
+                };
+                if tr_available {
+                    self.saved_wpp_cabac_state
+                        .ok_or(DecodeError::InvalidSyntax(
+                            "dependent WPP slice at row start without a saved WPP context state",
+                        ))?
+                } else {
+                    CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag)
+                }
+            } else {
+                self.saved_cabac_state.ok_or(DecodeError::InvalidSyntax(
+                    "dependent slice segment without a saved CABAC state",
+                ))?
+            }
+        } else {
+            CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag)
+        };
+
+        with_picture_state!(&mut self.state, |state| {
+            state.first_qp_group = job.segment_starts_qp_chain;
+            if !sh.dependent_slice_segment_flag {
+                state.last_qp_y = sh.slice_qp_y;
+            }
+            // CuQpOffsetCb / Cr start at 0 in every slice segment.
+            state.cu_qp_offset_cb = 0;
+            state.cu_qp_offset_cr = 0;
+        });
+
+        let wpp = pps.entropy_coding_sync_enabled_flag;
+
+        let mut saved_state: Option<CabacContexts> = if sh.dependent_slice_segment_flag {
+            self.saved_wpp_cabac_state
+        } else {
+            None
+        };
+
+        let mut cabac = CabacReader::new(&job.rbsp, cabac_byte_offset)?;
+
+        let slice_ctx = crate::wavefront::SliceContext {
+            sps,
+            pps,
+            sh,
+            slice_params: &job.slice_params,
+            recorded_slice_addr,
+        };
+        let substreams = crate::wavefront::Substreams {
+            rbsp: &job.rbsp,
+            data_start: cabac_byte_offset,
+            nal_data_start: nal_slice_data_start,
+            epb_positions,
+            entry_point_offsets: &sh.entry_point_offsets,
+        };
+        let wavefront = threads > 1 && crate::wavefront::applies(sps, pps, sh, substreams.count());
+        type CtbLoopResult = Result<(u32, Option<CabacContexts>, CabacContexts), DecodeError>;
+        let ctb_loop_result: CtbLoopResult = with_picture_state!(&mut self.state, |state| {
+            if wavefront {
+                // CTB rows on several threads; same result as the loop below.
+                crate::wavefront::decode_rows(
+                    state,
+                    &slice_ctx,
+                    &substreams,
+                    slice_start_ts,
+                    contexts,
+                    saved_state,
+                    threads,
+                )
+            } else {
+                let mut more_data = true;
+                let mut ctb_addr_ts: u32 = slice_start_ts;
+                let mut substream_idx: u32 = 0;
+
+                while more_data && ctb_addr_ts < total_ctbs {
+                    let ctb_addr_rs = tile_tables.ctb_addr_ts_to_rs[ctb_addr_ts as usize];
+                    let col = ctb_addr_rs % pic_width_in_ctbs;
+                    let is_first_ctb_of_slice = ctb_addr_ts == slice_start_ts;
+
+                    let is_tile_start = if is_first_ctb_of_slice {
+                        false
+                    } else {
+                        let prev_ts = ctb_addr_ts - 1;
+                        let prev_rs = tile_tables.ctb_addr_ts_to_rs[prev_ts as usize];
+                        tile_tables.tile_id[ctb_addr_rs as usize]
+                            != tile_tables.tile_id[prev_rs as usize]
+                    };
+
+                    // First CTB of a CTB row within its tile.
+                    let is_row_start = col == tile_col_start[col as usize];
+                    let needs_wpp_reinit = wpp && is_row_start && !is_first_ctb_of_slice;
+
+                    if is_tile_start || needs_wpp_reinit {
+                        substream_idx += 1;
+                        let ep_idx = substream_idx as usize;
+                        if ep_idx == 0 || ep_idx > sh.entry_point_offsets.len() {
+                            return Err(DecodeError::InvalidSyntax(
+                                "slice missing entry_point_offset for substream",
+                            ));
+                        }
+                        let nal_offset_from_start = sh.entry_point_offsets[ep_idx - 1];
+                        let nal_target = nal_slice_data_start + nal_offset_from_start;
+                        let epbs_in_data_prefix = epb_positions
+                            .iter()
+                            .filter(|&&p| p >= nal_slice_data_start && p < nal_target)
+                            .count() as u32;
+                        let rbsp_offset_from_start = nal_offset_from_start - epbs_in_data_prefix;
+                        let byte_offset = cabac_byte_offset + rbsp_offset_from_start as usize;
+                        cabac.reinit_at(byte_offset)?;
+
+                        // WPP synchronisation (spec 9.3.1): from the state saved
+                        // after the second CTB of the row above when the CTB
+                        // above-right is available (same tile and slice);
+                        // otherwise, and at every tile start, initialise.
+                        let tr_available = wpp
+                            && ctb_addr_rs >= pic_width_in_ctbs
+                            && col + 1 < pic_width_in_ctbs
+                            && {
+                                let tr = (ctb_addr_rs - pic_width_in_ctbs + 1) as usize;
+                                tile_tables.tile_id[tr] == tile_tables.tile_id[ctb_addr_rs as usize]
+                                    && state.tab_slice_addr_rs[tr] == recorded_slice_addr
+                            };
+                        if tr_available {
+                            contexts = *saved_state.as_ref().ok_or(DecodeError::InvalidSyntax(
+                                "WPP row start without a saved context state",
+                            ))?;
+                        } else {
+                            contexts = CabacContexts::init(
+                                sh.slice_qp_y,
+                                sh.slice_type,
+                                sh.cabac_init_flag,
+                            );
+                        }
+                        state.first_qp_group = true;
+                    }
+
+                    more_data = crate::wavefront::decode_ctb(
+                        &mut cabac,
+                        &mut contexts,
+                        state,
+                        &slice_ctx,
+                        ctb_addr_rs,
+                        ctb_addr_ts,
+                    )?;
+                    ctb_addr_ts += 1;
+
+                    // Storage for WPP (spec 9.3.2.4): after the second CTB of a
+                    // CTB row within its tile.
+                    if wpp && col == tile_col_start[col as usize] + 1 {
+                        saved_state = Some(contexts);
+                    }
+                }
+
+                if more_data {
+                    return Err(DecodeError::InvalidSyntax(
+                        "slice did not end on terminate bin",
+                    ));
+                }
+
+                Ok((ctb_addr_ts, saved_state, contexts))
+            }
+        });
+
+        let (final_ctb_addr_ts, final_saved_state, final_contexts_state) = ctb_loop_result?;
+
+        self.ctbs_decoded = final_ctb_addr_ts;
+        self.saved_cabac_state = Some(final_contexts_state);
+        self.saved_wpp_cabac_state = final_saved_state;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TileScanTables {
     /// Raster → tile-scan; converts `slice_segment_address` to the
@@ -324,11 +558,11 @@ type ZscanKey = (u32, u32, u8, u8);
 pub struct Decoder {
     limits: DecodeLimits,
     vps: Option<Vps>,
-    sps: Option<Sps>,
-    pps: Option<Pps>,
+    sps: Option<Arc<Sps>>,
+    pps: Option<Arc<Pps>>,
     /// Phase 3c-2: cached tile-scan tables for the active (SPS, PPS) pair.
     /// Rebuilt lazily on the first slice following a parameter-set change.
-    tile_tables: Option<TileScanTables>,
+    tile_tables: Option<Arc<TileScanTables>>,
     /// The picture currently being assembled from one or more slice segments.
     /// Phase 3c-1: created on the first slice segment, finalized and
     /// returned as a `Frame` when all CTBs have been decoded.
@@ -977,10 +1211,12 @@ impl Decoder {
                 .as_mut()
                 .ok_or(DecodeError::InvalidSyntax("slice without active PPS"))?;
             if pps.column_widths_in_ctbs.is_empty() {
-                pps.resolve_tile_geometry(sps)?;
+                // Resolved once per activation, before any slice of it is
+                // handed to a picture thread (otherwise this clones).
+                Arc::make_mut(pps).resolve_tile_geometry(sps)?;
             }
             if self.tile_tables.is_none() {
-                self.tile_tables = Some(TileScanTables::build(sps, pps));
+                self.tile_tables = Some(Arc::new(TileScanTables::build(sps, pps)));
             }
         }
 
@@ -1146,48 +1382,10 @@ impl Decoder {
             }
             starts
         };
-        let mut contexts = if sh.dependent_slice_segment_flag && slice_starts_tile {
-            // The first CTB of a tile always starts from initialised contexts
-            // (spec 9.3.1), even in a dependent slice segment.
-            CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag)
-        } else if sh.dependent_slice_segment_flag {
-            let pic = self.current_picture.as_ref().expect("checked above");
-            // Does the dependent slice's first CTB start a CTB row of its
-            // tile? Then WPP synchronises from the row above when the CTB
-            // above-right is available (same tile and slice), and
-            // initialises otherwise (spec 9.3.1).
-            let w = pic_width_in_ctbs_for_init;
-            let addr = sh.slice_segment_address;
-            let col = addr % w;
-            let on_row_start = col == tile_col_start[col as usize];
-            if wpp_for_init && on_row_start {
-                let parent_addr = pic.last_independent_slice_header.slice_segment_address as i32;
-                let tr_available = addr >= w && col + 1 < w && {
-                    let tr = (addr - w + 1) as usize;
-                    let tr_slice = match &pic.state {
-                        PictureStateEnum::U8(st) => st.tab_slice_addr_rs[tr],
-                        PictureStateEnum::U16(st) => st.tab_slice_addr_rs[tr],
-                    };
-                    tile_tables.tile_id[tr] == tile_tables.tile_id[addr as usize]
-                        && tr_slice == parent_addr
-                };
-                if tr_available {
-                    pic.saved_wpp_cabac_state.ok_or(DecodeError::InvalidSyntax(
-                        "dependent WPP slice at row start without a saved WPP context state",
-                    ))?
-                } else {
-                    CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag)
-                }
-            } else {
-                pic.saved_cabac_state.ok_or(DecodeError::InvalidSyntax(
-                    "dependent slice segment without a saved CABAC state",
-                ))?
-            }
-        } else {
-            CabacContexts::init(sh.slice_qp_y, sh.slice_type, sh.cabac_init_flag)
-        };
         let cabac_byte_offset = sh.header_size_bits / 8;
-        let mut cabac = CabacReader::new(&nal.rbsp, cabac_byte_offset)?;
+        // Checked here, before a new picture starts, as the CTB decode
+        // opens its own reader.
+        CabacReader::new(&nal.rbsp, cabac_byte_offset)?;
 
         // Spec 7.4.7.1: `entry_point_offset_minus1[i]` values are in NAL-unit
         // byte-space (they count the emulation-prevention bytes 0x03 present
@@ -1207,7 +1405,6 @@ impl Decoder {
             }
             nss
         };
-        let epb_positions: &[u32] = &nal.epb_positions;
 
         let pic_width_in_ctbs = sps.pic_width_in_ctbs_y();
         let pic_height_in_ctbs = sps.pic_height_in_ctbs_y();
@@ -1285,12 +1482,14 @@ impl Decoder {
                 ps.first_qp_group = !sh.dependent_slice_segment_flag;
             });
             self.current_picture = Some(PictureInProgress {
-                state: ps_enum,
+                decode: PictureDecode {
+                    state: ps_enum,
+                    saved_cabac_state: None,
+                    saved_wpp_cabac_state: None,
+                    ctbs_decoded: 0,
+                },
                 last_slice_header: sh.clone(),
                 last_independent_slice_header: sh.clone(),
-                saved_cabac_state: None,
-                saved_wpp_cabac_state: None,
-                ctbs_decoded: 0,
                 total_ctbs,
                 slice_ref_pocs: Vec::new(),
             });
@@ -1354,17 +1553,6 @@ impl Decoder {
                 && sh
                     .slice_segment_address
                     .is_multiple_of(pic_width_in_ctbs_for_init));
-        with_picture_state!(&mut pic.state, |state| {
-            state.first_qp_group = segment_starts_qp_chain;
-            if !sh.dependent_slice_segment_flag {
-                state.last_qp_y = sh.slice_qp_y;
-            }
-            // CuQpOffsetCb / Cr start at 0 in every slice segment.
-            state.cu_qp_offset_cb = 0;
-            state.cu_qp_offset_cr = 0;
-        });
-
-        let wpp = pps.entropy_coding_sync_enabled_flag;
 
         // Phase 3c-3 (WPP): saved CABAC context state captured after the
         // second CTB of each row, to be loaded at the start of the next row.
@@ -1373,11 +1561,6 @@ impl Decoder {
         // from the picture-level `saved_wpp_cabac_state` so that the
         // first inner-row reinit inside the dependent slice can still find
         // a state from the previous slice's row.
-        let mut saved_state: Option<CabacContexts> = if sh.dependent_slice_segment_flag {
-            pic.saved_wpp_cabac_state
-        } else {
-            None
-        };
 
         // Phase 3d-3/3d-5: construct SliceParams for the CU tree.
         // Include POC information so the AMVP candidate list builder can
@@ -1440,141 +1623,33 @@ impl Decoder {
         // The CTB loop, deblock, SAO, and DPB insertion all operate on a
         // generic PictureState<P>. Dispatch once via the enum variant and
         // execute the entire inner body monomorphized for the right P.
-        let slice_ctx = crate::wavefront::SliceContext {
-            sps,
-            pps,
-            sh: &sh,
-            slice_params: &slice_params,
+
+        let job = SliceJob {
+            rbsp: nal.rbsp.to_vec(),
+            epb_positions: nal.epb_positions.clone(),
+            sps: Arc::clone(sps),
+            pps: Arc::clone(pps),
+            tile_tables: Arc::clone(tile_tables),
+            slice_params,
             recorded_slice_addr,
+            slice_start_ts,
+            slice_starts_tile,
+            tile_col_start,
+            segment_starts_qp_chain,
+            cabac_byte_offset,
+            nal_slice_data_start,
+            sh: sh.clone(),
         };
-        let substreams = crate::wavefront::Substreams {
-            rbsp: &nal.rbsp,
-            data_start: cabac_byte_offset,
-            nal_data_start: nal_slice_data_start,
-            epb_positions,
-            entry_point_offsets: &sh.entry_point_offsets,
-        };
-        let wavefront =
-            self.threads > 1 && crate::wavefront::applies(sps, pps, &sh, substreams.count());
-        let threads = self.threads;
-        type CtbLoopResult = Result<(u32, Option<CabacContexts>, CabacContexts), DecodeError>;
-        let ctb_loop_result: CtbLoopResult = with_picture_state!(&mut pic.state, |state| {
-            if wavefront {
-                // CTB rows on several threads; same result as the loop below.
-                crate::wavefront::decode_rows(
-                    state,
-                    &slice_ctx,
-                    &substreams,
-                    slice_start_ts,
-                    contexts,
-                    saved_state,
-                    threads,
-                )
-            } else {
-                let mut more_data = true;
-                let mut ctb_addr_ts: u32 = slice_start_ts;
-                let mut substream_idx: u32 = 0;
-
-                while more_data && ctb_addr_ts < total_ctbs {
-                    let ctb_addr_rs = tile_tables.ctb_addr_ts_to_rs[ctb_addr_ts as usize];
-                    let col = ctb_addr_rs % pic_width_in_ctbs;
-                    let is_first_ctb_of_slice = ctb_addr_ts == slice_start_ts;
-
-                    let is_tile_start = if is_first_ctb_of_slice {
-                        false
-                    } else {
-                        let prev_ts = ctb_addr_ts - 1;
-                        let prev_rs = tile_tables.ctb_addr_ts_to_rs[prev_ts as usize];
-                        tile_tables.tile_id[ctb_addr_rs as usize]
-                            != tile_tables.tile_id[prev_rs as usize]
-                    };
-
-                    // First CTB of a CTB row within its tile.
-                    let is_row_start = col == tile_col_start[col as usize];
-                    let needs_wpp_reinit = wpp && is_row_start && !is_first_ctb_of_slice;
-
-                    if is_tile_start || needs_wpp_reinit {
-                        substream_idx += 1;
-                        let ep_idx = substream_idx as usize;
-                        if ep_idx == 0 || ep_idx > sh.entry_point_offsets.len() {
-                            return Err(DecodeError::InvalidSyntax(
-                                "slice missing entry_point_offset for substream",
-                            ));
-                        }
-                        let nal_offset_from_start = sh.entry_point_offsets[ep_idx - 1];
-                        let nal_target = nal_slice_data_start + nal_offset_from_start;
-                        let epbs_in_data_prefix = epb_positions
-                            .iter()
-                            .filter(|&&p| p >= nal_slice_data_start && p < nal_target)
-                            .count() as u32;
-                        let rbsp_offset_from_start = nal_offset_from_start - epbs_in_data_prefix;
-                        let byte_offset = cabac_byte_offset + rbsp_offset_from_start as usize;
-                        cabac.reinit_at(byte_offset)?;
-
-                        // WPP synchronisation (spec 9.3.1): from the state saved
-                        // after the second CTB of the row above when the CTB
-                        // above-right is available (same tile and slice);
-                        // otherwise, and at every tile start, initialise.
-                        let tr_available = wpp
-                            && ctb_addr_rs >= pic_width_in_ctbs
-                            && col + 1 < pic_width_in_ctbs
-                            && {
-                                let tr = (ctb_addr_rs - pic_width_in_ctbs + 1) as usize;
-                                tile_tables.tile_id[tr] == tile_tables.tile_id[ctb_addr_rs as usize]
-                                    && state.tab_slice_addr_rs[tr] == recorded_slice_addr
-                            };
-                        if tr_available {
-                            contexts = *saved_state.as_ref().ok_or(DecodeError::InvalidSyntax(
-                                "WPP row start without a saved context state",
-                            ))?;
-                        } else {
-                            contexts = CabacContexts::init(
-                                sh.slice_qp_y,
-                                sh.slice_type,
-                                sh.cabac_init_flag,
-                            );
-                        }
-                        state.first_qp_group = true;
-                    }
-
-                    more_data = crate::wavefront::decode_ctb(
-                        &mut cabac,
-                        &mut contexts,
-                        state,
-                        &slice_ctx,
-                        ctb_addr_rs,
-                        ctb_addr_ts,
-                    )?;
-                    ctb_addr_ts += 1;
-
-                    // Storage for WPP (spec 9.3.2.4): after the second CTB of a
-                    // CTB row within its tile.
-                    if wpp && col == tile_col_start[col as usize] + 1 {
-                        saved_state = Some(contexts);
-                    }
-                }
-
-                if more_data {
-                    return Err(DecodeError::InvalidSyntax(
-                        "slice did not end on terminate bin",
-                    ));
-                }
-
-                Ok((ctb_addr_ts, saved_state, contexts))
-            }
-        });
-
-        let (final_ctb_addr_ts, final_saved_state, final_contexts_state) = ctb_loop_result?;
-
-        pic.ctbs_decoded = final_ctb_addr_ts;
-        pic.saved_cabac_state = Some(final_contexts_state);
-        pic.saved_wpp_cabac_state = final_saved_state;
+        // The picture's latest slice header, and the one dependent segments
+        // inherit from, whether or not this segment's data decodes: with
+        // frame threading the data decodes later, on the picture's thread.
         if !sh.dependent_slice_segment_flag {
             pic.last_independent_slice_header = sh.clone();
         }
         pic.last_slice_header = sh;
+        pic.decode.decode_slice(&job, self.threads)?;
 
-        if pic.ctbs_decoded != total_ctbs {
+        if pic.decode.ctbs_decoded != total_ctbs {
             // More slice segments still to come for this picture.
             return Ok(None);
         }
@@ -1601,7 +1676,7 @@ impl Decoder {
             .pps
             .as_ref()
             .ok_or(DecodeError::InvalidSyntax("picture without active PPS"))?;
-        with_picture_state!(&mut pic.state, |state| fill_undecoded_ctbs(state));
+        with_picture_state!(&mut pic.decode.state, |state| fill_undecoded_ctbs(state));
         let last_sh = &pic.last_slice_header;
 
         // Phase 3b-1: in-loop deblocking filter.
@@ -1620,7 +1695,7 @@ impl Decoder {
         let bd = sps.bit_depth_luma;
 
         // Run deblock + SAO + crop + DPB insert, dispatching on pixel type.
-        let emitted_frame = with_picture_state!(&mut pic.state, |state| {
+        let emitted_frame = with_picture_state!(&mut pic.decode.state, |state| {
             // Per-slice: CUs of slices with deblocking disabled have no
             // boundary strengths, so this only filters enabled slices.
             crate::deblock::deblock_picture(state, sps, pps, &last_sh_for_filters, threads);
@@ -1667,7 +1742,7 @@ impl Decoder {
         let ref_list_l0_pocs: Vec<i32> = self.current_ref_list_l0.iter().map(|p| p.poc).collect();
         let ref_list_l1_pocs: Vec<i32> = self.current_ref_list_l1.iter().map(|p| p.poc).collect();
 
-        let decoded_pic = with_picture_state!(&mut pic.state, |state| {
+        let decoded_pic = with_picture_state!(&mut pic.decode.state, |state| {
             // The planes keep the CTU-aligned stride and chroma geometry of
             // the picture state; motion compensation reads them through
             // these fields rather than assuming `stride == width`.
@@ -1700,7 +1775,7 @@ impl Decoder {
             dp.ctb_slice_addr = std::mem::take(&mut state.tab_slice_addr_rs);
             Arc::new(dp)
         });
-        self.pool.recycle_state(pic.state);
+        self.pool.recycle_state(pic.decode.state);
         decoded_pic.mark(PictureReferenceStatus::ShortTerm);
         decoded_pic.set_output();
         self.dpb.insert(decoded_pic);
@@ -1954,15 +2029,15 @@ impl Decoder {
         };
         // A bit-depth change invalidates every picture in the DPB.
         let bit_depths = |s: &Sps| (s.bit_depth_luma, s.bit_depth_chroma);
-        let old_bd = self.sps.as_ref().map(bit_depths);
+        let old_bd = self.sps.as_deref().map(bit_depths);
         if old_bd.is_some() && old_bd != Some(bit_depths(&sps)) {
             self.dpb.clear();
             self.current_picture = None;
         }
-        self.sps = Some(sps);
+        self.sps = Some(Arc::new(sps));
         // A fresh PPS copy has no tile geometry resolved yet; it is derived
         // for this SPS at the next slice, and the scan tables rebuilt.
-        self.pps = Some(pps);
+        self.pps = Some(Arc::new(pps));
         self.tile_tables = None;
         self.active_sps_id = Some(sps_id);
         self.active_pps_id = Some(pps_id);
