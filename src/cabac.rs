@@ -10,11 +10,10 @@
 //! `rust_h264`: a single `u8` per context where the low bit is `valMps`
 //! (0 = MPS is 0, 1 = MPS is 1) and the upper bits encode `pStateIdx`.
 //! Concretely the combined value is `2 * pStateIdx + valMps`, ranging
-//! 0..=125 for legal states. State transitions go through `MLPS_STATE`,
-//! which has 256 entries: indices 0..127 are MPS transitions, 128..255 are
-//! LPS transitions.
+//! 0..=125 for legal states. Each decision bin does one lookup in
+//! `CABAC_FUSED`, which packs rangeTabLps and both state transitions.
 
-use crate::cabac_tables::{HEVC_CONTEXTS, INIT_VALUES, LPS_RANGE, MLPS_STATE, NORM_SHIFT};
+use crate::cabac_tables::{CABAC_FUSED, HEVC_CONTEXTS, INIT_VALUES};
 use crate::slice::SliceType;
 
 /// Bits buffered in the low register beyond the active range.
@@ -22,16 +21,12 @@ const CABAC_BITS: u32 = 16;
 /// Mask for the buffered region of `low`.
 const CABAC_MASK: u32 = (1 << CABAC_BITS) - 1;
 
+/// Renormalisation shift: how far `range` (9 bits, non-zero) must move
+/// left to reach 256. One count-leading-zeros instead of a table lookup on
+/// the per-bin dependency chain.
 #[inline]
 fn norm_shift(range: u32) -> u32 {
-    NORM_SHIFT[range as usize] as u32
-}
-
-#[inline]
-fn lps_range_lookup(range: u32, state: u8) -> u32 {
-    // Bits 6..7 of `range` select one of four LPS sub-ranges (spec table 9-41 /
-    // FFmpeg-style 4-way grouping); the state value picks the row.
-    LPS_RANGE[2 * (range & 0xC0) as usize + state as usize] as u32
+    range.leading_zeros() - 23
 }
 
 /// HEVC CABAC binary arithmetic decoder.
@@ -119,7 +114,10 @@ impl<'a> CabacReader<'a> {
     #[inline]
     pub fn decode_bin(&mut self, state: &mut u8) -> u32 {
         let s = *state;
-        let range_lps = lps_range_lookup(self.range, s);
+        // Bits 6..7 of the (normalised, 9-bit) range pick one of the four
+        // rangeTabLps columns (spec table 9-46).
+        let fused = CABAC_FUSED[((s as usize) << 2) | ((self.range >> 6) & 3) as usize];
+        let range_lps = fused & 0xff;
 
         self.range -= range_lps;
         // FFmpeg-style branchless MPS/LPS resolution: build a sign-extended
@@ -134,9 +132,10 @@ impl<'a> CabacReader<'a> {
             .range
             .wrapping_add(range_lps.wrapping_sub(self.range) & lps_mask);
 
-        let s_signed = (s as i32) ^ (lps_mask as i32);
-        *state = MLPS_STATE[(128 + s_signed) as usize];
-        let bit = (s_signed & 1) as u32;
+        // Next state: bits 8..16 after an MPS, 16..24 after an LPS.
+        *state = (fused >> (8 + (lps_mask & 8))) as u8;
+        // The decoded bin is valMps, inverted for an LPS.
+        let bit = ((s as u32) ^ lps_mask) & 1;
 
         // Renormalization (spec 9.3.4.3.5).
         let shift = norm_shift(self.range);
@@ -347,6 +346,39 @@ impl CabacContexts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `norm_shift` (leading zeros) equals the shift that brings each
+    /// possible range back to at least 256.
+    #[test]
+    fn norm_shift_matches_reference_loop() {
+        for range in 1u32..512 {
+            let mut r = range;
+            let mut shift = 0;
+            while r < 256 {
+                r <<= 1;
+                shift += 1;
+            }
+            assert_eq!(norm_shift(range), shift, "range {range}");
+        }
+    }
+
+    /// Every fused entry equals the separate rangeTabLps / transition tables.
+    #[test]
+    fn fused_table_matches_source_tables() {
+        use crate::cabac_tables::{LPS_RANGE, MLPS_STATE};
+        for s in 0usize..128 {
+            for q in 0usize..4 {
+                let e = CABAC_FUSED[(s << 2) | q];
+                assert_eq!(e & 0xff, LPS_RANGE[q * 128 + s] as u32, "lps s{s} q{q}");
+                assert_eq!((e >> 8) & 0xff, MLPS_STATE[128 + s] as u32, "mps s{s}");
+                assert_eq!(
+                    (e >> 16) & 0xff,
+                    MLPS_STATE[127 - s] as u32,
+                    "lps-next s{s}"
+                );
+            }
+        }
+    }
 
     /// Hand-decoded reference: a CABAC bypass-only stream of 8 bits with the
     /// MSB-first value `0b10110100 = 0xB4`. Encoded as the trivial range-coded

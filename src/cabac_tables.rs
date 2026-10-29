@@ -1,58 +1,15 @@
-//! CABAC engine tables (HEVC spec section 9.3.4).
+//! CABAC engine tables (HEVC spec section 9.3).
 //!
-//! `NORM_SHIFT`, `LPS_RANGE`, and `MLPS_STATE` are the renormalization /
-//! state-transition tables. HEVC inherited them verbatim from H.264, so
-//! these are byte-for-byte the same as the corresponding rust_h264 tables.
-//! The HEVC spec presents them as `rangeTabLPS` (table 9-41), `transIdxLPS`
-//! (table 9-42), and `transIdxMPS` (table 9-43); the FFmpeg-style packed
-//! encoding used here interleaves them for efficient lookup.
-//!
-//! **Per-syntax-element init values** (HEVC spec table 9-4) are intentionally
-//! NOT in this file yet. They are the second half of CABAC bring-up:
-//! transcribing them from the spec is mechanical but error-prone, and a
-//! single wrong value silently corrupts the decoder. They will be added
-//! incrementally per syntax element as Phase 2b proceeds.
-
-#[rustfmt::skip]
-pub static NORM_SHIFT: [u8; 512] = [
-    9,8,7,7,6,6,6,6,5,5,5,5,5,5,5,5,
-    4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,
-    3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,
-    3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,
-    2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
-    2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
-    2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
-    2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-];
+//! `LPS_RANGE` and `MLPS_STATE` are `rangeTabLps` and the `transIdx`
+//! state transitions, inherited verbatim from H.264 and kept in the packed
+//! FFmpeg-style layout; `CABAC_FUSED` combines them into the single table
+//! the decoder reads per bin. `INIT_VALUES` holds the per-context init
+//! values (spec tables 9-5 to 9-37) for the three init types.
 
 /// Equivalent of HEVC spec `rangeTabLPS` (table 9-41), packed for the
 /// FFmpeg-style 4-way range bucket lookup (`(range >> 6) & 3`).
 #[rustfmt::skip]
-pub static LPS_RANGE: [u8; 512] = [
+pub const LPS_RANGE: [u8; 512] = [
     // Range group 0
     128, 128, 128, 128, 128, 128, 123, 123,
     116, 116, 111, 111, 105, 105, 100, 100,
@@ -127,7 +84,7 @@ pub static LPS_RANGE: [u8; 512] = [
 /// branch (next state after decoding the most-probable symbol); indices
 /// 128..255 are the LPS branch.
 #[rustfmt::skip]
-pub static MLPS_STATE: [u8; 256] = [
+pub const MLPS_STATE: [u8; 256] = [
     // MPS transitions
     127, 126,  77,  76,  77,  76,  75,  74,
      75,  74,  75,  74,  73,  72,  73,  72,
@@ -180,6 +137,29 @@ pub static MLPS_STATE: [u8; 256] = [
 // 9-4 / 9-5 / etc. exactly.
 
 /// Number of CABAC contexts in HEVC.
+/// `LPS_RANGE` and both `MLPS_STATE` transitions fused into one lookup,
+/// indexed by `(state << 2) | quartile` with `quartile = (range >> 6) & 3`:
+/// bits 0..8 hold rangeTabLps, bits 8..16 the next state after an MPS and
+/// bits 16..24 the next state after an LPS. One load per bin instead of two
+/// dependent ones; the 1024 entries cover every `u8` state, so the index
+/// needs no bounds check (states 128..=255 never occur and mirror 0..=127).
+pub static CABAC_FUSED: [u32; 1024] = build_cabac_fused();
+
+const fn build_cabac_fused() -> [u32; 1024] {
+    let mut t = [0u32; 1024];
+    let mut i = 0;
+    while i < 1024 {
+        let s = (i >> 2) & 127;
+        let q = i & 3;
+        let lps = LPS_RANGE[q * 128 + s] as u32;
+        let next_mps = MLPS_STATE[128 + s] as u32;
+        let next_lps = MLPS_STATE[127 - s] as u32;
+        t[i] = lps | (next_mps << 8) | (next_lps << 16);
+        i += 1;
+    }
+    t
+}
+
 pub const HEVC_CONTEXTS: usize = 179;
 
 /// "Context not used" placeholder, kept so contexts unused in a given slice

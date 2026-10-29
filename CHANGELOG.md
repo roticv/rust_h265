@@ -129,6 +129,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transform block, and the luma inverse transform runs in place instead
   of on a clone: one buffer is lent to each block in turn. About 1% fewer
   instructions and cycles.
+- CABAC decision bins do one table lookup instead of two dependent ones
+  (rangeTabLps and both state transitions fused into one table) and
+  renormalise with a count-leading-zeros instead of a table. About 0.5%
+  fewer instructions and cycles.
 
 ## [0.2.0] - 2026-10-28
 
