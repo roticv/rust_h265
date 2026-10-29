@@ -14,7 +14,7 @@ reconstruction instead, since FFmpeg lacks bypass alignment and differs
 on lossless rotation / RDPCM. Rejected with `DecodeError::Unsupported`
 rather than decoded wrongly: 4:2:2, monochrome, bit depth > 12, SCC.
 Display-order output (`with_display_order`) and recovery from damaged
-slices are in place. Single-threaded, no hand-written SIMD (MC, SAO and
+slices are in place. Decoding is single-threaded apart from the loop filters (`with_threads`), no hand-written SIMD (MC, SAO and
 the inverse transform are compiler-vectorised): about 1.5-1.6x slower
 than single-threaded FFmpeg on 8-bit, 1.3-1.5x faster on 10-bit
 (`BENCHMARK.md`).
@@ -61,6 +61,7 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 | `residual_coding.rs` | CABAC coefficient decode, dequantization (with `qp_bd_offset`), transform_skip |
 | `deblock.rs` | 8×8-grid deblocking, beta/tc scaling by `1 << (bit_depth - 8)` |
 | `sao.rs` | Band offset + edge offset, per-CTB SAO params, slice boundary handling |
+| `parallel.rs` | Row-band splitting of the three planes and scoped-thread execution (`for_each_band`), used by the loop filters for `with_threads` |
 | `output.rs` | Display-order output process (spec C.5.2 bumping, NoOutputOfPriorPicsFlag), used by `with_display_order` |
 | `dpb.rs` | `DecodedPicture` (with `PixelData` planes), DPB, RPS, ref list construction |
 | `cabac.rs` | CABAC arithmetic engine (renorm, bypass, terminate) |
@@ -113,4 +114,5 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 - **Unsupported features are rejected, not ignored:** the SPS parser skips the VUI/HRD (`skip_vui`) to reach the extensions; SCC returns `Unsupported`. A failed SPS/PPS is stored in the ID table as its error (activation returns it), so it replaces an older set with the same ID.
 - **Range extensions:** flags live in `Sps::range` and the PPS range fields. Rotation applies to transform-skip *and* transquant-bypass 4×4 intra blocks (HM; FFmpeg skips bypass). StatCoeff (persistent Rice) lives in `CabacContexts`, so it resets and syncs with the contexts. Extended precision with a coefficient range above 16 bits uses `ResidualBlock::coeffs_wide` and `inverse_transform::inverse_transform_ext`; the 8-bit path is unchanged. With WPP and tiles together, a CTB row of a tile is a substream (`tile_col_start` in `decode_slice`). Verify RExt work with the JCT-VC-RExt suite and the HM-recon fixtures (`test_decode_rext_tools_match_hm`); FFmpeg lacks extended precision and bypass alignment and differs on lossless RDPCM.
 - **Conformance:** `tools/conformance/run_suite.py` runs the JCT-VC suites from Fluster's JSON (see its README). Re-run it after changes to parsing, prediction or loop filters.
+- **Threaded loop filters must stay band-local:** `deblock_picture` runs vertical edges on bands `[y0, y1)` (multiples of 16 luma rows), then horizontal edges on bands `[y0 - 4, y1 - 4)` (an edge at row y touches rows y-4..=y+3; chroma edges y-2..=y+1); SAO runs per band of CTB rows reading the shared snapshot. A change that makes a filter read or write further from its edge breaks this; `threaded_decode_matches_single_thread` and the conformance suites with `dump_frames --threads 7` catch it. `Decoder` must stay `Send` (compile-time assertion in `decoder.rs`): no `Rc` / `RefCell` in pictures or picture state.
 - **EPB compensation for WPP entry points:** `entry_point_offset` is in NAL-byte space (includes EPBs). Must convert to RBSP-byte offset by subtracting EPB count.

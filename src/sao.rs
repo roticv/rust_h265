@@ -230,6 +230,7 @@ pub fn decode_sao_param<P: Pixel>(
 #[allow(clippy::too_many_arguments)]
 fn sao_band_filter<P: Pixel>(
     dst: &mut [P],
+    dst_row0: usize,
     src: &[P],
     stride_dst: usize,
     stride_src: usize,
@@ -252,7 +253,8 @@ fn sao_band_filter<P: Pixel>(
             let sample = src[(y0 + y) * stride_src + (x0 + x)].to_i32();
             let band = (sample >> shift) & 31;
             let new_val = sample + offset_table[band as usize] as i32;
-            dst[(y0 + y) * stride_dst + (x0 + x)] = P::from_i32_clamped(new_val, bit_depth);
+            dst[(y0 + y - dst_row0) * stride_dst + (x0 + x)] =
+                P::from_i32_clamped(new_val, bit_depth);
         }
     }
 }
@@ -272,9 +274,13 @@ fn cmp(a: i32, b: i32) -> i32 {
 /// unavailable is left unchanged. The check is per sample, so a CTB corner
 /// sample uses the diagonal CTB's availability, not that of the CTB above,
 /// below or beside it.
+///
+/// `dst` holds the destination plane from row `dst_row0` on (a band of it
+/// when SAO runs on several threads); `src` is the whole snapshot.
 #[allow(clippy::too_many_arguments)]
 fn sao_edge_filter<P: Pixel>(
     dst: &mut [P],
+    dst_row0: usize,
     src: &[P],
     stride_dst: usize,
     stride_src: usize,
@@ -346,7 +352,7 @@ fn sao_edge_filter<P: Pixel>(
             let cur = &src[row..row + n];
             let a = &src[(row as isize + a_off) as usize..][..n];
             let b = &src[(row as isize + b_off) as usize..][..n];
-            let drow = (y0 + y) * stride_dst + x0 + start;
+            let drow = (y0 + y - dst_row0) * stride_dst + x0 + start;
             let out = &mut dst[drow..drow + n];
             edge_offset_row(out, cur, a, b, &off_by_sum, bit_depth);
         }
@@ -363,7 +369,7 @@ fn sao_edge_filter<P: Pixel>(
                 let cur = src[si].to_i32();
                 let a = src[(si as isize + a_off) as usize].to_i32();
                 let b = src[(si as isize + b_off) as usize].to_i32();
-                dst[(y0 + y) * stride_dst + x0 + x] =
+                dst[(y0 + y - dst_row0) * stride_dst + x0 + x] =
                     P::from_i32_clamped(edge(cur, a, b), bit_depth);
             }
         }
@@ -444,7 +450,15 @@ fn sao_skip_slice_boundary<P: Pixel>(state: &PictureState<P>, rs_a: usize, rs_b:
 
 /// Apply SAO to the entire reconstructed picture, after deblocking.
 /// Per-CTB SAO parameters must already be in `state.sao_params`.
-pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &SliceHeader) {
+///
+/// Uses up to `threads` threads, over bands of CTB rows; the result is
+/// identical for any thread count.
+pub fn apply_sao_picture<P: Pixel>(
+    state: &mut PictureState<P>,
+    sps: &Sps,
+    sh: &SliceHeader,
+    threads: usize,
+) {
     if !sh.slice_sao_luma_flag && !sh.slice_sao_chroma_flag {
         return;
     }
@@ -461,125 +475,164 @@ pub fn apply_sao_picture<P: Pixel>(state: &mut PictureState<P>, sps: &Sps, sh: &
     // modified, so it works from a snapshot. The snapshot buffers are kept
     // in the picture state (and recycled with it) instead of cloning three
     // fresh planes for every picture.
+    // CTBs write only their own samples and read the shared snapshot, so
+    // bands of CTB rows run in parallel. The snapshot is filled band by
+    // band in parallel too (it is a full copy of the three planes).
+    let ctb_c_h = ctb_size >> state.chroma_shift_h;
+    let mut planes = [
+        std::mem::take(&mut state.y_plane),
+        std::mem::take(&mut state.u_plane),
+        std::mem::take(&mut state.v_plane),
+    ];
+    let strides = [state.y_stride, state.uv_stride, state.uv_stride];
+    let bands = crate::parallel::split_units(pic_h_in_ctbs, threads);
+    let starts: Vec<[usize; 3]> = bands
+        .iter()
+        .map(|r| [r.start * ctb_size, r.start * ctb_c_h, r.start * ctb_c_h])
+        .collect();
     let mut snapshot = std::mem::take(&mut state.sao_snapshot);
-    for (snap, plane) in snapshot
-        .iter_mut()
-        .zip([&state.y_plane, &state.u_plane, &state.v_plane])
-    {
-        snap.clear();
-        snap.extend_from_slice(plane);
+    for (snap, plane) in snapshot.iter_mut().zip(&planes) {
+        // Same length as last picture (the usual case): no reallocation and
+        // no fill; every sample is overwritten below.
+        snap.resize(plane.len(), P::zero());
     }
+    crate::parallel::for_each_band(&mut snapshot, strides, &starts, |_, band| {
+        for ((dst, row0), (plane, &stride)) in band.into_iter().zip(planes.iter().zip(&strides)) {
+            let start = row0 * stride;
+            dst.copy_from_slice(&plane[start..start + dst.len()]);
+        }
+    });
     let [y_src, u_src, v_src] = &snapshot;
 
-    for ry in 0..pic_h_in_ctbs {
-        for rx in 0..pic_w_in_ctbs {
-            let ctb_rs = ry * pic_w_in_ctbs + rx;
-            let sao = state.sao_params[ctb_rs].clone();
+    {
+        let state: &PictureState<P> = state;
+        crate::parallel::for_each_band(&mut planes, strides, &starts, |i, band| {
+            let rows = bands[i].clone();
+            let [(y_band, y_row0), (u_band, c_row0), (v_band, _)] = band;
+            for ry in rows.clone() {
+                for rx in 0..pic_w_in_ctbs {
+                    let ctb_rs = ry * pic_w_in_ctbs + rx;
+                    let sao = state.sao_params[ctb_rs].clone();
 
-            // Which of the 8 neighbouring CTBs may supply EO neighbours.
-            let mut avail = [[false; 3]; 3];
-            for (dy, row) in avail.iter_mut().enumerate() {
-                for (dx, ok) in row.iter_mut().enumerate() {
-                    let (nx, ny) = ((rx + dx).wrapping_sub(1), (ry + dy).wrapping_sub(1));
-                    *ok = nx < pic_w_in_ctbs
-                        && ny < pic_h_in_ctbs
-                        && (nx == rx && ny == ry
-                            || !sao_skip_slice_boundary(state, ctb_rs, ny * pic_w_in_ctbs + nx));
-                }
-            }
-
-            // Luma
-            if sh.slice_sao_luma_flag && sao.type_idx[0] != SaoType::NotApplied {
-                let x0 = rx * ctb_size;
-                let y0 = ry * ctb_size;
-                let w = (x0 + ctb_size).min(pic_w) - x0;
-                let h = (y0 + ctb_size).min(pic_h) - y0;
-                let bit_depth_y = sps.bit_depth_luma;
-                match sao.type_idx[0] {
-                    SaoType::Band => sao_band_filter::<P>(
-                        &mut state.y_plane,
-                        y_src,
-                        state.y_stride,
-                        state.y_stride,
-                        &sao.offset_val[0],
-                        sao.band_position[0],
-                        w,
-                        h,
-                        x0,
-                        y0,
-                        bit_depth_y,
-                    ),
-                    SaoType::Edge => sao_edge_filter::<P>(
-                        &mut state.y_plane,
-                        y_src,
-                        state.y_stride,
-                        state.y_stride,
-                        &sao.offset_val[0],
-                        sao.eo_class[0],
-                        w,
-                        h,
-                        x0,
-                        y0,
-                        &avail,
-                        bit_depth_y,
-                    ),
-                    SaoType::NotApplied => {}
-                }
-            }
-
-            // Chroma: operates on the chroma CTU grid, sized by the chroma
-            // subsampling (equal to the luma grid for 4:4:4).
-            if sh.slice_sao_chroma_flag && state.chroma_array_type != 0 {
-                let ctb_c_w = ctb_size >> state.chroma_shift_w;
-                let ctb_c_h = ctb_size >> state.chroma_shift_h;
-                let x0_c = rx * ctb_c_w;
-                let y0_c = ry * ctb_c_h;
-                let w_c = (x0_c + ctb_c_w).min(pic_w_c) - x0_c;
-                let h_c = (y0_c + ctb_c_h).min(pic_h_c) - y0_c;
-                for c_idx in 1..=2 {
-                    if sao.type_idx[c_idx] == SaoType::NotApplied {
-                        continue;
+                    // Which of the 8 neighbouring CTBs may supply EO neighbours.
+                    let mut avail = [[false; 3]; 3];
+                    for (dy, row) in avail.iter_mut().enumerate() {
+                        for (dx, ok) in row.iter_mut().enumerate() {
+                            let (nx, ny) = ((rx + dx).wrapping_sub(1), (ry + dy).wrapping_sub(1));
+                            *ok = nx < pic_w_in_ctbs
+                                && ny < pic_h_in_ctbs
+                                && (nx == rx && ny == ry
+                                    || !sao_skip_slice_boundary(
+                                        state,
+                                        ctb_rs,
+                                        ny * pic_w_in_ctbs + nx,
+                                    ));
+                        }
                     }
-                    let (dst_plane, src_plane) = if c_idx == 1 {
-                        (&mut state.u_plane, u_src)
-                    } else {
-                        (&mut state.v_plane, v_src)
-                    };
-                    let bit_depth_c = sps.bit_depth_chroma;
-                    match sao.type_idx[c_idx] {
-                        SaoType::Band => sao_band_filter::<P>(
-                            dst_plane,
-                            src_plane,
-                            state.uv_stride,
-                            state.uv_stride,
-                            &sao.offset_val[c_idx],
-                            sao.band_position[c_idx],
-                            w_c,
-                            h_c,
-                            x0_c,
-                            y0_c,
-                            bit_depth_c,
-                        ),
-                        SaoType::Edge => sao_edge_filter::<P>(
-                            dst_plane,
-                            src_plane,
-                            state.uv_stride,
-                            state.uv_stride,
-                            &sao.offset_val[c_idx],
-                            sao.eo_class[c_idx],
-                            w_c,
-                            h_c,
-                            x0_c,
-                            y0_c,
-                            &avail,
-                            bit_depth_c,
-                        ),
-                        SaoType::NotApplied => {}
+
+                    // Luma
+                    if sh.slice_sao_luma_flag && sao.type_idx[0] != SaoType::NotApplied {
+                        let x0 = rx * ctb_size;
+                        let y0 = ry * ctb_size;
+                        let w = (x0 + ctb_size).min(pic_w) - x0;
+                        let h = (y0 + ctb_size).min(pic_h) - y0;
+                        let bit_depth_y = sps.bit_depth_luma;
+                        match sao.type_idx[0] {
+                            SaoType::Band => sao_band_filter::<P>(
+                                y_band,
+                                y_row0,
+                                y_src,
+                                state.y_stride,
+                                state.y_stride,
+                                &sao.offset_val[0],
+                                sao.band_position[0],
+                                w,
+                                h,
+                                x0,
+                                y0,
+                                bit_depth_y,
+                            ),
+                            SaoType::Edge => sao_edge_filter::<P>(
+                                y_band,
+                                y_row0,
+                                y_src,
+                                state.y_stride,
+                                state.y_stride,
+                                &sao.offset_val[0],
+                                sao.eo_class[0],
+                                w,
+                                h,
+                                x0,
+                                y0,
+                                &avail,
+                                bit_depth_y,
+                            ),
+                            SaoType::NotApplied => {}
+                        }
+                    }
+
+                    // Chroma: operates on the chroma CTU grid, sized by the chroma
+                    // subsampling (equal to the luma grid for 4:4:4).
+                    if sh.slice_sao_chroma_flag && state.chroma_array_type != 0 {
+                        let ctb_c_w = ctb_size >> state.chroma_shift_w;
+                        let ctb_c_h = ctb_size >> state.chroma_shift_h;
+                        let x0_c = rx * ctb_c_w;
+                        let y0_c = ry * ctb_c_h;
+                        let w_c = (x0_c + ctb_c_w).min(pic_w_c) - x0_c;
+                        let h_c = (y0_c + ctb_c_h).min(pic_h_c) - y0_c;
+                        for c_idx in 1..=2 {
+                            if sao.type_idx[c_idx] == SaoType::NotApplied {
+                                continue;
+                            }
+                            let (dst_plane, src_plane) = if c_idx == 1 {
+                                (&mut *u_band, u_src)
+                            } else {
+                                (&mut *v_band, v_src)
+                            };
+                            let bit_depth_c = sps.bit_depth_chroma;
+                            match sao.type_idx[c_idx] {
+                                SaoType::Band => sao_band_filter::<P>(
+                                    dst_plane,
+                                    c_row0,
+                                    src_plane,
+                                    state.uv_stride,
+                                    state.uv_stride,
+                                    &sao.offset_val[c_idx],
+                                    sao.band_position[c_idx],
+                                    w_c,
+                                    h_c,
+                                    x0_c,
+                                    y0_c,
+                                    bit_depth_c,
+                                ),
+                                SaoType::Edge => sao_edge_filter::<P>(
+                                    dst_plane,
+                                    c_row0,
+                                    src_plane,
+                                    state.uv_stride,
+                                    state.uv_stride,
+                                    &sao.offset_val[c_idx],
+                                    sao.eo_class[c_idx],
+                                    w_c,
+                                    h_c,
+                                    x0_c,
+                                    y0_c,
+                                    &avail,
+                                    bit_depth_c,
+                                ),
+                                SaoType::NotApplied => {}
+                            }
+                        }
                     }
                 }
             }
-        }
+        });
     }
+    let [y, u, v] = planes;
+    state.y_plane = y;
+    state.u_plane = u;
+    state.v_plane = v;
+
     // Samples of lossless or PCM-protected blocks keep their deblocked
     // values (spec 8.7.3): copy them back from the SAO input snapshot.
     if state.any_no_filter {

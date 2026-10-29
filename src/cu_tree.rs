@@ -11,7 +11,7 @@
 //! (`hls_coding_quadtree`, `hls_coding_unit`, `hls_prediction_unit`,
 //! `luma_intra_pred_mode`) so that decoded values match byte-for-byte.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::cabac::{CabacContexts, CabacReader};
 use crate::cabac_tables::ctx;
@@ -138,11 +138,11 @@ pub struct SliceParams {
     /// slice's lists, not the current slice's.
     pub picture_slice_ref_lists: Vec<(i32, crate::dpb::SliceRefLists)>,
     /// Phase 3d-6: actual reference frame pixel data for L0 MC.
-    pub ref_frames_l0: Vec<Rc<DecodedPicture>>,
+    pub ref_frames_l0: Vec<Arc<DecodedPicture>>,
     /// Phase 3d-6: actual reference frame pixel data for L1 MC.
-    pub ref_frames_l1: Vec<Rc<DecodedPicture>>,
+    pub ref_frames_l1: Vec<Arc<DecodedPicture>>,
     /// Phase 3e: collocated reference picture for temporal MVP.
-    pub collocated_ref: Option<Rc<DecodedPicture>>,
+    pub collocated_ref: Option<Arc<DecodedPicture>>,
     /// Phase 3e: `slice_temporal_mvp_enabled_flag` from the slice header.
     pub slice_temporal_mvp_enabled_flag: bool,
     /// Phase 3e: `collocated_from_l0_flag` from the slice header.
@@ -322,7 +322,7 @@ pub struct PictureState<P: Pixel> {
     /// Matches FFmpeg's `pps->min_tb_addr_zs`.
     /// Shared between pictures: it depends only on the SPS geometry, so the
     /// decoder builds it once (see `build_min_tb_addr_zs`).
-    pub min_tb_addr_zs: std::rc::Rc<Vec<i32>>,
+    pub min_tb_addr_zs: std::sync::Arc<Vec<i32>>,
     /// Stride (width in min-TB units + 1 for the -1 sentinel column) of the
     /// Z-scan table.
     pub min_tb_addr_zs_stride: usize,
@@ -378,12 +378,12 @@ fn plane_buf<P: Pixel>(buf: Option<Vec<P>>, n: usize) -> Vec<P> {
 
 impl<P: Pixel> PictureState<P> {
     pub fn new(sps: &Sps) -> Self {
-        Self::new_with_zscan(sps, std::rc::Rc::new(build_min_tb_addr_zs(sps)))
+        Self::new_with_zscan(sps, std::sync::Arc::new(build_min_tb_addr_zs(sps)))
     }
 
     /// Like `new`, reusing a Z-scan table previously built by
     /// `build_min_tb_addr_zs` for an SPS with the same picture geometry.
-    pub fn new_with_zscan(sps: &Sps, zscan: std::rc::Rc<Vec<i32>>) -> Self {
+    pub fn new_with_zscan(sps: &Sps, zscan: std::sync::Arc<Vec<i32>>) -> Self {
         Self::new_recycled(sps, zscan, RecycledBuffers::default())
     }
 
@@ -395,7 +395,7 @@ impl<P: Pixel> PictureState<P> {
     /// process reads the CTU-alignment padding.
     pub fn new_recycled(
         sps: &Sps,
-        zscan: std::rc::Rc<Vec<i32>>,
+        zscan: std::sync::Arc<Vec<i32>>,
         recycled: RecycledBuffers<P>,
     ) -> Self {
         let mut old = recycled.state;

@@ -98,6 +98,7 @@ mod intra_pred;
 #[allow(dead_code)]
 mod inverse_transform;
 mod output;
+mod parallel;
 #[allow(dead_code)]
 pub(crate) mod pixel;
 #[allow(dead_code)]

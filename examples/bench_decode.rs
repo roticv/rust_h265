@@ -1,17 +1,19 @@
 //! Simple decode benchmark for HEVC bitstreams.
 //!
 //! Usage:
-//!   cargo run --release --example bench_decode -- <file.h265> [--repeat N] [--warmup K]
+//!   cargo run --release --example bench_decode -- <file.h265> [--repeat N] [--warmup K] [--threads T]
 //!
 //! With `--repeat N`, the full file is decoded N times and only the best
 //! (fastest) run is reported — the standard trick for microbenchmarking
 //! on an unloaded system. `--warmup K` runs K untimed decodes first.
+//! `--threads T` decodes with `Decoder::with_threads(T)` (default 1).
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut path: Option<String> = None;
     let mut repeat: u32 = 1;
     let mut warmup: u32 = 0;
+    let mut threads: usize = 1;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -23,18 +25,23 @@ fn main() {
                 warmup = args[i + 1].parse().expect("--warmup NUMBER");
                 i += 2;
             }
+            "--threads" => {
+                threads = args[i + 1].parse().expect("--threads NUMBER");
+                i += 2;
+            }
             s => {
                 path = Some(s.to_string());
                 i += 1;
             }
         }
     }
-    let path = path.expect("usage: bench_decode <file.h265> [--repeat N] [--warmup K]");
+    let path =
+        path.expect("usage: bench_decode <file.h265> [--repeat N] [--warmup K] [--threads T]");
     let data = std::fs::read(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
     let nals = rust_h265::nal::parse_annex_b(&data);
 
     let run_once = || -> (u64, std::time::Duration) {
-        let mut decoder = rust_h265::decoder::Decoder::new();
+        let mut decoder = rust_h265::decoder::Decoder::new().with_threads(threads);
         let start = std::time::Instant::now();
         let mut frames = 0u64;
         for nal in &nals {

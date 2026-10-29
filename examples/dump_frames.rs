@@ -8,7 +8,10 @@
 //! discard.
 //!
 //! Usage:
-//!   cargo run --release --example dump_frames -- <in.h265> <out.yuv> [--decode-order]
+//!   cargo run --release --example dump_frames -- <in.h265> <out.yuv> [--decode-order] [--threads N]
+//!
+//! `--threads N` decodes with `Decoder::with_threads(N)`; the output must
+//! not depend on it.
 //!
 //! Intended for byte-exact verification against FFmpeg's HEVC decoder:
 //!   ffmpeg -i <in.h265> -f rawvideo -pix_fmt yuv420p ref.yuv      # 8-bit
@@ -33,22 +36,38 @@ fn write_plane(out: &mut impl Write, plane: &PixelData) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let decode_order = args.len() == 4 && args[3] == "--decode-order";
-    if args.len() != 3 && !decode_order {
-        eprintln!("usage: dump_frames <in.h265> <out.yuv> [--decode-order]");
+    let usage = || -> ! {
+        eprintln!("usage: dump_frames <in.h265> <out.yuv> [--decode-order] [--threads N]");
         std::process::exit(2);
+    };
+    if args.len() < 3 {
+        usage();
+    }
+    let (mut decode_order, mut threads) = (false, 1usize);
+    let mut flags = args[3..].iter();
+    while let Some(flag) = flags.next() {
+        match flag.as_str() {
+            "--decode-order" => decode_order = true,
+            "--threads" => {
+                threads = flags
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or_else(|| usage())
+            }
+            _ => usage(),
+        }
     }
     let data = std::fs::read(&args[1]).unwrap_or_else(|e| panic!("read {}: {e}", args[1]));
     let out = std::fs::File::create(&args[2]).unwrap_or_else(|e| panic!("create {}: {e}", args[2]));
     let mut out = std::io::BufWriter::new(out);
 
     if !decode_order {
-        let frames = decode_display_order(&data);
+        let frames = decode_display_order(&data, threads);
         write_frames(&mut out, &frames, &args[2]);
         return;
     }
 
-    let mut dec = rust_h265::decoder::Decoder::new();
+    let mut dec = rust_h265::decoder::Decoder::new().with_threads(threads);
     // (coded video sequence index, frame). The decoder returns a frame while
     // decoding a slice of that same picture, so the sequence a frame belongs
     // to is the one current when it is returned.
@@ -93,8 +112,10 @@ fn main() {
 }
 
 /// Decode with the decoder's own output process.
-fn decode_display_order(data: &[u8]) -> Vec<Frame> {
-    let mut dec = rust_h265::decoder::Decoder::new().with_display_order();
+fn decode_display_order(data: &[u8], threads: usize) -> Vec<Frame> {
+    let mut dec = rust_h265::decoder::Decoder::new()
+        .with_display_order()
+        .with_threads(threads);
     let mut frames = Vec::new();
     for nal in rust_h265::nal::parse_annex_b(data) {
         if let Err(e) = dec.decode_nal(&nal) {

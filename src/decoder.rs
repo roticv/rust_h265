@@ -16,7 +16,7 @@
 //! `PictureState` on the first slice of the picture and finalizes the
 //! picture (deblock + SAO) when the CTB count reaches the picture total.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::cabac::{CabacContexts, CabacReader};
 use crate::cu_tree::{MvField, PictureState, RecycledBuffers, decode_coding_quadtree};
@@ -33,7 +33,7 @@ use crate::slice::{SliceHeader, SliceType, parse_slice_segment_header};
 use crate::sps::{ShortTermRps, Sps, parse_sps};
 
 /// Reference picture lists L0 and L1 of one slice.
-type RefPicLists = (Vec<Rc<DecodedPicture>>, Vec<Rc<DecodedPicture>>);
+type RefPicLists = (Vec<Arc<DecodedPicture>>, Vec<Arc<DecodedPicture>>);
 use crate::vps::{Vps, parse_vps};
 
 /// A reconstructed video frame in YUV420 planar layout.
@@ -77,6 +77,17 @@ pub struct Frame {
 }
 
 /// Runtime-dispatched picture state that can hold either 8-bit or 16-bit pixels.
+// Pictures and picture state are shared with, or moved to, worker
+// threads; a non-`Send` field (an `Rc`, a `RefCell`) would break that, and
+// `Decoder: Send` is part of the public API.
+const _: () = {
+    const fn send<T: Send>() {}
+    const fn send_sync<T: Send + Sync>() {}
+    send::<Decoder>();
+    send::<PictureStateEnum>();
+    send_sync::<crate::dpb::DecodedPicture>();
+};
+
 enum PictureStateEnum {
     U8(PictureState<u8>),
     U16(PictureState<u16>),
@@ -306,6 +317,8 @@ type ZscanKey = (u32, u32, u8, u8);
 /// (spec 8.3.3). Pictures predicted from damaged ones show the damage until
 /// the next IRAP picture. A picture whose first slice segment is lost is
 /// dropped, as in FFmpeg.
+///
+/// `Decoder` is `Send`: it can be moved to another thread.
 #[derive(Default)]
 pub struct Decoder {
     limits: DecodeLimits,
@@ -353,10 +366,10 @@ pub struct Decoder {
     /// Phase 3d-2: RefPicList0 for the current P/B slice, built per spec
     /// 8.3.2 after RPS marking. Empty for I slices. Consumed by Phase 3d-5
     /// AMVP to populate `SliceParams::ref_pic_list_pocs`.
-    current_ref_list_l0: Vec<Rc<DecodedPicture>>,
+    current_ref_list_l0: Vec<Arc<DecodedPicture>>,
     /// Phase 3d-2: RefPicList1 for the current B slice. Empty for P and I
     /// slices. Consumed by Phase 3d-5 AMVP.
-    current_ref_list_l1: Vec<Rc<DecodedPicture>>,
+    current_ref_list_l1: Vec<Arc<DecodedPicture>>,
 
     /// Parameter sets received so far, indexed by their IDs (up to 16 SPSs
     /// and 64 PPSs). `sps` / `pps` hold the active pair, activated from
@@ -375,12 +388,15 @@ pub struct Decoder {
     /// Min-TB Z-scan table shared by every picture with the same geometry,
     /// keyed by (width, height, log2 CTB size, log2 min TB size). Building
     /// it per picture was a measurable share of decode time.
-    zscan_cache: Option<(ZscanKey, Rc<Vec<i32>>)>,
+    zscan_cache: Option<(ZscanKey, Arc<Vec<i32>>)>,
 
     /// Set by `with_display_order`: frames are released in output order by
     /// the spec C.5.2 output process and taken with `next_output`, instead
     /// of being returned by `decode_nal` in decoding order.
     display_order: bool,
+    /// Set by `with_threads`: threads the picture-level passes may use (0
+    /// from `Default` means 1).
+    threads: usize,
     output_queue: crate::output::OutputQueue,
     /// Decoding-order mode: frames ready but not yet returned. A call can
     /// finish two pictures (an incomplete earlier one, then its own), and
@@ -425,7 +441,7 @@ fn fill_undecoded_ctbs<P: Pixel>(state: &mut crate::cu_tree::PictureState<P>) {
 
 /// Min-TB Z-scan table for `sps`, shared through `cache` while the picture
 /// geometry stays the same.
-fn zscan_table(cache: &mut Option<(ZscanKey, Rc<Vec<i32>>)>, sps: &Sps) -> Rc<Vec<i32>> {
+fn zscan_table(cache: &mut Option<(ZscanKey, Arc<Vec<i32>>)>, sps: &Sps) -> Arc<Vec<i32>> {
     let key = (
         sps.pic_width_in_luma_samples,
         sps.pic_height_in_luma_samples,
@@ -433,10 +449,10 @@ fn zscan_table(cache: &mut Option<(ZscanKey, Rc<Vec<i32>>)>, sps: &Sps) -> Rc<Ve
         sps.min_tb_log2_size_y,
     );
     match cache {
-        Some((k, tab)) if *k == key => Rc::clone(tab),
+        Some((k, tab)) if *k == key => Arc::clone(tab),
         _ => {
-            let tab = Rc::new(crate::cu_tree::build_min_tb_addr_zs(sps));
-            *cache = Some((key, Rc::clone(&tab)));
+            let tab = Arc::new(crate::cu_tree::build_min_tb_addr_zs(sps));
+            *cache = Some((key, Arc::clone(&tab)));
             tab
         }
     }
@@ -460,7 +476,7 @@ const POOLED_PLANE_SETS: usize = 2;
 
 impl PicturePool {
     /// A picture state for `sps`, built from pooled buffers when available.
-    fn new_state(&mut self, sps: &Sps, zscan: Rc<Vec<i32>>) -> PictureStateEnum {
+    fn new_state(&mut self, sps: &Sps, zscan: Arc<Vec<i32>>) -> PictureStateEnum {
         if sps.needs_u16_samples() {
             let (planes, mvf) = self
                 .planes_u16
@@ -496,8 +512,8 @@ impl PicturePool {
 
     /// Take back the planes and motion field of a picture that left the
     /// DPB, unless something else (a reference list) still holds it.
-    fn recycle_picture(&mut self, pic: Rc<DecodedPicture>) {
-        let Ok(pic) = Rc::try_unwrap(pic) else {
+    fn recycle_picture(&mut self, pic: Arc<DecodedPicture>) {
+        let Ok(pic) = Arc::try_unwrap(pic) else {
             return;
         };
         match (pic.y, pic.u, pic.v) {
@@ -517,7 +533,7 @@ impl PicturePool {
 }
 
 /// A fresh picture state with the sample type the SPS needs.
-fn new_picture_state(sps: &Sps, zscan: Rc<Vec<i32>>) -> PictureStateEnum {
+fn new_picture_state(sps: &Sps, zscan: Arc<Vec<i32>>) -> PictureStateEnum {
     if sps.needs_u16_samples() {
         PictureStateEnum::U16(PictureState::<u16>::new_with_zscan(sps, zscan))
     } else {
@@ -530,7 +546,7 @@ fn new_picture_state(sps: &Sps, zscan: Rc<Vec<i32>>) -> PictureStateEnum {
 fn generated_reference<P: Pixel>(
     state: &mut crate::cu_tree::PictureState<P>,
     poc: i32,
-) -> Rc<DecodedPicture> {
+) -> Arc<DecodedPicture> {
     fill_undecoded_ctbs(state);
     let (width, height) = (state.width, state.height);
     let (y_stride, uv_stride) = (state.y_stride, state.uv_stride);
@@ -554,7 +570,7 @@ fn generated_reference<P: Pixel>(
     dp.uv_stride = uv_stride;
     dp.chroma_shift_w = chroma_shift_w;
     dp.chroma_shift_h = chroma_shift_h;
-    Rc::new(dp)
+    Arc::new(dp)
 }
 
 /// Crop a decoded picture's planes to the conformance window and build a Frame.
@@ -730,6 +746,24 @@ impl Decoder {
     /// ```
     pub fn with_display_order(mut self) -> Self {
         self.display_order = true;
+        self
+    }
+
+    /// Use up to `threads` threads (at least 1; the default is 1).
+    ///
+    /// The output is identical for every thread count; only the speed
+    /// changes. For now the loop filters (deblocking and SAO) run in
+    /// parallel over bands of rows; the rest of decoding is still
+    /// sequential. [`std::thread::available_parallelism`] is a reasonable
+    /// value.
+    ///
+    /// ```
+    /// let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    /// let decoder = rust_h265::Decoder::new().with_display_order().with_threads(threads);
+    /// # drop(decoder);
+    /// ```
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
         self
     }
 
@@ -1547,6 +1581,7 @@ impl Decoder {
     /// frame to the output (decoding-order return value or display-order
     /// queue).
     fn finish_picture(&mut self, mut pic: PictureInProgress) -> Result<Option<Frame>, DecodeError> {
+        let threads = self.threads.max(1);
         let sps = self
             .sps
             .as_ref()
@@ -1577,8 +1612,8 @@ impl Decoder {
         let emitted_frame = with_picture_state!(&mut pic.state, |state| {
             // Per-slice: CUs of slices with deblocking disabled have no
             // boundary strengths, so this only filters enabled slices.
-            crate::deblock::deblock_picture(state, sps, pps, &last_sh_for_filters);
-            crate::sao::apply_sao_picture(state, sps, &last_sh_for_filters);
+            crate::deblock::deblock_picture(state, sps, pps, &last_sh_for_filters, threads);
+            crate::sao::apply_sao_picture(state, sps, &last_sh_for_filters, threads);
 
             crop_frame(
                 state,
@@ -1652,11 +1687,11 @@ impl Decoder {
             dp.chroma_shift_h = chroma_shift_h;
             dp.slice_ref_pic_list_pocs = std::mem::take(&mut pic.slice_ref_pocs);
             dp.ctb_slice_addr = std::mem::take(&mut state.tab_slice_addr_rs);
-            Rc::new(dp)
+            Arc::new(dp)
         });
         self.pool.recycle_state(pic.state);
         decoded_pic.mark(PictureReferenceStatus::ShortTerm);
-        *decoded_pic.output.borrow_mut() = true;
+        decoded_pic.set_output();
         self.dpb.insert(decoded_pic);
         for retired in self.dpb.cleanup_unused() {
             self.pool.recycle_picture(retired);
@@ -1689,7 +1724,7 @@ impl Decoder {
     fn generate_missing_refs(
         rps: &ReferencePictureSets,
         dpb: &mut DecodedPictureBuffer,
-        zscan_cache: &mut Option<(ZscanKey, Rc<Vec<i32>>)>,
+        zscan_cache: &mut Option<(ZscanKey, Arc<Vec<i32>>)>,
         sps: &Sps,
     ) {
         let mut missing: Vec<(i32, PictureReferenceStatus)> = Vec::new();
@@ -1713,7 +1748,7 @@ impl Decoder {
             let pic = with_picture_state!(&mut state, |st| generated_reference(st, poc));
             pic.mark(status);
             // Never output.
-            *pic.output.borrow_mut() = true;
+            pic.set_output();
             dpb.insert(pic);
         }
     }
@@ -1926,11 +1961,11 @@ impl Decoder {
 
     /// POCs and long-term flags of the current slice's reference lists.
     fn slice_ref_lists(
-        l0: &[Rc<DecodedPicture>],
-        l1: &[Rc<DecodedPicture>],
+        l0: &[Arc<DecodedPicture>],
+        l1: &[Arc<DecodedPicture>],
     ) -> crate::dpb::SliceRefLists {
-        let pocs = |l: &[Rc<DecodedPicture>]| l.iter().map(|p| p.poc).collect::<Vec<i32>>();
-        let lt = |l: &[Rc<DecodedPicture>]| {
+        let pocs = |l: &[Arc<DecodedPicture>]| l.iter().map(|p| p.poc).collect::<Vec<i32>>();
+        let lt = |l: &[Arc<DecodedPicture>]| {
             l.iter()
                 .map(|p| p.reference_status() == PictureReferenceStatus::LongTerm)
                 .collect::<Vec<bool>>()
@@ -2251,8 +2286,8 @@ mod tests {
         }
     }
 
-    fn test_decoded_picture(poc: i32) -> Rc<DecodedPicture> {
-        Rc::new(DecodedPicture::new(
+    fn test_decoded_picture(poc: i32) -> Arc<DecodedPicture> {
+        Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -4573,6 +4608,58 @@ mod tests {
         let late = std::iter::from_fn(|| dec.flush()).count();
         assert!(early > 0, "nothing released before flush");
         assert!(late > 0, "flush released nothing");
+    }
+
+    /// Threaded decoding must not change the output: every in-tree
+    /// fixture (all chroma formats, bit depths, tiles, WPP, multiple
+    /// slices with mixed loop-filter flags, PCM / lossless blocks that
+    /// filters must not touch) decodes identically with 1, 2, 3 and 7
+    /// threads. Odd counts give bands of unequal height. Pictures decoded
+    /// with errors (fuzz fixtures) must match too.
+    #[test]
+    fn threaded_decode_matches_single_thread() {
+        fn decode(data: &[u8], threads: usize) -> Vec<(i32, Vec<u8>)> {
+            let mut dec = Decoder::new().with_threads(threads);
+            let mut out = Vec::new();
+            let mut take = |f: Frame| {
+                let mut bytes = Vec::new();
+                for plane in [&f.y, &f.u, &f.v] {
+                    match plane {
+                        PixelData::U8(p) => bytes.extend_from_slice(p),
+                        PixelData::U16(p) => bytes.extend(p.iter().flat_map(|s| s.to_le_bytes())),
+                    }
+                }
+                out.push((f.pic_order_cnt, bytes));
+            };
+            for nal in parse_annex_b(data) {
+                if let Ok(Some(f)) = dec.decode_nal(&nal) {
+                    take(f);
+                }
+            }
+            while let Some(f) = dec.flush() {
+                take(f);
+            }
+            out
+        }
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata");
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "h265"))
+            .collect();
+        names.sort();
+        assert!(names.len() > 50, "fixtures missing");
+        for path in names {
+            let data = std::fs::read(&path).unwrap();
+            let single = decode(&data, 1);
+            for threads in [2, 3, 7] {
+                assert!(
+                    decode(&data, threads) == single,
+                    "{} differs with {threads} threads",
+                    path.display()
+                );
+            }
+        }
     }
 
     fn read_fixture(name: &str) -> Vec<u8> {

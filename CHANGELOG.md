@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Decoder::with_threads(n)`: the loop filters (deblocking and SAO) run in
+  parallel over bands of picture rows. The output is identical for every
+  thread count (tested on every fixture and both conformance suites).
+  The rest of decoding is still sequential, so the gain is modest: 5-7%
+  more frames per second with 4 threads on the 1080p benchmark fixtures.
+  The default stays at 1 thread.
+- `Decoder` is now `Send`: reference pictures are shared with `Arc` and
+  atomic marking instead of `Rc` / `RefCell`.
+- `dump_frames` and `bench_decode` take `--threads N`.
+
 ### Changed
 
 - The published crate no longer includes the test fixtures (`testdata/`),

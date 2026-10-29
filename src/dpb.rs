@@ -7,18 +7,19 @@
 //! Pictures are removed once they are unused for reference; output order is
 //! handled separately by `crate::output`.
 //!
-//! Pictures are shared as `Rc<DecodedPicture>` (with `RefCell` marking
+//! Pictures are shared as `Arc<DecodedPicture>` (with atomic marking
 //! state) so the same picture can be held by the DPB and by a slice's
 //! reference lists at once, without indices that compaction would
-//! invalidate.
+//! invalidate, and so worker threads can read reference pictures.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::pixel::PixelData;
 
 /// How this picture is currently marked in the DPB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum PictureReferenceStatus {
     /// No future slice can reference this picture.
     UnusedForReference,
@@ -51,11 +52,13 @@ pub struct DecodedPicture {
     /// Signed picture order count (negative for leading pictures that
     /// precede an IDR or CRA in output order).
     pub poc: i32,
-    /// Reference marking state. Mutable since a picture's state changes
-    /// over its lifetime in the DPB.
-    pub reference_status: RefCell<PictureReferenceStatus>,
+    /// Reference marking state (a `PictureReferenceStatus`), changed over
+    /// the picture's lifetime in the DPB through `mark`. Atomic rather than
+    /// a `Cell` so pictures can be shared with worker threads; marking only
+    /// happens on the decoding thread, so `Relaxed` ordering is enough.
+    reference_status: AtomicU8,
     /// Whether the picture has been output yet (emitted as a `Frame`).
-    pub output: RefCell<bool>,
+    pub output: AtomicBool,
 
     /// per min-PU motion field stored when inserting into the DPB.
     /// Used by temporal merge/AMVP candidate derivation (spec 8.5.3.2.3 / 8.5.3.2.7).
@@ -107,8 +110,8 @@ impl DecodedPicture {
             width,
             height,
             poc,
-            reference_status: RefCell::new(PictureReferenceStatus::ShortTerm),
-            output: RefCell::new(false),
+            reference_status: AtomicU8::new(PictureReferenceStatus::ShortTerm as u8),
+            output: AtomicBool::new(false),
             tab_mvf: Vec::new(),
             log2_min_pu_size: 2,
             min_pu_width: 0,
@@ -146,8 +149,8 @@ impl DecodedPicture {
             width,
             height,
             poc,
-            reference_status: RefCell::new(PictureReferenceStatus::ShortTerm),
-            output: RefCell::new(false),
+            reference_status: AtomicU8::new(PictureReferenceStatus::ShortTerm as u8),
+            output: AtomicBool::new(false),
             tab_mvf,
             log2_min_pu_size,
             min_pu_width,
@@ -176,11 +179,24 @@ impl DecodedPicture {
     }
 
     pub fn mark(&self, status: PictureReferenceStatus) {
-        *self.reference_status.borrow_mut() = status;
+        self.reference_status.store(status as u8, Ordering::Relaxed);
     }
 
     pub fn reference_status(&self) -> PictureReferenceStatus {
-        *self.reference_status.borrow()
+        match self.reference_status.load(Ordering::Relaxed) {
+            0 => PictureReferenceStatus::UnusedForReference,
+            1 => PictureReferenceStatus::ShortTerm,
+            _ => PictureReferenceStatus::LongTerm,
+        }
+    }
+
+    /// Whether the picture has been output (or is not to be output).
+    pub fn is_output(&self) -> bool {
+        self.output.load(Ordering::Relaxed)
+    }
+
+    pub fn set_output(&self) {
+        self.output.store(true, Ordering::Relaxed);
     }
 
     pub fn is_reference(&self) -> bool {
@@ -197,7 +213,7 @@ impl DecodedPicture {
 /// longer used for reference.
 #[derive(Debug, Default)]
 pub struct DecodedPictureBuffer {
-    pictures: Vec<Rc<DecodedPicture>>,
+    pictures: Vec<Arc<DecodedPicture>>,
 }
 
 impl DecodedPictureBuffer {
@@ -214,7 +230,7 @@ impl DecodedPictureBuffer {
     /// Insert a freshly decoded picture into the DPB. The new picture
     /// starts out marked as `ShortTerm` per HEVC conventions; callers
     /// that need a different initial state can `mark()` it afterwards.
-    pub fn insert(&mut self, pic: Rc<DecodedPicture>) {
+    pub fn insert(&mut self, pic: Arc<DecodedPicture>) {
         self.pictures.push(pic);
     }
 
@@ -230,13 +246,13 @@ impl DecodedPictureBuffer {
 
     /// Find a picture by POC. Returns `Some(...)` for the first match,
     /// `None` if no picture in the DPB has the given POC.
-    pub fn find_by_poc(&self, poc: i32) -> Option<Rc<DecodedPicture>> {
+    pub fn find_by_poc(&self, poc: i32) -> Option<Arc<DecodedPicture>> {
         self.pictures.iter().find(|p| p.poc == poc).cloned()
     }
 
     /// Find a short-term reference picture by POC. Like `find_by_poc`
     /// but skips pictures that aren't currently marked as ST references.
-    pub fn find_st_ref(&self, poc: i32) -> Option<Rc<DecodedPicture>> {
+    pub fn find_st_ref(&self, poc: i32) -> Option<Arc<DecodedPicture>> {
         self.pictures
             .iter()
             .find(|p| p.poc == poc && p.reference_status() == PictureReferenceStatus::ShortTerm)
@@ -257,11 +273,11 @@ impl DecodedPictureBuffer {
     /// (so their buffers can be reused). Allocation-free: the vector is
     /// partitioned in place and the removed tail drained. Safe to call after
     /// every picture insertion.
-    pub fn cleanup_unused(&mut self) -> std::vec::Drain<'_, Rc<DecodedPicture>> {
+    pub fn cleanup_unused(&mut self) -> std::vec::Drain<'_, Arc<DecodedPicture>> {
         let mut kept = 0;
         for i in 0..self.pictures.len() {
             let p = &self.pictures[i];
-            if p.is_reference() || !*p.output.borrow() {
+            if p.is_reference() || !p.is_output() {
                 self.pictures.swap(kept, i);
                 kept += 1;
             }
@@ -271,7 +287,7 @@ impl DecodedPictureBuffer {
 
     /// Direct access to the pictures list, for iteration by the caller
     /// when deriving the reference picture set.
-    pub fn pictures(&self) -> &[Rc<DecodedPicture>] {
+    pub fn pictures(&self) -> &[Arc<DecodedPicture>] {
         &self.pictures
     }
 }
@@ -428,8 +444,8 @@ pub fn apply_ref_pic_list_modification(
 pub fn resolve_ref_pics(
     dpb: &DecodedPictureBuffer,
     pocs: &[i32],
-) -> Result<Vec<Rc<DecodedPicture>>, crate::error::DecodeError> {
-    let mut out: Vec<Rc<DecodedPicture>> = Vec::with_capacity(pocs.len());
+) -> Result<Vec<Arc<DecodedPicture>>, crate::error::DecodeError> {
+    let mut out: Vec<Arc<DecodedPicture>> = Vec::with_capacity(pocs.len());
     for poc in pocs {
         // First try ST, then LT, then any-status (fallback for edge cases
         // where the marking hasn't settled yet, e.g. first slice of a new
@@ -464,7 +480,7 @@ mod tests {
     #[test]
     fn insert_and_lookup_by_poc() {
         let mut dpb = DecodedPictureBuffer::new();
-        let pic = Rc::new(DecodedPicture::new(
+        let pic = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![0; 16 * 16]),
             PixelData::U8(vec![0; 8 * 8]),
             PixelData::U8(vec![0; 8 * 8]),
@@ -480,7 +496,7 @@ mod tests {
 
     #[test]
     fn mark_short_term_reference() {
-        let pic = Rc::new(DecodedPicture::new(
+        let pic = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -500,7 +516,7 @@ mod tests {
     #[test]
     fn cleanup_keeps_order_and_returns_removed() {
         let pic = |poc: i32, referenced: bool, output: bool| {
-            let p = Rc::new(DecodedPicture::new(
+            let p = Arc::new(DecodedPicture::new(
                 PixelData::U8(vec![]),
                 PixelData::U8(vec![]),
                 PixelData::U8(vec![]),
@@ -511,7 +527,7 @@ mod tests {
             if !referenced {
                 p.mark(PictureReferenceStatus::UnusedForReference);
             }
-            *p.output.borrow_mut() = output;
+            p.output.store(output, Ordering::Relaxed);
             p
         };
         let mut dpb = DecodedPictureBuffer::new();
@@ -536,7 +552,7 @@ mod tests {
     #[test]
     fn cleanup_drops_unreferenced_and_output() {
         let mut dpb = DecodedPictureBuffer::new();
-        let a = Rc::new(DecodedPicture::new(
+        let a = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -545,8 +561,8 @@ mod tests {
             0,
         ));
         a.mark(PictureReferenceStatus::UnusedForReference);
-        *a.output.borrow_mut() = true;
-        let b = Rc::new(DecodedPicture::new(
+        a.set_output();
+        let b = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -650,7 +666,7 @@ mod tests {
     #[test]
     fn resolve_ref_pics_looks_up_by_poc() {
         let mut dpb = DecodedPictureBuffer::new();
-        let p0 = Rc::new(DecodedPicture::new(
+        let p0 = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -658,7 +674,7 @@ mod tests {
             0,
             2,
         ));
-        let p1 = Rc::new(DecodedPicture::new(
+        let p1 = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -685,7 +701,7 @@ mod tests {
     #[test]
     fn resolve_ref_pics_prefers_short_term() {
         let mut dpb = DecodedPictureBuffer::new();
-        let p = Rc::new(DecodedPicture::new(
+        let p = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -708,7 +724,7 @@ mod tests {
     #[test]
     fn resolve_ref_pics_finds_long_term() {
         let mut dpb = DecodedPictureBuffer::new();
-        let p = Rc::new(DecodedPicture::new(
+        let p = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -731,7 +747,7 @@ mod tests {
     #[test]
     fn resolve_ref_pics_fallback_unmarked() {
         let mut dpb = DecodedPictureBuffer::new();
-        let p = Rc::new(DecodedPicture::new(
+        let p = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -751,7 +767,7 @@ mod tests {
         use crate::decoder::Decoder;
 
         let mut dpb = DecodedPictureBuffer::new();
-        let p0 = Rc::new(DecodedPicture::new(
+        let p0 = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -759,7 +775,7 @@ mod tests {
             0,
             0,
         ));
-        let p4 = Rc::new(DecodedPicture::new(
+        let p4 = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -767,7 +783,7 @@ mod tests {
             0,
             4,
         ));
-        let p8 = Rc::new(DecodedPicture::new(
+        let p8 = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -805,7 +821,7 @@ mod tests {
 
         let mut dpb = DecodedPictureBuffer::new();
         // Two pictures: POC 3 (ST ref) and POC 19 (LT ref by LSB=3 with max_lsb=16).
-        let p3 = Rc::new(DecodedPicture::new(
+        let p3 = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -813,7 +829,7 @@ mod tests {
             0,
             3,
         ));
-        let p19 = Rc::new(DecodedPicture::new(
+        let p19 = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -849,7 +865,7 @@ mod tests {
         let mut dpb = DecodedPictureBuffer::new();
         // Two pictures with the SAME POC LSB (3) but different full POCs.
         // log2_max_poc_lsb=4 → max_poc_lsb=16
-        let p3 = Rc::new(DecodedPicture::new(
+        let p3 = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -857,7 +873,7 @@ mod tests {
             0,
             3,
         ));
-        let p19 = Rc::new(DecodedPicture::new(
+        let p19 = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
@@ -894,7 +910,7 @@ mod tests {
 
         let mut dpb = DecodedPictureBuffer::new();
         // POC 19 has LSB=3 (19%16=3)
-        let p19 = Rc::new(DecodedPicture::new(
+        let p19 = Arc::new(DecodedPicture::new(
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),
             PixelData::U8(vec![]),

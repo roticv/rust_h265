@@ -9,7 +9,7 @@
 //! Low-level MC functions (`mc_luma`, `mc_chroma`, `mc_luma_i16`, `mc_chroma_i16`,
 //! `ref_sample`) are generic over `P: Pixel` for multi-bit-depth support.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::cu_tree::PictureState;
 use crate::dpb::DecodedPicture;
@@ -808,8 +808,8 @@ pub fn mc_chroma<P: Pixel>(
 pub fn motion_compensation_pu<P: Pixel>(
     state: &mut PictureState<P>,
     scratch: &mut McScratch<P>,
-    ref_frames_l0: &[Rc<DecodedPicture>],
-    ref_frames_l1: &[Rc<DecodedPicture>],
+    ref_frames_l0: &[Arc<DecodedPicture>],
+    ref_frames_l1: &[Arc<DecodedPicture>],
     x0: u32,
     y0: u32,
     n_pb_w: u32,
@@ -1343,8 +1343,8 @@ pub fn motion_compensation_pu<P: Pixel>(
 #[allow(clippy::too_many_arguments)]
 pub fn motion_compensation_cu<P: Pixel>(
     state: &mut PictureState<P>,
-    ref_frames_l0: &[Rc<DecodedPicture>],
-    ref_frames_l1: &[Rc<DecodedPicture>],
+    ref_frames_l0: &[Arc<DecodedPicture>],
+    ref_frames_l1: &[Arc<DecodedPicture>],
     x0: u32,
     y0: u32,
     cb_size: u32,

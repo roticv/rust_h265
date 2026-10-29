@@ -474,31 +474,94 @@ fn skip_horizontal_slice_boundary<P: Pixel>(state: &PictureState<P>, x: usize, y
     !state.filter_slice_edges[bot_rs]
 }
 
-/// Apply the deblocking filter to the entire reconstructed picture.
+/// Apply the deblocking filter to the entire reconstructed picture, using
+/// up to `threads` threads. The boundary strength tables must already be
+/// filled by the CU/TU decode.
 ///
-/// Phase 3b-1 limitation: only the intra-slice path. The boundary strength
-/// arrays must already be populated by the CU/TU decode (every internal
-/// 8-aligned TU/CU edge inside the picture gets `bS = 2`).
+/// Spec 8.7.2 filters every vertical edge of the picture before any
+/// horizontal edge. Both passes split into bands of 16 luma rows that run
+/// in parallel:
+///
+/// - Vertical edges change samples only in their own rows, so band
+///   `[y0, y1)` owns rows `[y0, y1)` of every plane.
+/// - A horizontal luma edge at row `y` (a multiple of 8) reads rows
+///   `y - 4 ..= y + 3` and writes `y - 3 ..= y + 2`; a chroma edge at chroma
+///   row `yc` (a multiple of 8) touches `yc - 2 ..= yc + 1`. So the band of
+///   edges `y0 <= y < y1` owns rows `[y0 - 4, y1 - 4)` of each plane (in its
+///   own row units), which contain everything its edges touch and no row
+///   another band's edges touch.
+///
+/// The result is identical for any thread count.
 pub fn deblock_picture<P: Pixel>(
     state: &mut PictureState<P>,
     sps: &Sps,
     pps: &Pps,
     _sh: &SliceHeader,
+    threads: usize,
+) {
+    let pic_h = state.height as usize;
+    let mut planes = [
+        std::mem::take(&mut state.y_plane),
+        std::mem::take(&mut state.u_plane),
+        std::mem::take(&mut state.v_plane),
+    ];
+    let strides = [state.y_stride, state.uv_stride, state.uv_stride];
+    let cshift_h = state.chroma_shift_h as usize;
+    let st: &PictureState<P> = state;
+    let bands: Vec<(usize, usize)> = crate::parallel::split_units(pic_h.div_ceil(16), threads)
+        .into_iter()
+        .map(|r| (r.start * 16, (r.end * 16).min(pic_h)))
+        .collect();
+    let starts = |margin: usize| -> Vec<[usize; 3]> {
+        bands
+            .iter()
+            .enumerate()
+            .map(|(i, &(y0, _))| {
+                if i == 0 {
+                    [0; 3]
+                } else {
+                    [
+                        y0 - margin,
+                        (y0 >> cshift_h) - margin,
+                        (y0 >> cshift_h) - margin,
+                    ]
+                }
+            })
+            .collect()
+    };
+    crate::parallel::for_each_band(&mut planes, strides, &starts(0), |i, band| {
+        let (y0, y1) = bands[i];
+        let [(y_band, y_row0), (u_band, c_row0), (v_band, _)] = band;
+        luma_vertical_edges(st, sps, y_band, y_row0, y0..y1);
+        chroma_edges::<P, true>(st, sps, pps, [u_band, v_band], c_row0, y0..y1);
+    });
+    crate::parallel::for_each_band(&mut planes, strides, &starts(4), |i, band| {
+        let (y0, y1) = bands[i];
+        let [(y_band, y_row0), (u_band, c_row0), (v_band, _)] = band;
+        luma_horizontal_edges(st, sps, y_band, y_row0, y0..y1);
+        chroma_edges::<P, false>(st, sps, pps, [u_band, v_band], c_row0, y0..y1);
+    });
+    let [y, u, v] = planes;
+    state.y_plane = y;
+    state.u_plane = u;
+    state.v_plane = v;
+}
+
+/// Luma vertical edges in luma rows `rows` (multiples of 8). `plane` holds
+/// the plane from row `row0` on.
+fn luma_vertical_edges<P: Pixel>(
+    state: &PictureState<P>,
+    sps: &Sps,
+    plane: &mut [P],
+    row0: usize,
+    rows: std::ops::Range<usize>,
 ) {
     let pic_w = state.width as usize;
-    let pic_h = state.height as usize;
     let stride_y = state.y_stride;
-    let stride_uv = state.uv_stride;
-    let bit_depth_luma = sps.bit_depth_luma;
-    let bit_depth_chroma = sps.bit_depth_chroma;
-
-    // Most strengths in inter pictures are 0: the edge loops skip 64-sample
-    // runs whose strengths are all 0 with one 16-byte check.
     let bs_w = pic_w >> 2;
-
-    // ---- Luma vertical edges ----
-    let mut y = 0usize;
-    while y < pic_h {
+    // Most strengths in inter pictures are 0: skip 64-sample runs whose
+    // strengths are all 0 with one 16-byte check.
+    for y in rows.step_by(8) {
         let mut x = 8usize;
         while x < pic_w {
             if x & 63 == 8
@@ -521,12 +584,11 @@ pub fn deblock_picture<P: Pixel>(
                     + get_qp_y(state, x as i32, y as i32)
                     + 1)
                     >> 1;
-                let pix_base = y * stride_y + x;
                 let nf = edge_no_filter(state, (x - 1, y), (x, y), (0, 4));
                 let (beta_offset, tc_offset) = deblock_offsets(state, x, y);
                 filter_luma_edge::<P>(
-                    &mut state.y_plane,
-                    pix_base,
+                    plane,
+                    (y - row0) * stride_y + x,
                     1,
                     stride_y as isize,
                     qp_avg,
@@ -534,18 +596,28 @@ pub fn deblock_picture<P: Pixel>(
                     bs1,
                     beta_offset,
                     tc_offset,
-                    bit_depth_luma,
+                    sps.bit_depth_luma,
                     nf,
                 );
             }
             x += 8;
         }
-        y += 8;
     }
+}
 
-    // ---- Luma horizontal edges ----
-    let mut y = 8usize;
-    while y < pic_h {
+/// Luma horizontal edges at luma rows in `rows` (the first picture row has
+/// none). `plane` holds the plane from row `row0` on.
+fn luma_horizontal_edges<P: Pixel>(
+    state: &PictureState<P>,
+    sps: &Sps,
+    plane: &mut [P],
+    row0: usize,
+    rows: std::ops::Range<usize>,
+) {
+    let pic_w = state.width as usize;
+    let stride_y = state.y_stride;
+    let bs_w = pic_w >> 2;
+    for y in rows.step_by(8).filter(|&y| y > 0) {
         let mut x = 0usize;
         while x < pic_w {
             if x & 63 == 0 && bs_run_zero(&state.bs_horizontal, bs_w, y >> 2, x >> 2) {
@@ -563,12 +635,11 @@ pub fn deblock_picture<P: Pixel>(
                     + get_qp_y(state, x as i32, y as i32)
                     + 1)
                     >> 1;
-                let pix_base = y * stride_y + x;
                 let nf = edge_no_filter(state, (x, y - 1), (x, y), (4, 0));
                 let (beta_offset, tc_offset) = deblock_offsets(state, x, y);
                 filter_luma_edge::<P>(
-                    &mut state.y_plane,
-                    pix_base,
+                    plane,
+                    (y - row0) * stride_y + x,
                     stride_y as isize,
                     1,
                     qp_avg,
@@ -576,152 +647,111 @@ pub fn deblock_picture<P: Pixel>(
                     bs1,
                     beta_offset,
                     tc_offset,
-                    bit_depth_luma,
+                    sps.bit_depth_luma,
                     nf,
                 );
             }
             x += 8;
         }
-        y += 8;
     }
+}
 
-    // ---- Chroma deblocking ----
-    //
-    // Chroma edges lie on the 8×8 chroma-sample grid; in luma coordinates that
-    // is every `8 << SubWidthC-shift` columns / `8 << SubHeightC-shift` rows,
-    // and the two boundary-strength probes along an edge sit `4 << shift` luma
-    // samples apart. Chroma pixel coordinates are the luma coordinates shifted
-    // right by the subsampling (4:2:0 → the 16-luma grid; 4:4:4 → the 8-luma
-    // grid). To keep the borrow checker happy we collect every chroma edge
-    // before grabbing &mut state.u_plane / v_plane.
+/// Chroma edges (vertical when `VERT`, else horizontal) whose luma row lies
+/// in `rows`, on both chroma planes. `planes` hold the Cb and Cr planes
+/// from chroma row `row0` on.
+///
+/// Chroma edges lie on the 8×8 chroma-sample grid; in luma coordinates that
+/// is every `8 << SubWidthC-shift` columns / `8 << SubHeightC-shift` rows,
+/// and the two boundary-strength probes along an edge sit `4 << shift` luma
+/// samples apart (4:2:0 → the 16-luma grid; 4:4:4 → the 8-luma grid).
+fn chroma_edges<P: Pixel, const VERT: bool>(
+    state: &PictureState<P>,
+    sps: &Sps,
+    pps: &Pps,
+    planes: [&mut [P]; 2],
+    row0: usize,
+    rows: std::ops::Range<usize>,
+) {
     let chroma_array_type = sps.chroma_array_type();
-    if chroma_array_type != 0 {
-        let cshift_w = state.chroma_shift_w as usize;
-        let cshift_h = state.chroma_shift_h as usize;
-        let step_x = 8usize << cshift_w; // vertical-edge column spacing (luma)
-        let step_y = 8usize << cshift_h; // horizontal-edge row spacing (luma)
-        let bs_dx = 4usize << cshift_w; // 2nd bS probe offset along a horiz edge
-        let bs_dy = 4usize << cshift_h; // 2nd bS probe offset along a vert edge
+    if chroma_array_type == 0 {
+        return;
+    }
+    let pic_w = state.width as usize;
+    let stride_uv = state.uv_stride;
+    let cshift_w = state.chroma_shift_w as usize;
+    let cshift_h = state.chroma_shift_h as usize;
+    let step_x = 8usize << cshift_w; // vertical-edge column spacing (luma)
+    let step_y = 8usize << cshift_h; // horizontal-edge row spacing (luma)
+    let bs_dx = 4usize << cshift_w; // 2nd bS probe offset along a horiz edge
+    let bs_dy = 4usize << cshift_h; // 2nd bS probe offset along a vert edge
+    let offsets = [pps.pps_cb_qp_offset, pps.pps_cr_qp_offset];
+    let [u_plane, v_plane] = planes;
+    let mut planes = [u_plane, v_plane];
 
-        struct ChromaEdge {
-            pix_base: usize,
-            xstride: isize,
-            ystride: isize,
-            qp0_avg: i32,
-            qp1_avg: i32,
-            bs0: i32,
-            bs1: i32,
-            no_filter: [[bool; 2]; 2],
-            tc_offset: i32,
-        }
-        let mut edges: Vec<ChromaEdge> = Vec::new();
-
-        // Vertical edges.
-        let mut y_l = 0usize;
-        while y_l < pic_h {
-            let mut x_l = step_x;
-            while x_l < pic_w {
-                if skip_vertical_slice_boundary(state, x_l, y_l) {
-                    x_l += step_x;
-                    continue;
-                }
-                let bs0 = read_bs(&state.bs_vertical, pic_w, x_l, y_l);
-                let bs1 = read_bs(&state.bs_vertical, pic_w, x_l, y_l + bs_dy);
-                if bs0 == 2 || bs1 == 2 {
-                    let qp0_avg = (get_qp_y(state, x_l as i32 - 1, y_l as i32)
-                        + get_qp_y(state, x_l as i32, y_l as i32)
+    // Band boundaries are multiples of 16 luma rows, so of `step_y` too.
+    for y_l in rows.step_by(step_y).filter(|&y| VERT || y > 0) {
+        let mut x_l = if VERT { step_x } else { 0 };
+        while x_l < pic_w {
+            let skip = if VERT {
+                skip_vertical_slice_boundary(state, x_l, y_l)
+            } else {
+                skip_horizontal_slice_boundary(state, x_l, y_l)
+            };
+            if skip {
+                x_l += step_x;
+                continue;
+            }
+            // P / Q sample positions (luma) of the edge's first segment and
+            // the second probe position along it.
+            let (p, q, second) = if VERT {
+                ((x_l - 1, y_l), (x_l, y_l), (x_l, y_l + bs_dy))
+            } else {
+                ((x_l, y_l - 1), (x_l, y_l), (x_l + bs_dx, y_l))
+            };
+            let bs_tab = if VERT {
+                &state.bs_vertical
+            } else {
+                &state.bs_horizontal
+            };
+            let bs0 = read_bs(bs_tab, pic_w, x_l, y_l);
+            let bs1 = read_bs(bs_tab, pic_w, second.0, second.1);
+            if bs0 == 2 || bs1 == 2 {
+                let avg = |(px, py): (usize, usize), (qx, qy): (usize, usize)| {
+                    (get_qp_y(state, px as i32, py as i32)
+                        + get_qp_y(state, qx as i32, qy as i32)
                         + 1)
-                        >> 1;
-                    let qp1_avg = (get_qp_y(state, x_l as i32 - 1, (y_l + bs_dy) as i32)
-                        + get_qp_y(state, x_l as i32, (y_l + bs_dy) as i32)
-                        + 1)
-                        >> 1;
-                    let xc = x_l >> cshift_w;
-                    let yc = y_l >> cshift_h;
-                    edges.push(ChromaEdge {
-                        pix_base: yc * stride_uv + xc,
-                        xstride: 1,
-                        ystride: stride_uv as isize,
+                        >> 1
+                };
+                let along = if VERT { (0, bs_dy) } else { (bs_dx, 0) };
+                let qp0_avg = avg(p, q);
+                let qp1_avg = avg((p.0 + along.0, p.1 + along.1), second);
+                let no_filter = edge_no_filter(state, p, q, along);
+                let tc_offset = deblock_offsets(state, x_l, y_l).1;
+                let pix_base = ((y_l >> cshift_h) - row0) * stride_uv + (x_l >> cshift_w);
+                let (xstride, ystride) = if VERT {
+                    (1, stride_uv as isize)
+                } else {
+                    (stride_uv as isize, 1)
+                };
+                for (plane, &qp_offset) in planes.iter_mut().zip(&offsets) {
+                    filter_chroma_edge::<P>(
+                        plane,
+                        pix_base,
+                        xstride,
+                        ystride,
                         qp0_avg,
                         qp1_avg,
+                        qp_offset,
+                        tc_offset,
                         bs0,
                         bs1,
-                        no_filter: edge_no_filter(state, (x_l - 1, y_l), (x_l, y_l), (0, bs_dy)),
-                        tc_offset: deblock_offsets(state, x_l, y_l).1,
-                    });
+                        sps.bit_depth_chroma,
+                        chroma_array_type,
+                        no_filter,
+                    );
                 }
-                x_l += step_x;
             }
-            y_l += step_y;
-        }
-        // Horizontal edges.
-        let mut y_l = step_y;
-        while y_l < pic_h {
-            let mut x_l = 0usize;
-            while x_l < pic_w {
-                if skip_horizontal_slice_boundary(state, x_l, y_l) {
-                    x_l += step_x;
-                    continue;
-                }
-                let bs0 = read_bs(&state.bs_horizontal, pic_w, x_l, y_l);
-                let bs1 = read_bs(&state.bs_horizontal, pic_w, x_l + bs_dx, y_l);
-                if bs0 == 2 || bs1 == 2 {
-                    let qp0_avg = (get_qp_y(state, x_l as i32, y_l as i32 - 1)
-                        + get_qp_y(state, x_l as i32, y_l as i32)
-                        + 1)
-                        >> 1;
-                    let qp1_avg = (get_qp_y(state, (x_l + bs_dx) as i32, y_l as i32 - 1)
-                        + get_qp_y(state, (x_l + bs_dx) as i32, y_l as i32)
-                        + 1)
-                        >> 1;
-                    let xc = x_l >> cshift_w;
-                    let yc = y_l >> cshift_h;
-                    edges.push(ChromaEdge {
-                        pix_base: yc * stride_uv + xc,
-                        xstride: stride_uv as isize,
-                        ystride: 1,
-                        qp0_avg,
-                        qp1_avg,
-                        bs0,
-                        bs1,
-                        no_filter: edge_no_filter(state, (x_l, y_l - 1), (x_l, y_l), (bs_dx, 0)),
-                        tc_offset: deblock_offsets(state, x_l, y_l).1,
-                    });
-                }
-                x_l += step_x;
-            }
-            y_l += step_y;
-        }
-
-        // Now apply edges to each chroma plane.
-        for c_idx in 1..=2 {
-            let qp_offset = if c_idx == 1 {
-                pps.pps_cb_qp_offset
-            } else {
-                pps.pps_cr_qp_offset
-            };
-            let plane = if c_idx == 1 {
-                &mut state.u_plane
-            } else {
-                &mut state.v_plane
-            };
-            for e in &edges {
-                filter_chroma_edge::<P>(
-                    plane,
-                    e.pix_base,
-                    e.xstride,
-                    e.ystride,
-                    e.qp0_avg,
-                    e.qp1_avg,
-                    qp_offset,
-                    e.tc_offset,
-                    e.bs0,
-                    e.bs1,
-                    bit_depth_chroma,
-                    chroma_array_type,
-                    e.no_filter,
-                );
-            }
+            x_l += step_x;
         }
     }
 }
