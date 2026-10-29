@@ -28,18 +28,19 @@ pub(crate) fn split_units(units: usize, threads: usize) -> Vec<Range<usize>> {
 /// of band `i` in each plane; band `i` runs up to the next band's start
 /// (the last to the end of the plane), so `starts[0]` must be all zeros
 /// and each plane's starts must be non-decreasing.
-pub(crate) fn for_each_band<P, F>(
-    planes: &mut [Vec<P>; 3],
+pub(crate) fn for_each_band<P, D, F>(
+    planes: &mut [D; 3],
     strides: [usize; 3],
     starts: &[[usize; 3]],
     work: F,
 ) where
     P: Send,
+    D: std::ops::DerefMut<Target = [P]>,
     F: Fn(usize, Band<'_, P>) + Sync,
 {
     let mut bands: Vec<Band<'_, P>> = Vec::with_capacity(starts.len());
     let [y, u, v] = planes;
-    let mut rest: [&mut [P]; 3] = [y, u, v];
+    let mut rest: [&mut [P]; 3] = [&mut **y, &mut **u, &mut **v];
     for (i, start) in starts.iter().enumerate() {
         let next = starts.get(i + 1);
         let band: Band<'_, P> = std::array::from_fn(|p| {

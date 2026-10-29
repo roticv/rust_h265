@@ -625,9 +625,9 @@ fn crop_frame<P: Pixel>(
         luma_left == 0 && luma_top == 0 && cw == stride_y && ch == state.y_plane.len() / stride_y;
     if no_crop {
         return Ok(Frame {
-            y: P::wrap_vec(state.y_plane.clone()),
-            u: P::wrap_vec(state.u_plane.clone()),
-            v: P::wrap_vec(state.v_plane.clone()),
+            y: P::wrap_vec(state.y_plane.to_vec()),
+            u: P::wrap_vec(state.u_plane.to_vec()),
+            v: P::wrap_vec(state.v_plane.to_vec()),
             width: cropped_w,
             height: cropped_h,
             pic_order_cnt: poc,
@@ -647,8 +647,7 @@ fn crop_frame<P: Pixel>(
             .checked_add(cw)
             .ok_or(DecodeError::InvalidSyntax("invalid luma crop range"))?;
         y.extend_from_slice(
-            state
-                .y_plane
+            state.y_plane[..]
                 .get(start..end)
                 .ok_or(DecodeError::InvalidSyntax("invalid luma crop range"))?,
         );
@@ -671,14 +670,12 @@ fn crop_frame<P: Pixel>(
             .checked_add(cw_c)
             .ok_or(DecodeError::InvalidSyntax("invalid chroma crop range"))?;
         u.extend_from_slice(
-            state
-                .u_plane
+            state.u_plane[..]
                 .get(start..end)
                 .ok_or(DecodeError::InvalidSyntax("invalid chroma crop range"))?,
         );
         v.extend_from_slice(
-            state
-                .v_plane
+            state.v_plane[..]
                 .get(start..end)
                 .ok_or(DecodeError::InvalidSyntax("invalid chroma crop range"))?,
         );
@@ -1686,7 +1683,7 @@ impl Decoder {
             dp.chroma_shift_w = chroma_shift_w;
             dp.chroma_shift_h = chroma_shift_h;
             dp.slice_ref_pic_list_pocs = std::mem::take(&mut pic.slice_ref_pocs);
-            dp.ctb_slice_addr = std::mem::take(&mut state.tab_slice_addr_rs);
+            dp.ctb_slice_addr = std::mem::take(&mut state.tab_slice_addr_rs).into_vec();
             Arc::new(dp)
         });
         self.pool.recycle_state(pic.state);

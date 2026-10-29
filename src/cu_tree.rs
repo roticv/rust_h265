@@ -26,6 +26,7 @@ use crate::inverse_transform::apply_inverse_transform;
 use crate::pixel::Pixel;
 use crate::pps::Pps;
 use crate::residual_coding::{ResidualBlock, ResidualPlane, ScanOrder, decode_residual_coding};
+use crate::shared::SharedTable;
 use crate::slice::SliceType;
 use crate::sps::Sps;
 
@@ -184,16 +185,16 @@ pub struct PictureState<P: Pixel> {
     pub width_in_ctbs: usize,
     pub min_cb_width: usize,
     pub min_pu_width: usize,
-    pub tab_ct_depth: Vec<u8>,
-    pub tab_ipm: Vec<u8>,
+    pub tab_ct_depth: SharedTable<u8>,
+    pub tab_ipm: SharedTable<u8>,
     /// Per-min-PU chroma intra mode (luma-mode space). For 4:2:0/4:2:2 the
     /// whole CU shares one chroma mode; for 4:4:4 with PART_NxN each of the
     /// four PUs has its own, so the transform unit looks the mode up by
     /// position here rather than from `last_chroma_pred_mode`.
-    pub tab_chroma_ipm: Vec<u8>,
-    pub y_plane: Vec<P>,
-    pub u_plane: Vec<P>,
-    pub v_plane: Vec<P>,
+    pub tab_chroma_ipm: SharedTable<u8>,
+    pub y_plane: SharedTable<P>,
+    pub u_plane: SharedTable<P>,
+    pub v_plane: SharedTable<P>,
     pub y_stride: usize,
     pub uv_stride: usize,
     /// `ChromaArrayType` (1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4). Selects the chroma
@@ -264,43 +265,43 @@ pub struct PictureState<P: Pixel> {
 
     /// Phase 3b-1 deblocking: per-min-CB QP for deblock filter strength.
     /// Luma QP per min-CB. Signed: QpY ranges over -QpBdOffsetY..=51.
-    pub tab_qp_y: Vec<i8>,
+    pub tab_qp_y: SharedTable<i8>,
     /// Phase 3b-1 deblocking: per-4×4 boundary strength for vertical edges.
     /// Indexed by `(y/4) * (width/4) + (x/4)` (matches FFmpeg's `vertical_bs`).
-    pub bs_vertical: Vec<u8>,
+    pub bs_vertical: SharedTable<u8>,
     /// Phase 3b-1 deblocking: per-4×4 boundary strength for horizontal edges.
-    pub bs_horizontal: Vec<u8>,
+    pub bs_horizontal: SharedTable<u8>,
     /// Phase 3b-1 deblocking: per min-TB cbf_luma flag. Indexed by
     /// `(y >> log2_min_tb_size) * min_tb_width + (x >> log2_min_tb_size)`.
-    pub tab_cbf_luma: Vec<u8>,
+    pub tab_cbf_luma: SharedTable<u8>,
     /// log2 of minimum transform block size (for deblocking cbf_luma table).
     pub log2_min_tb_size: u32,
     /// Phase 3b-2 SAO: per-CTB SAO parameters, indexed by CTB raster address.
-    pub sao_params: Vec<crate::sao::SaoParams>,
+    pub sao_params: SharedTable<crate::sao::SaoParams>,
     /// Phase 3c-1 multi-slice: per-CTB slice address (`slice_segment_address`
     /// of the slice the CTB belongs to), indexed by CTB raster address.
     /// `-1` means the CTB has not been decoded yet (not part of any slice).
-    pub tab_slice_addr_rs: Vec<i32>,
+    pub tab_slice_addr_rs: SharedTable<i32>,
     /// Per-CTB `slice_loop_filter_across_slices_enabled_flag`. When false for
     /// either side of a CTB boundary, deblocking/SAO across that slice boundary
     /// is suppressed. Indexed by CTB raster address.
-    pub filter_slice_edges: Vec<bool>,
+    pub filter_slice_edges: SharedTable<bool>,
     /// Phase 3c-2 tiles: per-CTB tile id (0-based), indexed by CTB raster
     /// address. For `tiles_enabled_flag = 0` pictures this is all zeros.
     /// Consulted by `compute_luma_avail` to treat cross-tile neighbor
     /// samples as unavailable for intra prediction (spec 6.4.4 / 8.4.2).
-    pub tab_tile_id: Vec<u32>,
+    pub tab_tile_id: SharedTable<u32>,
     /// Per CTB (raster index): its tile-scan address, i.e. its position in
     /// decoding order. SAO uses it to tell which of two slices is later.
-    pub tab_ctb_ts: Vec<u32>,
+    pub tab_ctb_ts: SharedTable<u32>,
     /// Per CTB: the deblocking (beta_offset, tc_offset) of the slice that
     /// contains it, i.e. slice_beta_offset_div2 * 2 and slice_tc_offset_div2
     /// * 2. Edges use the values of the slice containing their Q side.
-    pub tab_deblock_offsets: Vec<(i8, i8)>,
+    pub tab_deblock_offsets: SharedTable<(i8, i8)>,
     /// Per 4x4 luma block: 1 where deblocking and SAO must leave samples
     /// unchanged (a cu_transquant_bypass CU, or a PCM CU when
     /// pcm_loop_filter_disabled_flag is set; spec 8.7.2.5.7, 8.7.3).
-    pub tab_no_filter: Vec<u8>,
+    pub tab_no_filter: SharedTable<u8>,
     /// True once any block of this picture is marked in `tab_no_filter`, so
     /// the loop filters can skip the lookups for ordinary pictures.
     pub any_no_filter: bool,
@@ -310,10 +311,10 @@ pub struct PictureState<P: Pixel> {
 
     /// Phase 3d-3: per min-PU motion field (MV + ref_idx + pred_flag).
     /// Indexed by `(y >> log2_min_pu_size) * min_pu_width + (x >> log2_min_pu_size)`.
-    pub tab_mvf: Vec<MvField>,
+    pub tab_mvf: SharedTable<MvField>,
     /// Phase 3d-3: per min-CB skip flag, used for `cu_skip_flag` neighbor
     /// context derivation. Indexed the same as `tab_ct_depth`.
-    pub tab_skip_flag: Vec<u8>,
+    pub tab_skip_flag: SharedTable<u8>,
     /// Z-scan order address table for intra prediction availability.
     /// `min_tb_addr_zs[y * min_tb_addr_zs_stride + x]` gives the Z-scan order
     /// index for the min-TB at position (x, y) in min-TB units within the
@@ -355,23 +356,27 @@ impl<P: Pixel> Default for RecycledBuffers<P> {
     }
 }
 
-/// `buf` (or a new vector) holding `n` copies of `value`.
-fn refill<T: Clone>(buf: Option<Vec<T>>, n: usize, value: T) -> Vec<T> {
-    match buf {
-        Some(mut v) => {
+/// `buf` (or a new buffer) holding `n` copies of `value`. Works on `Vec`s
+/// and `SharedTable`s alike (in and out).
+fn refill<T: Clone, R: From<Vec<T>>>(buf: Option<impl Into<Vec<T>>>, n: usize, value: T) -> R {
+    let v = match buf {
+        Some(v) => {
+            let mut v: Vec<T> = v.into();
             v.clear();
             v.resize(n, value);
             v
         }
         None => vec![value; n],
-    }
+    };
+    v.into()
 }
 
 /// A sample plane of `n` samples: `buf` as it is when it has that size,
 /// otherwise zero-filled.
-fn plane_buf<P: Pixel>(buf: Option<Vec<P>>, n: usize) -> Vec<P> {
-    match buf {
-        Some(v) if v.len() == n => v,
+fn plane_buf<P: Pixel, R: From<Vec<P>>>(buf: Option<impl Into<Vec<P>>>, n: usize) -> R {
+    let v: Option<Vec<P>> = buf.map(Into::into);
+    match v {
+        Some(v) if v.len() == n => v.into(),
         other => refill(other, n, P::zero()),
     }
 }
@@ -555,7 +560,7 @@ impl<P: Pixel> PictureState<P> {
             tab_no_filter: refill(reuse!(tab_no_filter), min_pu_width * min_pu_height, 0u8),
             any_no_filter: false,
             tab_mvf: refill(
-                recycled.mvf.or_else(|| reuse!(tab_mvf)),
+                recycled.mvf.or_else(|| reuse!(tab_mvf).map(Vec::from)),
                 min_pu_width * min_pu_height,
                 MvField::default(),
             ),
@@ -610,10 +615,10 @@ impl<P: Pixel> PictureState<P> {
         usize,
         u8,
     ) {
-        let y = P::wrap_vec(std::mem::take(&mut self.y_plane));
-        let u = P::wrap_vec(std::mem::take(&mut self.u_plane));
-        let v = P::wrap_vec(std::mem::take(&mut self.v_plane));
-        let tab_mvf = std::mem::take(&mut self.tab_mvf);
+        let y = P::wrap_vec(std::mem::take(&mut self.y_plane).into_vec());
+        let u = P::wrap_vec(std::mem::take(&mut self.u_plane).into_vec());
+        let v = P::wrap_vec(std::mem::take(&mut self.v_plane).into_vec());
+        let tab_mvf = std::mem::take(&mut self.tab_mvf).into_vec();
         (
             y,
             u,

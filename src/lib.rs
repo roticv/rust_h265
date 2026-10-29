@@ -112,6 +112,8 @@ mod sao;
 #[allow(dead_code)]
 mod scaling_list;
 #[allow(dead_code)]
+mod shared;
+#[allow(dead_code)]
 mod slice;
 #[allow(dead_code)]
 mod sps;

@@ -648,7 +648,7 @@ pub fn apply_sao_picture<P: Pixel>(
                 for r in y..y + 4 {
                     let o = r * ys + x;
                     if let (Some(d), Some(sr)) =
-                        (state.y_plane.get_mut(o..o + 4), y_src.get(o..o + 4))
+                        (state.y_plane[..].get_mut(o..o + 4), y_src.get(o..o + 4))
                     {
                         d.copy_from_slice(sr);
                     }
@@ -657,12 +657,12 @@ pub fn apply_sao_picture<P: Pixel>(
                 for r in cy..cy + ch {
                     let o = r * uvs + cx;
                     if let (Some(d), Some(sr)) =
-                        (state.u_plane.get_mut(o..o + cw), u_src.get(o..o + cw))
+                        (state.u_plane[..].get_mut(o..o + cw), u_src.get(o..o + cw))
                     {
                         d.copy_from_slice(sr);
                     }
                     if let (Some(d), Some(sr)) =
-                        (state.v_plane.get_mut(o..o + cw), v_src.get(o..o + cw))
+                        (state.v_plane[..].get_mut(o..o + cw), v_src.get(o..o + cw))
                     {
                         d.copy_from_slice(sr);
                     }
