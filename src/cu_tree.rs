@@ -247,6 +247,9 @@ pub struct PictureState<P: Pixel> {
     /// transform tree derives the QP prediction from the CU origin (spec
     /// 8.6.1 xCb / yCb), not from the transform block.
     pub cu_origin: (u32, u32),
+    /// The coding unit being decoded is a single prediction unit (skip or
+    /// PART_2Nx2N): no PU edges inside it for deblocking.
+    pub cu_single_pu: bool,
     /// Luma residual of the current transform unit after the inverse
     /// transform, kept for cross-component prediction (spec 8.6.6).
     pub ccp_luma_residual: Vec<i16>,
@@ -486,6 +489,7 @@ impl<P: Pixel> PictureState<P> {
             qpy_pred: 0,
             first_qp_group: false,
             cu_origin: (0, 0),
+            cu_single_pu: true,
             ccp_luma_residual: reuse!(ccp_luma_residual).unwrap_or_default(),
             coeff_buf: reuse!(coeff_buf).unwrap_or_default(),
             sao_snapshot: reuse!(sao_snapshot).unwrap_or_default(),
@@ -2377,12 +2381,18 @@ fn inter_boundary_strength_full(
 /// FFmpeg `ff_hevc_deblocking_boundary_strengths`.
 ///
 /// Called at TU leaf level (for CUs with residual) or at CU level (for skip/no-residual).
+///
+/// `single_pu`: the block lies in a coding unit with one prediction unit,
+/// so the motion inside it is uniform and every internal edge has bS 0.
+/// The tables start each picture at 0 and no other block writes these
+/// entries, so the internal-edge loops are skipped.
 fn compute_deblocking_boundary_strengths<P: Pixel>(
     state: &mut PictureState<P>,
     slice_params: &SliceParams,
     x0: u32,
     y0: u32,
     log2_size: u8,
+    single_pu: bool,
 ) {
     // Edges of CUs in a slice with deblocking disabled are not filtered
     // (spec 8.7.2): leave their boundary strengths at 0.
@@ -2501,7 +2511,7 @@ fn compute_deblocking_boundary_strengths<P: Pixel>(
     }
 
     // Internal PU boundaries within a large TU (for inter blocks only)
-    if (log2_size as u32) > log2_min_pu && !is_intra {
+    if (log2_size as u32) > log2_min_pu && !is_intra && !single_pu {
         // Internal horizontal PU boundaries (every 8 pixels)
         for j in (8..size).step_by(8) {
             let yp_pu = ((y0 + j - 1) >> log2_min_pu) as usize;
@@ -2641,7 +2651,7 @@ fn decode_coding_unit<P: Pixel>(
         write_qp_y_table(state, x0, y0, log2_cb_size, state.last_qp_y);
         maybe_save_qpy_pred(state, sps, pps, x0, y0, log2_cb_size);
         // Deblocking for inter skip/no-residual: compute bS per spec 8.7.2.
-        compute_deblocking_boundary_strengths(state, slice_params, x0, y0, log2_cb_size);
+        compute_deblocking_boundary_strengths(state, slice_params, x0, y0, log2_cb_size, true);
         state.cu_count += 1;
         return Ok(());
     }
@@ -2682,7 +2692,7 @@ fn decode_coding_unit<P: Pixel>(
             // A PCM CU has no transform tree, but its edges still need
             // boundary strengths (intra: bS = 2) and its QP must still be
             // recorded for deblocking and QP prediction.
-            compute_deblocking_boundary_strengths(state, slice_params, x0, y0, log2_cb_size);
+            compute_deblocking_boundary_strengths(state, slice_params, x0, y0, log2_cb_size, true);
             finish_coding_unit(state, sps, pps, slice_qp_y, x0, y0, log2_cb_size);
             return Ok(());
         }
@@ -2966,6 +2976,7 @@ fn decode_coding_unit<P: Pixel>(
                 && part_mode != PartMode::Part2Nx2N;
 
             state.cu_origin = (x0, y0);
+            state.cu_single_pu = part_mode == PartMode::Part2Nx2N;
             decode_transform_tree(
                 cabac,
                 contexts,
@@ -2993,7 +3004,15 @@ fn decode_coding_unit<P: Pixel>(
             // No residual: the end-of-CU block below still runs the
             // fallback set_qPy and writes tab_qp_y. We only need to
             // compute boundary strengths here (for inter no-residual).
-            compute_deblocking_boundary_strengths(state, slice_params, x0, y0, log2_cb_size);
+            let single_pu = part_mode == PartMode::Part2Nx2N;
+            compute_deblocking_boundary_strengths(
+                state,
+                slice_params,
+                x0,
+                y0,
+                log2_cb_size,
+                single_pu,
+            );
         }
     }
 
@@ -3854,7 +3873,15 @@ fn decode_transform_unit<P: Pixel>(
         }
     } else {
         // Inter TU leaf: compute boundary strengths using cbf_luma + MV comparison.
-        compute_deblocking_boundary_strengths(state, slice_params, x0, y0, log2_trafo_size);
+        let single_pu = state.cu_single_pu;
+        compute_deblocking_boundary_strengths(
+            state,
+            slice_params,
+            x0,
+            y0,
+            log2_trafo_size,
+            single_pu,
+        );
     }
 
     Ok(new_cbf)

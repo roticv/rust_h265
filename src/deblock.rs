@@ -413,6 +413,17 @@ fn read_bs(bs: &[u8], pic_w: usize, x: usize, y: usize) -> i32 {
     bs[(y >> 2) * (pic_w >> 2) + (x >> 2)] as i32
 }
 
+/// Whether the 16 boundary strengths (64 luma samples) of `row` (in 4×4
+/// units) starting at grid column `col` are all 0, so the edges there need
+/// no work. Returns false when fewer than 16 remain in the row.
+#[inline(always)]
+fn bs_run_zero(bs: &[u8], bs_w: usize, row: usize, col: usize) -> bool {
+    col + 16 <= bs_w
+        && bs
+            .get(row * bs_w + col..row * bs_w + col + 16)
+            .is_some_and(|r| u128::from_ne_bytes(r.try_into().unwrap()) == 0)
+}
+
 /// Check whether a vertical edge at luma x crosses a slice boundary and
 /// should be skipped because `slice_loop_filter_across_slices_enabled_flag`
 /// is false on either side.
@@ -481,11 +492,24 @@ pub fn deblock_picture<P: Pixel>(
     let bit_depth_luma = sps.bit_depth_luma;
     let bit_depth_chroma = sps.bit_depth_chroma;
 
+    // Most strengths in inter pictures are 0: the edge loops skip 64-sample
+    // runs whose strengths are all 0 with one 16-byte check.
+    let bs_w = pic_w >> 2;
+
     // ---- Luma vertical edges ----
     let mut y = 0usize;
     while y < pic_h {
         let mut x = 8usize;
         while x < pic_w {
+            if x & 63 == 8
+                && bs_run_zero(&state.bs_vertical, bs_w, y >> 2, (x >> 2) - 2)
+                && bs_run_zero(&state.bs_vertical, bs_w, (y >> 2) + 1, (x >> 2) - 2)
+            {
+                // Columns x - 8 .. x + 56 have no edge to filter on either
+                // 4-line half; the first one (x - 8) was already handled.
+                x += 56;
+                continue;
+            }
             if skip_vertical_slice_boundary(state, x, y) {
                 x += 8;
                 continue;
@@ -524,6 +548,10 @@ pub fn deblock_picture<P: Pixel>(
     while y < pic_h {
         let mut x = 0usize;
         while x < pic_w {
+            if x & 63 == 0 && bs_run_zero(&state.bs_horizontal, bs_w, y >> 2, x >> 2) {
+                x += 64;
+                continue;
+            }
             if skip_horizontal_slice_boundary(state, x, y) {
                 x += 8;
                 continue;

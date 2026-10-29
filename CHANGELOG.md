@@ -159,6 +159,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of one scalar butterfly per column and row. Inverse transform time fell
   from about 9.6% to 2% of decode time: 14-18% fewer cycles on the x265
   `safe` fixtures, 5-9% on `medium` / `slow`.
+- Deblocking boundary strengths skip the internal-edge pass for coding
+  units with a single prediction unit (skip and 2Nx2N, where motion is
+  uniform and every internal edge has bS 0), and the luma edge loops skip
+  64-sample runs of zero strengths with one 16-byte check. Boundary
+  strength time fell from about 6% to 2% of decode time: 2-5% fewer
+  cycles.
 
 ## [0.2.0] - 2026-10-28
 
