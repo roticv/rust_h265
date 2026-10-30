@@ -58,12 +58,16 @@ use rust_h265::{Decoder, parse_annex_b};
 
 let h265_data = std::fs::read("input.h265").unwrap();
 // Display order (recommended): frames come out in the order to show them.
-let mut decoder = Decoder::new().with_display_order();
+// Decoding on all cores gives identical frames, sooner.
+let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+let mut decoder = Decoder::new().with_display_order().with_threads(threads);
 
 for nal in parse_annex_b(&h265_data) {
     if let Err(e) = decoder.decode_nal(&nal) {
         eprintln!("decode error: {:?}", e);
     }
+    // With several threads a frame can come out a few NAL units after its
+    // last slice; `next_output` returns what is ready.
     while let Some(frame) = decoder.next_output() {
         // `frame` is a decoded YUV picture:
         //   frame.y, frame.u, frame.v  — PixelData (U8 or U16)
@@ -80,6 +84,10 @@ for nal in parse_annex_b(&h265_data) {
 // At the end of the stream, take the pictures still waiting.
 while let Some(frame) = decoder.flush() {
     // handle frame
+}
+// Errors in slice data found after the last NAL unit (with threads).
+while let Some(e) = decoder.next_error() {
+    eprintln!("decode error: {:?}", e);
 }
 ```
 
@@ -170,7 +178,7 @@ These do not change how you call the decoder; they change what the decoder has t
 
 ```sh
 # Play an H.265 file in a window (press Escape to quit):
-cargo run --release --example play -- input.h265 [--fps 30] [--loop]
+cargo run --release --example play -- input.h265 [--fps 30] [--loop] [--threads N]
 
 # Decode to raw YUV in display order (8-bit: yuv420p, 10-bit: yuv420p10le):
 cargo run --release --example dump_frames -- input.h265 out.yuv

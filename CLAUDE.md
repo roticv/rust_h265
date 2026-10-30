@@ -27,7 +27,7 @@ than single-threaded FFmpeg on 8-bit, 1.3-1.5x faster on 10-bit
 - **Run single test:** `cargo test --release <test_name>`
 - **Lint:** `cargo clippy --release --all-targets -- -D warnings` (what CI runs)
 - **Format:** `cargo fmt`
-- **Play a file:** `cargo run --release --example play -- input.h265 [--fps 30] [--loop]`
+- **Play a file:** `cargo run --release --example play -- input.h265 [--fps 30] [--loop] [--threads N]`
 - **Dump YUV:** `cargo run --release --example dump_frames -- input.h265 out.yuv`
 - **Benchmark:** `cargo run --release --example bench_realworld`
 

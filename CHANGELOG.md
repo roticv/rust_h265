@@ -35,7 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     corrupted WPP streams, and on both conformance suites.
 - `Decoder` is now `Send`: reference pictures are shared with `Arc` and
   atomic marking instead of `Rc` / `RefCell`.
-- `dump_frames` and `bench_decode` take `--threads N`.
+- `dump_frames` and `bench_decode` take `--threads N`; `play` decodes on
+  all cores by default (`--threads N` to change it).
 
 ### Changed
 

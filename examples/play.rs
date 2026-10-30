@@ -1,11 +1,13 @@
 //! Decode an H.265 bitstream and display frames in a window.
 //!
-//! Usage: cargo run --example play -- <input.h265> [--fps N] [--loop]
+//! Usage: cargo run --example play -- <input.h265> [--fps N] [--loop] [--threads N]
 //!
 //! Streams decode: feeds NALs incrementally, lets the decoder's
 //! display-order mode release frames in display order, then displays each
 //! frame at the specified rate.
 //! Press Escape to quit. With --loop, playback repeats from the beginning.
+//! Decodes on all cores by default (`Decoder::with_threads`); `--threads 1`
+//! decodes on the calling thread.
 
 use minifb::{Key, Window, WindowOptions};
 use rust_h265::decoder::{Decoder, Frame};
@@ -50,11 +52,11 @@ struct FrameSource<'a> {
 }
 
 impl<'a> FrameSource<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    fn new(data: &'a [u8], threads: usize) -> Self {
         Self {
             nals: parse_annex_b(data),
             next_nal: 0,
-            decoder: Decoder::new().with_display_order(),
+            decoder: Decoder::new().with_display_order().with_threads(threads),
         }
     }
 
@@ -88,13 +90,14 @@ fn to_argb(f: &Frame) -> Vec<u32> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: play <input.h265> [--fps N] [--loop]");
+        eprintln!("Usage: play <input.h265> [--fps N] [--loop] [--threads N]");
         std::process::exit(1);
     }
     let input_path = &args[1];
 
     let mut fps_override: Option<f64> = None;
     let mut do_loop = false;
+    let mut threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -103,6 +106,13 @@ fn main() {
                 fps_override = args.get(i).and_then(|s| s.parse().ok());
             }
             "--loop" => do_loop = true,
+            "--threads" => {
+                i += 1;
+                match args.get(i).and_then(|s| s.parse().ok()) {
+                    Some(n) => threads = n,
+                    None => eprintln!("--threads needs a number"),
+                }
+            }
             _ => eprintln!("Unknown option: {}", args[i]),
         }
         i += 1;
@@ -116,7 +126,7 @@ fn main() {
         }
     };
 
-    let mut source = FrameSource::new(&h265_data);
+    let mut source = FrameSource::new(&h265_data, threads);
     let Some(first) = source.next_frame() else {
         eprintln!("No frames decoded.");
         std::process::exit(1);
@@ -172,7 +182,7 @@ fn main() {
         let Some(f) = source.next_frame() else {
             // End of stream.
             if do_loop {
-                source = FrameSource::new(&h265_data);
+                source = FrameSource::new(&h265_data, threads);
                 eprintln!("Looping... ({} frames played)", frame_count);
                 continue;
             }
