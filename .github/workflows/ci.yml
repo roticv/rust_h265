@@ -53,3 +53,30 @@ jobs:
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: Minimum Rust version (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.88
+      - name: Build and test
+        run: cargo test --release
+
+  miri:
+    # The shared picture tables (src/shared.rs) are the crate's only unsafe
+    # code: check them, and a small multithreaded decode, under Miri's
+    # aliasing and data-race model.
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - name: Unsafe module and thread pool tests
+        run: cargo miri test --lib -- shared:: parallel::
+      - name: Small threaded decode
+        run: cargo miri test --lib threaded_decode_small
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation

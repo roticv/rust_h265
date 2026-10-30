@@ -27,7 +27,10 @@
 //! another thread accesses it. The wavefront schedule guarantees that:
 //!
 //! - every element belongs to one CTB (by its position in the picture);
-//! - a worker writes only elements of the CTB it is decoding;
+//! - a worker writes only elements of the CTB it is decoding, each range
+//!   within one table row (a range over several rows covers the start of
+//!   its last row, which can be the CTB row's bottom row, read by the row
+//!   below: Miri found this; blocks go through `cu_tree::with_block`);
 //! - a worker reads elements of CTBs in its own CTB row, or of CTBs in rows
 //!   above that are finished: row `r` decodes CTB `c` only after row `r - 1`
 //!   has finished CTB `c + 1` (published through [`RowProgress`]);
@@ -561,16 +564,14 @@ impl AccessCheck {
                 if write { "writes" } else { "reads" },
             );
         }
-        // A range spanning several table rows covers whole rows in between:
-        // checking its first and last element is enough for one CTB row,
-        // but not when it crosses CTB rows.
-        let (r0, r1) = (
-            (range.start / g.row_len) / g.ctb_rows,
-            ((range.end - 1) / g.row_len) / g.ctb_rows,
-        );
+        // A range must lie within one table row: a range over several rows
+        // covers whole rows in between and the start of its last row, which
+        // can be the bottom row of the CTB row, read concurrently by the row
+        // below (its intra references).
+        let (t0, t1) = (range.start / g.row_len, (range.end - 1) / g.row_len);
         assert!(
-            r0 == r1,
-            "wavefront violation: CTB ({row}, {col}) accesses {table}[{}..{}], spanning CTB rows {r0}..={r1}",
+            t0 == t1,
+            "wavefront violation: CTB ({row}, {col}) accesses {table}[{}..{}], spanning table rows {t0}..={t1}",
             range.start,
             range.end,
         );

@@ -23,8 +23,10 @@
 //!   deblocking step writes rows from `y1(r + 1) - 3` on. They are
 //!   published as final.
 //!
-//! A slice segment that would write into a row already published (only a
-//! corrupt stream does that) is rejected: other threads may be reading it.
+//! Which CTB rows are decoded is tracked by [`DecodedRows`], in every mode:
+//! a slice segment that would write into a CTB row already complete (only a
+//! corrupt stream does that) is rejected, with any thread count. Here the
+//! row may already be published, and other threads may be reading it.
 
 use std::sync::Arc;
 
@@ -41,14 +43,9 @@ pub(crate) struct RowFilter<P: Pixel> {
     sps: Arc<Sps>,
     pps: Arc<Pps>,
     ctb: usize,
-    w_ctbs: usize,
     h_ctbs: usize,
-    /// Which CTBs are decoded, and how many per CTB row.
-    decoded: Vec<bool>,
-    row_done: Vec<usize>,
-    /// CTB rows decoded (a prefix: every CTB in them), deblocked, and
-    /// through SAO (final).
-    decoded_rows: usize,
+    /// CTB rows deblocked, and through SAO (final). How many are decoded is
+    /// `PictureState::decoded_rows`.
     deblocked_rows: usize,
     sao_rows: usize,
     sao: bool,
@@ -67,7 +64,6 @@ impl<P: Pixel> RowFilter<P> {
         pps: Arc<Pps>,
     ) -> Self {
         let ctb = 1usize << state.log2_ctb_size;
-        let w_ctbs = state.width_in_ctbs;
         let h_ctbs = (state.height as usize).div_ceil(ctb);
         let sao = sps.sample_adaptive_offset_enabled_flag;
         let lens = [
@@ -86,11 +82,7 @@ impl<P: Pixel> RowFilter<P> {
             sps,
             pps,
             ctb,
-            w_ctbs,
             h_ctbs,
-            decoded: vec![false; w_ctbs * h_ctbs],
-            row_done: vec![0; h_ctbs],
-            decoded_rows: 0,
             deblocked_rows: 0,
             sao_rows: 0,
             sao,
@@ -98,39 +90,22 @@ impl<P: Pixel> RowFilter<P> {
         }
     }
 
-    /// Whether CTB `rs` (raster address) lies in a row already published:
-    /// decoding it would change samples other threads may be reading.
-    pub(crate) fn frozen(&self, rs: usize) -> bool {
-        rs / self.w_ctbs < self.decoded_rows
-    }
-
-    /// CTB `rs` has been decoded (or failed: its samples are what they
-    /// are). Runs the filters and publishes progress when that completes a
-    /// row.
-    pub(crate) fn ctb_decoded(&mut self, state: &mut PictureState<P>, rs: usize) {
-        if rs >= self.decoded.len() || self.decoded[rs] {
-            return;
-        }
-        self.decoded[rs] = true;
-        self.row_done[rs / self.w_ctbs] += 1;
-        let before = self.decoded_rows;
-        while self.decoded_rows < self.h_ctbs && self.row_done[self.decoded_rows] == self.w_ctbs {
-            self.decoded_rows += 1;
-        }
-        if self.decoded_rows > before {
-            self.advance(state, false);
-        }
+    /// More CTB rows of the picture are decoded: filter what can be
+    /// filtered and publish progress.
+    pub(crate) fn rows_decoded(&mut self, state: &mut PictureState<P>) {
+        self.advance(state, false);
     }
 
     /// Filter what can be filtered (everything when `finishing`: the CTBs
     /// no slice decoded have been filled by then) and publish progress.
     fn advance(&mut self, state: &mut PictureState<P>, finishing: bool) {
+        let decoded_rows = state.decoded_rows.rows();
         // Row r is deblocked once row r + 1 is decoded (see the module
         // documentation), all of them when finishing.
         let target = if finishing {
             self.h_ctbs
         } else {
-            self.decoded_rows.saturating_sub(1)
+            decoded_rows.saturating_sub(1)
         };
         while self.deblocked_rows < target {
             self.deblock_row(state, self.deblocked_rows);
@@ -143,7 +118,7 @@ impl<P: Pixel> RowFilter<P> {
             self.sao_rows += 1;
         }
         let final_rows = (self.sao_rows * self.ctb).min(state.height as usize);
-        self.picture.progress.publish(self.decoded_rows, final_rows);
+        self.picture.progress.publish(decoded_rows, final_rows);
     }
 
     /// Finish the picture's filtering (after `fill_undecoded_ctbs`) and
@@ -280,5 +255,52 @@ impl<P: Pixel> RowFilter<P> {
         let block_rows = state.tab_no_filter.len() / state.min_pu_width.max(1);
         let b1 = if last { block_rows } else { y1 >> 2 };
         crate::sao::restore_no_filter(state, src, (y0 >> 2)..b1.min(block_rows));
+    }
+}
+
+/// Which CTBs of a picture are decoded, and how many CTB rows from the top
+/// are complete. Kept in every mode (`PictureState::decoded_rows`), so the
+/// rule that a slice segment may not rewrite a complete CTB row applies
+/// with any thread count. A CTB that failed does not count.
+#[derive(Debug, Default)]
+pub(crate) struct DecodedRows {
+    w_ctbs: usize,
+    decoded: Vec<bool>,
+    row_done: Vec<usize>,
+    rows: usize,
+}
+
+impl DecodedRows {
+    pub(crate) fn new(w_ctbs: usize, h_ctbs: usize) -> Self {
+        Self {
+            w_ctbs,
+            decoded: vec![false; w_ctbs * h_ctbs],
+            row_done: vec![0; h_ctbs],
+            rows: 0,
+        }
+    }
+
+    /// CTB rows complete from the top of the picture.
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Whether CTB `rs` (raster address) lies in a complete CTB row.
+    pub(crate) fn frozen(&self, rs: usize) -> bool {
+        self.w_ctbs > 0 && rs / self.w_ctbs < self.rows
+    }
+
+    /// CTB `rs` is decoded. Returns whether that completed CTB rows.
+    pub(crate) fn mark(&mut self, rs: usize) -> bool {
+        if rs >= self.decoded.len() || self.decoded[rs] {
+            return false;
+        }
+        self.decoded[rs] = true;
+        self.row_done[rs / self.w_ctbs] += 1;
+        let before = self.rows;
+        while self.rows < self.row_done.len() && self.row_done[self.rows] == self.w_ctbs {
+            self.rows += 1;
+        }
+        self.rows > before
     }
 }

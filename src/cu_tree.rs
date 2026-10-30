@@ -336,6 +336,13 @@ pub struct PictureState<P: Pixel> {
     /// Frame threading: the loop filters run row by row as this picture
     /// decodes (`crate::rowfilter`); `None` otherwise.
     pub row_filter: Option<Box<crate::rowfilter::RowFilter<P>>>,
+    /// Which CTBs are decoded (in every mode; see `rowfilter::DecodedRows`).
+    pub decoded_rows: crate::rowfilter::DecodedRows,
+    /// A wavefront worker's state: blocks are written to the planes one
+    /// row at a time (see `with_block`).
+    pub row_exact: bool,
+    /// Scratch block for `with_block`.
+    pub block_buf: Vec<P>,
 }
 
 /// Buffers of earlier pictures that `PictureState::new_recycled` reuses.
@@ -457,6 +464,9 @@ impl<P: Pixel> PictureState<P> {
             min_tb_width: self.min_tb_width,
             mc_scratch: crate::inter_pred::McScratch::new(),
             row_filter: None,
+            decoded_rows: Default::default(),
+            row_exact: true,
+            block_buf: Vec::new(),
         }
     }
 
@@ -668,6 +678,41 @@ pub(crate) struct TableGeometries {
     pub min_tb: crate::shared::Geometry,
     pub grid4: crate::shared::Geometry,
     pub ctb: crate::shared::Geometry,
+}
+
+/// Run `f(dst, dst_stride)` on the `w` x `h` block of `plane` whose first
+/// sample is `plane[off]` (row stride `stride`).
+///
+/// Normally `dst` is the plane range from the block's first to its last
+/// sample. A wavefront worker (`row_exact`) must not do that: such a range
+/// also covers the start of the block's last row, which can be the bottom
+/// sample row of the CTB row, read at the same time by the row below (as
+/// intra references). It gets a copy in `buf` instead, read and written
+/// back one exact row at a time.
+pub(crate) fn with_block<P: Pixel, R>(
+    plane: &mut SharedTable<P>,
+    buf: &mut Vec<P>,
+    row_exact: bool,
+    off: usize,
+    stride: usize,
+    (w, h): (usize, usize),
+    f: impl FnOnce(&mut [P], usize) -> R,
+) -> R {
+    if h == 0 || w == 0 {
+        return f(&mut [], stride);
+    }
+    if !row_exact {
+        return f(&mut plane[off..off + (h - 1) * stride + w], stride);
+    }
+    buf.clear();
+    for j in 0..h {
+        buf.extend_from_slice(&plane[off + j * stride..off + j * stride + w]);
+    }
+    let r = f(&mut buf[..], w);
+    for j in 0..h {
+        plane[off + j * stride..off + j * stride + w].copy_from_slice(&buf[j * w..(j + 1) * w]);
+    }
+    r
 }
 
 /// `buf` (or a new buffer) holding `n` copies of `value`. Works on `Vec`s
@@ -899,6 +944,12 @@ impl<P: Pixel> PictureState<P> {
                 None => crate::inter_pred::McScratch::new(),
             },
             row_filter: None,
+            decoded_rows: crate::rowfilter::DecodedRows::new(
+                (w as usize).div_ceil(1 << log2_ctb_size),
+                (h as usize).div_ceil(1 << log2_ctb_size),
+            ),
+            row_exact: false,
+            block_buf: reuse!(block_buf).unwrap_or_default(),
         }
     }
 
@@ -1885,11 +1936,14 @@ fn temporal_luma_motion_vector<P: Pixel>(
         return None;
     }
     // Frame threading: the collocated picture may still be decoding. Both
-    // candidates lie in this block's CTB row (the bottom-right one is used
-    // only inside it), so that many of its CTB rows must be decoded.
+    // candidates lie at or above this block's bottom row (the bottom-right
+    // one is used only inside this block's CTB row), so the collocated
+    // picture's CTB rows down to there must be decoded, counted in its own
+    // CTB size (a broken stream can give it another one).
+    let bottom = (y0 + n_pb_h).max(0) as usize;
     col_ref
         .progress
-        .wait_decoded_ctb_rows((y0 as usize >> state.log2_ctb_size) + 1);
+        .wait_decoded_ctb_rows((bottom >> col_ref.log2_ctb_size) + 1);
 
     let col_pic_poc = col_ref.poc;
     let min_pu_width = col_ref.min_pu_width;
@@ -4483,19 +4537,21 @@ fn decode_chroma_residuals<P: Pixel>(
             }
         }
         let dst_stride = state.uv_stride;
+        let (bit_depth_c, row_exact) = (state.bit_depth_c, state.row_exact);
         let dst_plane = if c_idx == 1 {
             &mut state.u_plane
         } else {
             &mut state.v_plane
         };
         let dst_offset = y_c * dst_stride + x_c;
-        let dst = &mut dst_plane[dst_offset..dst_offset + (size_c - 1) * dst_stride + size_c];
-        add_residual(
-            dst,
+        with_block(
+            dst_plane,
+            &mut state.block_buf,
+            row_exact,
+            dst_offset,
             dst_stride,
-            &residual,
-            log2_trafo_size_c,
-            state.bit_depth_c,
+            (size_c, size_c),
+            |dst, stride| add_residual(dst, stride, &residual, log2_trafo_size_c, bit_depth_c),
         );
         state.coeff_buf = residual;
     }
@@ -4589,35 +4645,37 @@ fn predict_intra_luma<P: Pixel>(
 
     let dst_stride = state.y_stride;
     let dst_offset = (y0 as usize) * dst_stride + (x0 as usize);
-    let dst = &mut state.y_plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
-
-    match mode {
-        0 => predict_planar(dst, dst_stride, &top, &left, log2_size, state.bit_depth),
-        1 => predict_dc(
-            dst,
-            dst_stride,
-            &top,
-            &left,
-            log2_size,
-            edge_filters,
-            state.bit_depth,
-        ),
-        // The angular edge filters apply to component 0 only; passing a
-        // chroma index turns them off.
-        2..=34 => predict_angular(
-            dst,
-            dst_stride,
-            &top,
-            &left,
-            log2_size,
-            mode,
-            if edge_filters { 0 } else { 1 },
-            state.bit_depth,
-        ),
-        _ => {
-            return Err(DecodeError::Unsupported("invalid intra prediction mode"));
-        }
-    }
+    let bit_depth = state.bit_depth;
+    with_block(
+        &mut state.y_plane,
+        &mut state.block_buf,
+        state.row_exact,
+        dst_offset,
+        dst_stride,
+        (size, size),
+        |dst, stride| {
+            match mode {
+                0 => predict_planar(dst, stride, &top, &left, log2_size, bit_depth),
+                1 => predict_dc(dst, stride, &top, &left, log2_size, edge_filters, bit_depth),
+                // The angular edge filters apply to component 0 only; passing a
+                // chroma index turns them off.
+                2..=34 => predict_angular(
+                    dst,
+                    stride,
+                    &top,
+                    &left,
+                    log2_size,
+                    mode,
+                    if edge_filters { 0 } else { 1 },
+                    bit_depth,
+                ),
+                _ => {
+                    return Err(DecodeError::Unsupported("invalid intra prediction mode"));
+                }
+            }
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 
@@ -4888,38 +4946,41 @@ fn predict_intra_chroma<P: Pixel>(
             );
         }
 
+        let (bit_depth_c, row_exact) = (state.bit_depth_c, state.row_exact);
         let plane = if plane_idx == 0 {
             &mut state.u_plane
         } else {
             &mut state.v_plane
         };
         let dst_offset = y_c * dst_stride + x_c;
-        let dst = &mut plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
-        match mode {
-            0 => predict_planar(dst, dst_stride, &top, &left, log2_size, state.bit_depth_c),
-            1 => predict_dc(
-                dst,
-                dst_stride,
-                &top,
-                &left,
-                log2_size,
-                false,
-                state.bit_depth_c,
-            ),
-            2..=34 => predict_angular(
-                dst,
-                dst_stride,
-                &top,
-                &left,
-                log2_size,
-                mode,
-                c_idx,
-                state.bit_depth_c,
-            ),
-            _ => {
-                return Err(DecodeError::Unsupported("invalid intra prediction mode"));
-            }
-        }
+        with_block(
+            plane,
+            &mut state.block_buf,
+            row_exact,
+            dst_offset,
+            dst_stride,
+            (size, size),
+            |dst, stride| {
+                match mode {
+                    0 => predict_planar(dst, stride, &top, &left, log2_size, bit_depth_c),
+                    1 => predict_dc(dst, stride, &top, &left, log2_size, false, bit_depth_c),
+                    2..=34 => predict_angular(
+                        dst,
+                        stride,
+                        &top,
+                        &left,
+                        log2_size,
+                        mode,
+                        c_idx,
+                        bit_depth_c,
+                    ),
+                    _ => {
+                        return Err(DecodeError::Unsupported("invalid intra prediction mode"));
+                    }
+                }
+                Ok(())
+            },
+        )?;
     }
     Ok(())
 }
@@ -4965,13 +5026,15 @@ fn apply_residual_to_luma<P: Pixel>(
         );
         let dst_stride = state.y_stride;
         let dst_offset = (y0 as usize) * dst_stride + (x0 as usize);
-        let dst = &mut state.y_plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
-        add_residual(
-            dst,
+        let bit_depth = state.bit_depth;
+        with_block(
+            &mut state.y_plane,
+            &mut state.block_buf,
+            state.row_exact,
+            dst_offset,
             dst_stride,
-            &residual_pixels,
-            log2_size,
-            state.bit_depth,
+            (size, size),
+            |dst, stride| add_residual(dst, stride, &residual_pixels, log2_size, bit_depth),
         );
         if keep_for_ccp {
             state.ccp_luma_residual = residual_pixels;
@@ -5000,8 +5063,16 @@ fn apply_residual_to_luma<P: Pixel>(
     // residual — skip IDCT, add directly (HEVC spec 8.6.4).
     let dst_stride = state.y_stride;
     let dst_offset = (y0 as usize) * dst_stride + (x0 as usize);
-    let dst = &mut state.y_plane[dst_offset..dst_offset + (size - 1) * dst_stride + size];
-    add_residual(dst, dst_stride, residual_pixels, log2_size, state.bit_depth);
+    let bit_depth = state.bit_depth;
+    with_block(
+        &mut state.y_plane,
+        &mut state.block_buf,
+        state.row_exact,
+        dst_offset,
+        dst_stride,
+        (size, size),
+        |dst, stride| add_residual(dst, stride, residual_pixels, log2_size, bit_depth),
+    );
     if keep_for_ccp {
         // Copy into the persistent buffer, which keeps its allocation.
         state.ccp_luma_residual.clear();

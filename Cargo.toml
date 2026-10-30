@@ -2,6 +2,7 @@
 name = "rust_h265"
 version = "0.3.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Pure Rust H.265/HEVC video decoder: Main, Main 10 and the 4:2:0 / 4:4:4 range-extension profiles up to 12-bit"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/roticv/rust_h265"

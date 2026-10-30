@@ -44,7 +44,8 @@ pub(crate) struct SliceContext<'a> {
 /// Decode CTB `ctb_addr_rs` (tile-scan position `ctb_addr_ts`): record its
 /// slice-level tables, then parse SAO parameters and the coding quadtree.
 /// Returns whether the slice segment continues (`end_of_slice_segment_flag
-/// == 0`). Used by both the sequential and the wavefront CTB loops.
+/// == 0`). Used by both the sequential and the wavefront CTB loops. A CTB
+/// that fails is left marked undecoded (grey-filled at the picture's end).
 pub(crate) fn decode_ctb<P: Pixel>(
     cabac: &mut CabacReader,
     contexts: &mut CabacContexts,
@@ -75,7 +76,7 @@ pub(crate) fn decode_ctb<P: Pixel>(
         col as usize,
         row as usize,
     );
-    decode_coding_quadtree(
+    let result = decode_coding_quadtree(
         cabac,
         contexts,
         state,
@@ -87,7 +88,15 @@ pub(crate) fn decode_ctb<P: Pixel>(
         row * ctb_size,
         sps.ctb_log2_size_y,
         0,
-    )
+    );
+    if result.is_err() {
+        // A CTB that fails part-way is treated as never decoded, so the end
+        // of the picture fills it mid-grey: its samples are otherwise partly
+        // whatever its (recycled) plane held before, which depends on
+        // buffer reuse and so differs between thread counts.
+        state.tab_slice_addr_rs[rs] = -1;
+    }
+    result
 }
 
 /// Where the substreams of a slice start in the RBSP.
@@ -151,6 +160,8 @@ struct RowOutcome {
     /// Columns this row started decoding (including a failed CTB), for
     /// undoing a discarded row.
     started: std::ops::Range<usize>,
+    /// End of the columns decoded successfully (from `started.start`).
+    decoded_end: usize,
     /// Contexts after the row's last decoded CTB.
     contexts: CabacContexts,
     /// The worker that decoded the row.
@@ -224,6 +235,9 @@ pub(crate) fn decode_rows<P: Pixel>(
     // that `progress` reports finished (it waits for column `c + 1` of the
     // row above before decoding column `c`); in test builds `AccessCheck`
     // asserts this for every access.
+    // CTB rows complete before this slice: not to be rewritten (as in the
+    // sequential loop; rows this slice completes are behind it).
+    let frozen_rows = state.decoded_rows.rows();
     let workers: Vec<PictureState<P>> = (0..n_workers)
         .map(|_| unsafe { state.worker_view() })
         .collect();
@@ -254,6 +268,7 @@ pub(crate) fn decode_rows<P: Pixel>(
         let mut outcome = RowOutcome {
             end: RowEnd::Complete,
             started: col0..col0,
+            decoded_end: col0,
             contexts,
             worker,
         };
@@ -261,10 +276,17 @@ pub(crate) fn decode_rows<P: Pixel>(
             outcome.end = RowEnd::Failed(e);
         };
         // Substream for this row, and its starting contexts.
-        let mut cabac = match substreams
-            .start(r - r0)
-            .and_then(|o| CabacReader::new(substreams.rbsp, o))
-        {
+        // Opened as the sequential loop does (so a bad entry point fails
+        // with the same error): the first row at the slice data, later rows
+        // by re-initialising at their entry point.
+        let opened = substreams.start(r - r0).and_then(|o| {
+            let mut c = CabacReader::new(substreams.rbsp, substreams.data_start)?;
+            if !first {
+                c.reinit_at(o)?;
+            }
+            Ok(c)
+        });
+        let mut cabac = match opened {
             Ok(c) => c,
             Err(e) => {
                 fail(&mut outcome, e);
@@ -306,6 +328,13 @@ pub(crate) fn decode_rows<P: Pixel>(
                 outcome.end = RowEnd::Failed(DecodeError::InvalidSyntax("discarded"));
                 break;
             }
+            if r < frozen_rows {
+                fail(
+                    &mut outcome,
+                    DecodeError::InvalidSyntax("slice segment overlaps CTB rows already decoded"),
+                );
+                break;
+            }
             outcome.started.end = c + 1;
             #[cfg(test)]
             check.set_current(Some((r, c)));
@@ -314,7 +343,10 @@ pub(crate) fn decode_rows<P: Pixel>(
             #[cfg(test)]
             check.set_current(None);
             let more = match result {
-                Ok(m) => m,
+                Ok(m) => {
+                    outcome.decoded_end = c + 1;
+                    m
+                }
                 Err(e) => {
                     fail(&mut outcome, e);
                     break;
@@ -366,12 +398,15 @@ pub(crate) fn decode_rows<P: Pixel>(
     // to its end; rows below it are discarded.
     let mut result = None;
     let mut stop = rows.end - 1;
+    // CTBs decoded, per row up to the stop (a failed CTB does not count).
+    let mut decoded: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
     for r in rows.clone() {
         let o = outcomes[r]
             .lock()
             .unwrap()
             .take()
             .expect("every row up to the stop is decoded");
+        decoded.push((r, o.started.start..o.decoded_end));
         let last_row = r + 1 == rows.end;
         let end = match o.end {
             RowEnd::Complete if !last_row => continue,
@@ -406,6 +441,16 @@ pub(crate) fn decode_rows<P: Pixel>(
     }
     state.take_worker_state(&workers[last_worker], &workers);
     drop(workers);
+    let mut rows_completed = false;
+    for (r, cols) in decoded {
+        for c in cols {
+            rows_completed |= state.decoded_rows.mark(r * w + c);
+        }
+    }
+    if rows_completed && let Some(mut filter) = state.row_filter.take() {
+        filter.rows_decoded(state);
+        state.row_filter = Some(filter);
+    }
 
     // Discard what the rows below the stop decoded.
     for (r, outcome) in outcomes.iter().enumerate().take(rows.end).skip(stop + 1) {

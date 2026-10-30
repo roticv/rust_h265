@@ -39,6 +39,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A picture ends when the next picture starts, at an access unit
+  delimiter, end of sequence or end of bitstream NAL unit, or at
+  `flush()`, with any thread count. Before, a picture also ended as soon as
+  its last CTB was decoded, so in decoding-order mode its frame came out of
+  that `decode_nal` call; now, for a stream without access unit
+  delimiters, it comes out when the next picture starts, and the last
+  picture's from `flush()` (which every stream must end with). This lets a
+  stray slice segment after a picture's last CTB be handled the same way
+  with any thread count.
+- A slice segment may not rewrite a CTB row that is already complete (in
+  a corrupt stream): it is rejected with an error, with any thread count.
+- A CTB whose decoding fails is filled mid-grey with the CTBs no slice
+  decoded, instead of keeping whatever its recycled sample buffer held.
+- Minimum supported Rust version: 1.88 (`rust-version` in `Cargo.toml`;
+  CI tests it).
 - The crate has `unsafe` code for the first time, confined to one module
   (`src/shared.rs`): multithreaded decoding has one thread reading parts
   of picture tables another thread is writing, which safe Rust cannot
@@ -52,6 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Found by a new fuzz target that compares multithreaded and
+  single-threaded decoding, and by Miri: a wavefront row wrote blocks
+  through a slice that also covered the start of the CTB row's bottom
+  sample row, which the row below reads concurrently (now written one row
+  at a time); a wavefront row reported a bad entry point with another
+  error than sequential decoding; temporal MV prediction waited for the
+  collocated picture's rows in the current picture's CTB size.
 - Uni-prediction clamped reference sample positions to the current
   picture's size instead of the reference's (only differs for a
   reference of another size, in a broken stream).

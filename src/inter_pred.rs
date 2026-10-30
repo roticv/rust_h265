@@ -1162,29 +1162,39 @@ pub fn motion_compensation_pu<P: Pixel>(
         };
 
         if !weighted_pred_flag {
-            // Non-weighted uni-prediction: MC directly into the picture planes.
-            // Each destination range ends at the block's last sample, so it
-            // stays inside the block's own CTB row (wavefront decoding).
+            // Non-weighted uni-prediction: MC directly into the picture planes
+            // (through `with_block`, which a wavefront worker needs).
+            let row_exact = state.row_exact;
             let ref_y = ref_plane::<P>(ref_list, 0, ref_rows(y0, h, mv.y));
             let ref_u = ref_plane::<P>(ref_list, 1, ref_rows(y0, h, mv.y));
             let ref_v = ref_plane::<P>(ref_list, 2, ref_rows(y0, h, mv.y));
             let y_off = (y0 as usize) * y_stride + (x0 as usize);
-            mc_luma::<P>(
-                &mut state.y_plane[y_off..y_off + (h - 1) * y_stride + w],
+            crate::cu_tree::with_block(
+                &mut state.y_plane,
+                &mut state.block_buf,
+                row_exact,
+                y_off,
                 y_stride,
-                ref_y,
-                ref_list.y_stride,
-                ref_list.width as i32,
-                ref_list.height as i32,
-                x0 as i32,
-                y0 as i32,
-                w,
-                h,
-                mv.x,
-                mv.y,
-                bit_depth,
-                &mut tmp[..],
-                &mut edge[..],
+                (w, h),
+                |dst, dst_stride| {
+                    mc_luma::<P>(
+                        dst,
+                        dst_stride,
+                        ref_y,
+                        ref_list.y_stride,
+                        ref_list.width as i32,
+                        ref_list.height as i32,
+                        x0 as i32,
+                        y0 as i32,
+                        w,
+                        h,
+                        mv.x,
+                        mv.y,
+                        bit_depth,
+                        &mut tmp[..],
+                        &mut edge[..],
+                    )
+                },
             );
 
             let ref_w_c = (ref_list.width >> csw) as i32;
@@ -1193,39 +1203,59 @@ pub fn motion_compensation_pu<P: Pixel>(
             let mv_x_c = chroma_mv(mv.x, csw);
             let mv_y_c = chroma_mv(mv.y, csh);
 
-            mc_chroma::<P>(
-                &mut state.u_plane[c_off..c_off + (h_c - 1) * uv_stride + w_c],
+            crate::cu_tree::with_block(
+                &mut state.u_plane,
+                &mut state.block_buf,
+                row_exact,
+                c_off,
                 uv_stride,
-                ref_u,
-                ref_uv_stride,
-                ref_w_c,
-                ref_h_c,
-                x0_c,
-                y0_c,
-                w_c,
-                h_c,
-                mv_x_c,
-                mv_y_c,
-                bit_depth_c,
-                &mut tmp[..],
-                &mut edge[..],
+                (w_c, h_c),
+                |dst, dst_stride| {
+                    mc_chroma::<P>(
+                        dst,
+                        dst_stride,
+                        ref_u,
+                        ref_uv_stride,
+                        ref_w_c,
+                        ref_h_c,
+                        x0_c,
+                        y0_c,
+                        w_c,
+                        h_c,
+                        mv_x_c,
+                        mv_y_c,
+                        bit_depth_c,
+                        &mut tmp[..],
+                        &mut edge[..],
+                    )
+                },
             );
-            mc_chroma::<P>(
-                &mut state.v_plane[c_off..c_off + (h_c - 1) * uv_stride + w_c],
+            crate::cu_tree::with_block(
+                &mut state.v_plane,
+                &mut state.block_buf,
+                row_exact,
+                c_off,
                 uv_stride,
-                ref_v,
-                ref_uv_stride,
-                ref_w_c,
-                ref_h_c,
-                x0_c,
-                y0_c,
-                w_c,
-                h_c,
-                mv_x_c,
-                mv_y_c,
-                bit_depth_c,
-                &mut tmp[..],
-                &mut edge[..],
+                (w_c, h_c),
+                |dst, dst_stride| {
+                    mc_chroma::<P>(
+                        dst,
+                        dst_stride,
+                        ref_v,
+                        ref_uv_stride,
+                        ref_w_c,
+                        ref_h_c,
+                        x0_c,
+                        y0_c,
+                        w_c,
+                        h_c,
+                        mv_x_c,
+                        mv_y_c,
+                        bit_depth_c,
+                        &mut tmp[..],
+                        &mut edge[..],
+                    )
+                },
             );
         } else {
             // Weighted uni-prediction: compute MC at i16 precision, then apply

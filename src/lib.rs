@@ -56,10 +56,13 @@
 //! # Decoding order
 //!
 //! Prefer display order. A decoder made with [`Decoder::new`] alone
-//! returns each picture from [`decode_nal`](Decoder::decode_nal) as soon as
-//! it is decoded, in decoding order, and returns every decoded picture,
-//! including those the spec does not output. This suits callers that pair
-//! each frame with the container packet it came from. To display such frames, sort them by
+//! returns each picture from [`decode_nal`](Decoder::decode_nal) once it
+//! has ended (when the next picture starts, at an access unit delimiter,
+//! end of sequence or end of bitstream NAL unit, or at
+//! [`flush`](Decoder::flush)), in decoding order, and returns every decoded
+//! picture, including those the spec does not output. This suits callers
+//! that pair each frame with the container packet it came from. To display
+//! such frames, sort them by
 //! [`pic_order_cnt`](Frame::pic_order_cnt) within each coded video
 //! sequence: POC restarts at every IDR or BLA picture, and at a CRA
 //! picture that follows an end-of-sequence NAL unit.

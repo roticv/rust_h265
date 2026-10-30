@@ -152,8 +152,6 @@ struct PictureDecode {
     /// WPP context state saved after the second CTB of the latest CTB row,
     /// for a dependent slice segment that starts a row.
     saved_wpp_cabac_state: Option<CabacContexts>,
-    /// CTBs decoded so far, in tile scan.
-    ctbs_decoded: u32,
     /// Frame threading: decode WPP slices' CTB rows in parallel even though
     /// the picture is filtered row by row (set for a picture that started
     /// with no other picture in flight, such as a still image).
@@ -353,7 +351,6 @@ fn start_picture_thread(
         state,
         saved_cabac_state: None,
         saved_wpp_cabac_state: None,
-        ctbs_decoded: 0,
         rows_in_parallel,
     };
     let for_thread = Arc::clone(&picture);
@@ -570,13 +567,10 @@ impl PictureDecode {
                         state.first_qp_group = true;
                     }
 
-                    // Frame threading: rows already published may be read
-                    // by other pictures' threads and must not change.
-                    if state
-                        .row_filter
-                        .as_ref()
-                        .is_some_and(|f| f.frozen(ctb_addr_rs as usize))
-                    {
+                    // A complete CTB row is not rewritten (with frame
+                    // threading it may be published and read by other
+                    // pictures' threads); the same rule for any thread count.
+                    if state.decoded_rows.frozen(ctb_addr_rs as usize) {
                         return Err(DecodeError::InvalidSyntax(
                             "slice segment overlaps CTB rows already decoded",
                         ));
@@ -589,8 +583,13 @@ impl PictureDecode {
                         ctb_addr_rs,
                         ctb_addr_ts,
                     );
-                    if let Some(mut filter) = state.row_filter.take() {
-                        filter.ctb_decoded(state, ctb_addr_rs as usize);
+                    // A failed CTB stays undecoded for the row filter: its row
+                    // is filtered at the picture's end, after the grey fill.
+                    if result.is_ok()
+                        && state.decoded_rows.mark(ctb_addr_rs as usize)
+                        && let Some(mut filter) = state.row_filter.take()
+                    {
+                        filter.rows_decoded(state);
                         state.row_filter = Some(filter);
                     }
                     more_data = result?;
@@ -613,9 +612,8 @@ impl PictureDecode {
             }
         });
 
-        let (final_ctb_addr_ts, final_saved_state, final_contexts_state) = ctb_loop_result?;
+        let (_, final_saved_state, final_contexts_state) = ctb_loop_result?;
 
-        self.ctbs_decoded = final_ctb_addr_ts;
         self.saved_cabac_state = Some(final_contexts_state);
         self.saved_wpp_cabac_state = final_saved_state;
         Ok(())
@@ -1439,22 +1437,29 @@ impl Decoder {
             NalUnitType::Eos => {
                 // End of sequence: the next picture must be an IRAP and
                 // starts a new coded video sequence (NoRaslOutputFlag = 1).
+                let frame = self.end_picture()?;
                 self.after_eos = true;
-                Ok(None)
+                Ok(frame)
             }
+            // An access unit delimiter or end of bitstream also ends the
+            // picture before it, so its frame need not wait for the next
+            // picture.
+            NalUnitType::Aud | NalUnitType::Eob => self.end_picture(),
             t if t.is_vcl() => self.decode_slice(nal, t),
             _ => Ok(None),
         }
     }
 
-    /// Flush any buffered frame.
+    /// End the stream: finish the picture in progress and return the frames
+    /// still waiting, one per call, until `None`. Call it at the end of
+    /// every stream.
     ///
-    /// For streams without B-frame reordering (P-only), all frames are
-    /// emitted during `decode_nal` and `flush` returns `None`. If a
-    /// picture is still in progress (all CTBs decoded but not yet
-    /// finalized — shouldn't happen in normal operation), this drains
-    /// it as a best-effort measure. Future phases will add proper DPB
-    /// bumping for reorder delay.
+    /// A picture ends when the next one starts, at an access unit
+    /// delimiter, end of sequence or end of bitstream NAL unit, or here: its
+    /// slices can arrive over several `decode_nal` calls, so the last
+    /// picture of a stream without such a NAL unit after it comes out of
+    /// `flush`. With [`with_threads`](Self::with_threads) above 1 this also
+    /// waits for the pictures still decoding.
     ///
     /// In display-order mode this ends the stream: every frame still
     /// waiting is released, and each call returns the next one in display
@@ -1474,6 +1479,15 @@ impl Decoder {
             return self.output_queue.pop();
         }
         self.pending_frames.pop_front()
+    }
+
+    /// End the picture in progress, if any (it is finished as it is, with
+    /// any CTBs no slice decoded filled mid-grey).
+    fn end_picture(&mut self) -> Result<Option<Frame>, DecodeError> {
+        match self.current_picture.take() {
+            Some(pic) => self.finish_picture(pic),
+            None => Ok(None),
+        }
     }
 
     fn decode_slice(
@@ -1802,7 +1816,6 @@ impl Decoder {
                     state: ps_enum,
                     saved_cabac_state: None,
                     saved_wpp_cabac_state: None,
-                    ctbs_decoded: 0,
                     rows_in_parallel: false,
                 }))
             };
@@ -1967,35 +1980,22 @@ impl Decoder {
             pic.last_independent_slice_header = sh.clone();
         }
         pic.last_slice_header = sh;
+        // The picture ends when the next one starts (or at flush), with any
+        // thread count: a picture thread cannot tell the calling thread in
+        // time that its CTBs are complete, and a slice segment arriving
+        // after that is then handled the same way whatever the thread count
+        // (it may not rewrite complete CTB rows).
         match &mut pic.side {
-            PictureSide::Local(decode) => {
-                decode.decode_slice(&job, self.threads)?;
-                if decode.ctbs_decoded != total_ctbs {
-                    // More slice segments still to come for this picture.
-                    return Ok(None);
-                }
-            }
+            PictureSide::Local(decode) => decode.decode_slice(&job, self.threads)?,
             PictureSide::Thread(t) => {
-                // The picture ends when the next one starts (or at flush):
-                // only its thread knows how far its CTBs got. A send fails
-                // only if the thread panicked, which joining it reports.
+                // A send fails only if the thread panicked, which joining
+                // it reports.
                 let _ = t.jobs.send(PictureMessage::Slice(Box::new(job)));
-                return Ok(None);
             }
         }
-
-        // Picture complete — run in-loop filters and emit the frame.
-        let pic = self
-            .current_picture
-            .take()
-            .expect("current_picture taken after completion");
-        self.finish_picture(pic)
+        Ok(None)
     }
 
-    /// Finish a picture: fill CTBs that were never decoded (slices lost or
-    /// failed), run the in-loop filters, store it in the DPB and hand the
-    /// frame to the output (decoding-order return value or display-order
-    /// queue).
     /// Spec 8.3.1: prevTid0Pic is simply the previous TemporalId-0 picture
     /// that is not RASL/RADL/sub-layer non-reference. IRAP pictures qualify
     /// like any other, so store their actual POC (a mid-stream CRA keeps a
@@ -2106,6 +2106,10 @@ impl Decoder {
         }
     }
 
+    /// Finish a picture: fill CTBs that were never decoded (slices lost or
+    /// failed), run the in-loop filters, store it in the DPB and hand the
+    /// frame to the output (decoding-order return value or display-order
+    /// queue).
     fn finish_picture(&mut self, mut pic: PictureInProgress) -> Result<Option<Frame>, DecodeError> {
         let mut decode = match pic.side {
             PictureSide::Local(decode) => decode,
@@ -2953,6 +2957,10 @@ mod tests {
                 frame = Some(f);
             }
         }
+        while let Some(f) = decoder.flush() {
+            assert!(frame.is_none(), "fixture has only one frame");
+            frame = Some(f);
+        }
         let frame = frame.expect("expected one decoded frame");
 
         assert_eq!(frame.width, 16);
@@ -3003,6 +3011,10 @@ mod tests {
                 frame = Some(f);
             }
         }
+        while let Some(f) = decoder.flush() {
+            assert!(frame.is_none(), "fixture has only one frame");
+            frame = Some(f);
+        }
         let frame = frame.expect("expected one decoded frame");
         let mut decoded = Vec::with_capacity(ref_yuv.len());
         decoded.extend_from_slice(frame.y.as_u8().unwrap());
@@ -3035,6 +3047,10 @@ mod tests {
                 assert!(frame.is_none(), "fixture has only one frame");
                 frame = Some(f);
             }
+        }
+        while let Some(f) = decoder.flush() {
+            assert!(frame.is_none(), "fixture has only one frame");
+            frame = Some(f);
         }
         let frame = frame.expect("expected one decoded frame");
         let mut decoded = Vec::with_capacity(ref_yuv.len());
@@ -3083,6 +3099,10 @@ mod tests {
                 frame = Some(f);
             }
         }
+        while let Some(f) = decoder.flush() {
+            assert!(frame.is_none(), "fixture has only one frame");
+            frame = Some(f);
+        }
         let frame = frame.expect("expected one decoded frame");
         let mut decoded = Vec::with_capacity(1536);
         decoded.extend_from_slice(frame.y.as_u8().unwrap());
@@ -3116,6 +3136,10 @@ mod tests {
                 assert!(frame.is_none(), "fixture has only one frame");
                 frame = Some(f);
             }
+        }
+        while let Some(f) = decoder.flush() {
+            assert!(frame.is_none(), "fixture has only one frame");
+            frame = Some(f);
         }
         let frame = frame.expect("expected one decoded frame");
         assert_eq!(frame.width, 32);
@@ -3157,6 +3181,10 @@ mod tests {
                 assert!(frame.is_none(), "fixture has only one frame");
                 frame = Some(f);
             }
+        }
+        while let Some(f) = decoder.flush() {
+            assert!(frame.is_none(), "fixture has only one frame");
+            frame = Some(f);
         }
         let frame = frame.expect("expected one decoded frame");
 
@@ -3213,6 +3241,10 @@ mod tests {
                 assert!(frame.is_none(), "fixture has only one frame");
                 frame = Some(f);
             }
+        }
+        while let Some(f) = decoder.flush() {
+            assert!(frame.is_none(), "fixture has only one frame");
+            frame = Some(f);
         }
         let frame = frame.expect("expected one decoded frame");
 
@@ -3290,6 +3322,10 @@ mod tests {
                 assert!(frame.is_none(), "fixture has only one frame");
                 frame = Some(f);
             }
+        }
+        while let Some(f) = decoder.flush() {
+            assert!(frame.is_none(), "fixture has only one frame");
+            frame = Some(f);
         }
         let frame = frame.expect("expected one decoded frame");
 
@@ -3373,6 +3409,10 @@ mod tests {
                 assert!(frame.is_none(), "fixture has only one frame");
                 frame = Some(f);
             }
+        }
+        while let Some(f) = decoder.flush() {
+            assert!(frame.is_none(), "fixture has only one frame");
+            frame = Some(f);
         }
         let frame = frame.expect("expected one decoded frame");
 
@@ -3467,6 +3507,10 @@ mod tests {
                 frame = Some(f);
             }
         }
+        while let Some(f) = decoder.flush() {
+            assert!(frame.is_none(), "fixture has only one frame");
+            frame = Some(f);
+        }
         let frame = frame.expect("expected one decoded frame");
 
         assert_eq!(frame.width as usize, w);
@@ -3545,6 +3589,10 @@ mod tests {
                 Err(e) => panic!("decode_nal error: {e}"),
             }
         }
+        if let Some(f) = decoder.flush() {
+            assert!(frame.is_none(), "fixture has only one frame");
+            frame = Some(f);
+        }
         let frame = frame.expect("expected one decoded frame");
 
         assert_eq!(frame.width as usize, w);
@@ -3622,6 +3670,10 @@ mod tests {
                 assert!(frame.is_none(), "fixture has only one frame");
                 frame = Some(f);
             }
+        }
+        while let Some(f) = decoder.flush() {
+            assert!(frame.is_none(), "fixture has only one frame");
+            frame = Some(f);
         }
         let frame = frame.expect("expected one decoded frame");
         assert_eq!(frame.width, 64);
@@ -3710,6 +3762,10 @@ mod tests {
                 assert!(frame.is_none(), "fixture has only one frame");
                 frame = Some(f);
             }
+        }
+        while let Some(f) = decoder.flush() {
+            assert!(frame.is_none(), "fixture has only one frame");
+            frame = Some(f);
         }
         let frame = frame.expect("expected one decoded frame");
         assert_eq!(frame.width as usize, w);
@@ -3841,6 +3897,10 @@ mod tests {
                 frame = Some(f);
             }
         }
+        while let Some(f) = decoder.flush() {
+            assert!(frame.is_none(), "fixture has only one frame");
+            frame = Some(f);
+        }
         let frame = frame.expect("expected one decoded frame");
         assert_eq!(frame.width as usize, w);
         assert_eq!(frame.height as usize, h);
@@ -3925,6 +3985,9 @@ mod tests {
                 Ok(None) => {}
                 Err(e) => panic!("decode_nal failed: {:?}", e),
             }
+        }
+        while let Some(f) = decoder.flush() {
+            frames.push(f);
         }
 
         assert!(
@@ -4018,6 +4081,9 @@ mod tests {
                 Ok(None) => {}
                 Err(e) => panic!("decode_nal failed: {:?}", e),
             }
+        }
+        while let Some(f) = decoder.flush() {
+            frames.push(f);
         }
 
         assert_eq!(
@@ -5110,29 +5176,6 @@ mod tests {
     /// with errors (fuzz fixtures) must match too.
     #[test]
     fn threaded_decode_matches_single_thread() {
-        fn decode(data: &[u8], threads: usize) -> Vec<(i32, Vec<u8>)> {
-            let mut dec = Decoder::new().with_threads(threads);
-            let mut out = Vec::new();
-            let mut take = |f: Frame| {
-                let mut bytes = Vec::new();
-                for plane in [&f.y, &f.u, &f.v] {
-                    match plane {
-                        PixelData::U8(p) => bytes.extend_from_slice(p),
-                        PixelData::U16(p) => bytes.extend(p.iter().flat_map(|s| s.to_le_bytes())),
-                    }
-                }
-                out.push((f.pic_order_cnt, bytes));
-            };
-            for nal in parse_annex_b(data) {
-                if let Ok(Some(f)) = dec.decode_nal(&nal) {
-                    take(f);
-                }
-            }
-            while let Some(f) = dec.flush() {
-                take(f);
-            }
-            out
-        }
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata");
         let mut names: Vec<_> = std::fs::read_dir(dir)
             .unwrap()
@@ -5143,10 +5186,11 @@ mod tests {
         assert!(names.len() > 50, "fixtures missing");
         for path in names {
             let data = std::fs::read(&path).unwrap();
-            let single = decode(&data, 1);
+            let nals = parse_annex_b(&data);
+            let single = decode_with_threads(&nals, 1);
             for threads in [2, 3, 7] {
                 assert!(
-                    decode(&data, threads) == single,
+                    decode_with_threads(&nals, threads) == single,
                     "{} differs with {threads} threads",
                     path.display()
                 );
@@ -5187,6 +5231,37 @@ mod tests {
         }
         results.sort();
         (results, frames)
+    }
+
+    /// A small threaded decode for Miri (`cargo +nightly miri test --lib
+    /// threaded_decode_small -- ` with `MIRIFLAGS=-Zmiri-disable-isolation`):
+    /// the first pictures of a WPP stream and of a B-frame stream with 1
+    /// and 3 threads, exercising the wavefront rows of a first picture,
+    /// frame threading with row filters and reference waits, and the
+    /// worker pool, under Miri's aliasing and data-race checks.
+    #[test]
+    fn threaded_decode_small() {
+        for (name, pictures) in [
+            ("rext_rice_wpp_hm_444_96x64.h265", 2),
+            ("bframes3_128x128.h265", 3),
+        ] {
+            let data = read_fixture(name);
+            let mut nals = parse_annex_b(&data);
+            // Parameter sets plus the first `pictures` pictures.
+            let mut seen = 0;
+            nals.retain(|n| {
+                if n.nal_unit_type.is_vcl() && n.rbsp.first().is_some_and(|b| b & 0x80 != 0) {
+                    seen += 1;
+                }
+                seen <= pictures
+            });
+            let single = decode_with_threads(&nals, 1);
+            assert!(!single.1.is_empty(), "{name}: no frames");
+            assert!(
+                decode_with_threads(&nals, 3) == single,
+                "{name} differs with 3 threads"
+            );
+        }
     }
 
     /// Wavefront decoding of damaged WPP streams matches sequential
@@ -5503,6 +5578,7 @@ mod tests {
         for nal in parse_annex_b(&data) {
             dec.decode_nal(&nal).unwrap();
         }
+        while dec.flush().is_some() {}
         assert!(
             dec.pool.state_u8.is_some(),
             "finished picture state not kept"
@@ -5600,6 +5676,9 @@ mod tests {
             if let Some(f) = decoder.decode_nal(nal).unwrap() {
                 frames.push(f);
             }
+        }
+        while let Some(f) = decoder.flush() {
+            frames.push(f);
         }
         assert_eq!(frames.len(), 1);
         assert_eq!((frames[0].width, frames[0].height), (100, 68));

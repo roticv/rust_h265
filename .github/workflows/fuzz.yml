@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [decode_annex_b, parse_nal_headers, decode_single_nal, decode_hvcc]
+        target: [decode_annex_b, parse_nal_headers, decode_single_nal, decode_hvcc, decode_threaded]
     steps:
       - uses: actions/checkout@v4
 
