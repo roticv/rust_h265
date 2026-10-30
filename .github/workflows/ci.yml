@@ -75,7 +75,7 @@ jobs:
         with:
           components: miri, rust-src
       - name: Unsafe module and thread pool tests
-        run: cargo miri test --lib -- shared:: parallel::
+        run: 'cargo miri test --lib -- shared:: parallel::'
       - name: Small threaded decode
         run: cargo miri test --lib threaded_decode_small
         env:

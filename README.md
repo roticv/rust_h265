@@ -146,6 +146,14 @@ while let Some(frame) = decoder.flush() {
 }
 ```
 
+**Always end with `flush()`.** A picture's slices can arrive over several
+`decode_nal` calls, so a picture ends only when the next one starts, at an
+access unit delimiter, end-of-sequence or end-of-bitstream NAL unit, or at
+`flush()`; the last picture of a stream comes out of `flush()`. With
+`with_threads(n > 1)` frames come out a little later still, while pictures
+decode ahead on other threads, and errors in slice data found after the
+last NAL unit come from `next_error()`.
+
 The dropped pictures are those with `pic_output_flag = 0`, skipped RASL
 pictures, and pictures still waiting when an IRAP picture with
 `NoOutputOfPriorPicsFlag = 1` starts a new coded video sequence. This mode

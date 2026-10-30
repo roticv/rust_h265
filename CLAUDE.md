@@ -45,6 +45,7 @@ use rust_h265::{Decoder, Frame, DecodeError, parse_annex_b, parse_hvcc, parse_na
 - `parse_nal(&[u8])` — parse a single raw NAL (no framing)
 - `Frame` has `y: PixelData`, `u: PixelData`, `v: PixelData`, `width`, `height`, `bit_depth`, `pic_order_cnt`
 - `PixelData::U8(Vec<u8>)` for 8-bit, `PixelData::U16(Vec<u16>)` for 10-bit
+- `with_threads(n)`: frame threading + row-level reference progress (+ wavefront rows for a picture with nothing to overlap); output identical for every thread count. Slice-data errors may come from a later `decode_nal` or from `next_error()`. A picture ends at the next picture's first slice, AUD / EOS / EOB, or `flush()` (any thread count), so the last frame always comes from `flush()`.
 - Frames emitted in **decode order** by default — callers sort by POC within each CVS. `Decoder::new().with_display_order()` runs the spec C.5.2 output process instead (`output.rs`): `decode_nal` returns `Ok(None)`, frames come from `next_output()` and, at the end, `flush()` until `None`. `dump_frames` uses display order (`--decode-order` for the old path)
 
 ### Module layout
