@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-30
+
+Multithreaded decoding. Frames per second on the Big Buck Bunny
+fixtures, Apple M4 (4 performance and 6 efficiency cores), with
+`Decoder::with_threads(n)` and FFmpeg 9.0.2 with `-threads n`:
+
+| Fixture | 1 thread | 4 threads | 8 threads | FFmpeg, 4 threads |
+|---|---:|---:|---:|---:|
+| 1080p `safe` preset | 387 | 1157 | 1414 | 1482 |
+| 720p `safe` preset | 705 | 2223 | 2626 | 2927 |
+| 1080p `medium` preset | 298 | 769 | 892 | 952 |
+| 1080p `slow` preset | 293 | 765 | 884 | 923 |
+| 1080p 10-bit `safe` | 298 | 914 | 1076 | 686 |
+| 1080p 10-bit `medium` | 238 | 586 | 714 | 456 |
+
+The output is identical for every thread count, including for damaged
+streams. Single-threaded speed is unchanged from 0.3.0. Note the changed
+picture-end timing (under Changed): end every stream with `flush()`.
+
 ### Added
 
 - **Multithreaded decoding:** `Decoder::with_threads(n)` (default 1).
