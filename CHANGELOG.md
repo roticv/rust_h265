@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `with_threads(n)` with `n > 1` could hang on a damaged stream whose
+  reference picture set names the current picture's own POC: the
+  picture, already in the DPB, was put in its own reference lists and
+  motion compensation waited forever for its own final rows. Reference
+  lists now skip the current picture, as sequential decoding does (found
+  by the `decode_threaded` fuzz target;
+  `testdata/fuzz_threaded_self_reference.h265`).
+
 ## [0.4.0] - 2026-10-30
 
 Multithreaded decoding. Frames per second on the Big Buck Bunny

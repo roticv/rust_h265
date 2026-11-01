@@ -1851,7 +1851,13 @@ impl Decoder {
             self.current_ref_list_l0.clear();
             self.current_ref_list_l1.clear();
             if sh.slice_type != SliceType::I {
-                let (l0, l1) = Self::build_ref_pic_lists(&self.current_rps, &self.dpb, &sh)?;
+                // With frame threading the picture is in the DPB already.
+                let current = match self.current_picture.as_ref().map(|p| &p.side) {
+                    Some(PictureSide::Thread(t)) => Some(&t.picture),
+                    _ => None,
+                };
+                let (l0, l1) =
+                    Self::build_ref_pic_lists(&self.current_rps, &self.dpb, &sh, current)?;
                 self.current_ref_list_l0 = l0;
                 self.current_ref_list_l1 = l1;
             }
@@ -2476,6 +2482,7 @@ impl Decoder {
         rps: &ReferencePictureSets,
         dpb: &DecodedPictureBuffer,
         sh: &SliceHeader,
+        current: Option<&Arc<DecodedPicture>>,
     ) -> Result<RefPicLists, DecodeError> {
         let num_poc_total_curr = rps.num_poc_total_curr();
         let active_l0 = sh.num_ref_idx_l0_active_minus1 as usize + 1;
@@ -2488,7 +2495,7 @@ impl Decoder {
             &sh.ref_pic_list_modification.list_entry_l0,
             active_l0,
         )?;
-        let l0 = resolve_ref_pics(dpb, &l0_pocs)?;
+        let l0 = resolve_ref_pics(dpb, &l0_pocs, current)?;
 
         let l1 = if sh.slice_type == SliceType::B {
             let active_l1 = sh.num_ref_idx_l1_active_minus1 as usize + 1;
@@ -2501,7 +2508,7 @@ impl Decoder {
                 &sh.ref_pic_list_modification.list_entry_l1,
                 active_l1,
             )?;
-            resolve_ref_pics(dpb, &l1_pocs)?
+            resolve_ref_pics(dpb, &l1_pocs, current)?
         } else {
             Vec::new()
         };
@@ -2816,7 +2823,7 @@ mod tests {
             RefPicListModification::default(),
         );
 
-        let (l0, l1) = Decoder::build_ref_pic_lists(&rps, &dpb, &sh).expect("build lists");
+        let (l0, l1) = Decoder::build_ref_pic_lists(&rps, &dpb, &sh, None).expect("build lists");
         assert_eq!(l0.len(), 2);
         assert_eq!(l0[0].poc, 8);
         assert_eq!(l0[1].poc, 6);
@@ -2846,7 +2853,7 @@ mod tests {
             RefPicListModification::default(),
         );
 
-        let (l0, l1) = Decoder::build_ref_pic_lists(&rps, &dpb, &sh).expect("build lists");
+        let (l0, l1) = Decoder::build_ref_pic_lists(&rps, &dpb, &sh, None).expect("build lists");
         assert_eq!(l0.len(), 2);
         assert_eq!(l0[0].poc, 8);
         assert_eq!(l0[1].poc, 12);
@@ -2877,7 +2884,7 @@ mod tests {
         };
 
         let sh = test_slice_header_for_ref_lists(SliceType::P, 1, 0, modif);
-        let (l0, _l1) = Decoder::build_ref_pic_lists(&rps, &dpb, &sh).expect("build lists");
+        let (l0, _l1) = Decoder::build_ref_pic_lists(&rps, &dpb, &sh, None).expect("build lists");
         assert_eq!(l0.len(), 2);
         assert_eq!(l0[0].poc, 6);
         assert_eq!(l0[1].poc, 8);
@@ -2905,7 +2912,7 @@ mod tests {
             0,
             RefPicListModification::default(),
         );
-        let (l0, _l1) = Decoder::build_ref_pic_lists(&rps, &dpb, &sh).expect("build lists");
+        let (l0, _l1) = Decoder::build_ref_pic_lists(&rps, &dpb, &sh, None).expect("build lists");
         assert_eq!(l0.len(), 5);
         let pocs: Vec<i32> = l0.iter().map(|p| p.poc).collect();
         assert_eq!(pocs, vec![8, 6, 8, 6, 8]);
@@ -2925,7 +2932,7 @@ mod tests {
         let dpb = DecodedPictureBuffer::new();
         let sh =
             test_slice_header_for_ref_lists(SliceType::P, 0, 0, RefPicListModification::default());
-        assert!(Decoder::build_ref_pic_lists(&rps, &dpb, &sh).is_err());
+        assert!(Decoder::build_ref_pic_lists(&rps, &dpb, &sh, None).is_err());
     }
 
     /// **Phase 2d byte-exact test**: feed `testdata/tiny_intra.h265` through

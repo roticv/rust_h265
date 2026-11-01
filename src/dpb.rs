@@ -578,38 +578,35 @@ pub fn apply_ref_pic_list_modification(
     Ok(out)
 }
 
-/// resolve a list of reference-picture POCs to actual DPB
-/// entries. Each POC in the list must be present in the DPB; an
-/// unresolved POC is a hard error. Matches FFmpeg's `find_ref_idx`
-/// behavior when no "generate missing ref" fallback is required.
-/// Look up each POC in the DPB, returning the corresponding pictures.
+/// Look up each reference-picture POC in the DPB: a short-term reference
+/// first, then a long-term one, then any picture with that POC (marking may
+/// not have settled for a damaged stream). An unresolved POC is an error.
 ///
-/// Only returns pictures that are currently marked as a reference (ShortTerm
-/// or LongTerm). This ensures that the ref lists only contain pictures that
-/// the RPS marking step actually retained — matching FFmpeg's behavior where
-/// `find_ref_idx` checks the marking status.
+/// `current` is the picture being decoded, which frame threading puts in
+/// the DPB at its first slice: it is skipped, so the lists are those of a
+/// sequential decode (where it enters the DPB once finished) even for a
+/// damaged RPS naming the current POC. A picture listing itself would wait
+/// forever for its own final rows.
 pub fn resolve_ref_pics(
     dpb: &DecodedPictureBuffer,
     pocs: &[i32],
+    current: Option<&Arc<DecodedPicture>>,
 ) -> Result<Vec<Arc<DecodedPicture>>, crate::error::DecodeError> {
+    let candidates = |poc: i32| {
+        dpb.pictures()
+            .iter()
+            .filter(move |p| p.poc == poc && !current.is_some_and(|c| Arc::ptr_eq(c, p)))
+    };
     let mut out: Vec<Arc<DecodedPicture>> = Vec::with_capacity(pocs.len());
-    for poc in pocs {
-        // First try ST, then LT, then any-status (fallback for edge cases
-        // where the marking hasn't settled yet, e.g. first slice of a new
-        // picture before apply_rps_marking runs at picture completion).
-        let pic = dpb
-            .find_st_ref(*poc)
+    for &poc in pocs {
+        let pic = candidates(poc)
+            .find(|p| p.reference_status() == PictureReferenceStatus::ShortTerm)
             .or_else(|| {
-                dpb.pictures()
-                    .iter()
-                    .find(|p| {
-                        p.poc == *poc && p.reference_status() == PictureReferenceStatus::LongTerm
-                    })
-                    .cloned()
+                candidates(poc).find(|p| p.reference_status() == PictureReferenceStatus::LongTerm)
             })
-            .or_else(|| dpb.find_by_poc(*poc));
+            .or_else(|| candidates(poc).next());
         match pic {
-            Some(p) => out.push(p),
+            Some(p) => out.push(Arc::clone(p)),
             None => {
                 return Err(crate::error::DecodeError::InvalidSyntax(
                     "reference picture POC not present in DPB",
@@ -831,7 +828,7 @@ mod tests {
         ));
         dpb.insert(p0);
         dpb.insert(p1);
-        let resolved = resolve_ref_pics(&dpb, &[5, 2]).expect("resolve");
+        let resolved = resolve_ref_pics(&dpb, &[5, 2], None).expect("resolve");
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].poc, 5);
         assert_eq!(resolved[1].poc, 2);
@@ -840,7 +837,7 @@ mod tests {
     #[test]
     fn resolve_ref_pics_errors_on_missing_poc() {
         let dpb = DecodedPictureBuffer::new();
-        let err = resolve_ref_pics(&dpb, &[3]);
+        let err = resolve_ref_pics(&dpb, &[3], None);
         assert!(err.is_err());
     }
 
@@ -859,7 +856,7 @@ mod tests {
         // Default status is ShortTerm.
         assert_eq!(p.reference_status(), PictureReferenceStatus::ShortTerm);
         dpb.insert(p);
-        let resolved = resolve_ref_pics(&dpb, &[7]).expect("resolve");
+        let resolved = resolve_ref_pics(&dpb, &[7], None).expect("resolve");
         assert_eq!(resolved[0].poc, 7);
         assert_eq!(
             resolved[0].reference_status(),
@@ -881,7 +878,7 @@ mod tests {
         ));
         p.mark(PictureReferenceStatus::LongTerm);
         dpb.insert(p);
-        let resolved = resolve_ref_pics(&dpb, &[7]).expect("resolve");
+        let resolved = resolve_ref_pics(&dpb, &[7], None).expect("resolve");
         assert_eq!(
             resolved[0].reference_status(),
             PictureReferenceStatus::LongTerm
@@ -904,7 +901,7 @@ mod tests {
         ));
         p.mark(PictureReferenceStatus::UnusedForReference);
         dpb.insert(p);
-        let resolved = resolve_ref_pics(&dpb, &[7]).expect("resolve");
+        let resolved = resolve_ref_pics(&dpb, &[7], None).expect("resolve");
         assert_eq!(resolved[0].poc, 7);
     }
 
