@@ -2276,6 +2276,9 @@ impl Decoder {
                 missing.push((poc, PictureReferenceStatus::LongTerm));
             }
         }
+        // A POC named twice (a damaged RPS) is generated once.
+        missing.sort_unstable_by_key(|&(poc, _)| poc);
+        missing.dedup_by_key(|&mut (poc, _)| poc);
         for (poc, status) in missing {
             let zscan = zscan_table(zscan_cache, sps);
             let mut state = new_picture_state(sps, zscan);
@@ -2285,6 +2288,9 @@ impl Decoder {
             pic.set_output();
             dpb.insert(pic);
         }
+        // At most 16 references plus 15 stand-ins, and the pictures not yet
+        // output or still decoding on their threads.
+        debug_assert!(dpb.len() <= 64, "DPB holds {} pictures", dpb.len());
     }
 
     /// Phase 3d-1: compute a picture's POC from `prev_tid0_poc`, the

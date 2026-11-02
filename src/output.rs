@@ -34,7 +34,8 @@ impl OutputLimits {
             max_num_reorder: reorder as usize,
             // SpsMaxLatencyPictures = sps_max_num_reorder_pics +
             // sps_max_latency_increase_plus1 - 1 (spec 7.4.3.2.1).
-            max_latency_pictures: (plus1 != 0).then(|| reorder + plus1 - 1),
+            // (plus1 itself is any u32 below 2^32 - 1.)
+            max_latency_pictures: (plus1 != 0).then(|| reorder.saturating_add(plus1 - 1)),
             max_dec_pic_buffering: sps.sps_max_dec_pic_buffering_minus1 as usize + 1,
         }
     }

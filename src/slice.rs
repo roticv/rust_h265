@@ -390,6 +390,22 @@ pub fn parse_slice_segment_header(
             if sps.long_term_ref_pics_present_flag {
                 long_term_rps = parse_lt_ref_pic_set(&mut r, sps)?;
             }
+            // 7.4.7.1: the short-term and long-term pictures together fit
+            // in the DPB (every one may be generated if missing, 8.3.3).
+            let st_pics = match &short_term_rps {
+                Some(rps) => rps.num_delta_pocs(),
+                None => sps
+                    .st_ref_pic_sets
+                    .get(short_term_ref_pic_set_idx as usize)
+                    .map_or(0, ShortTermRps::num_delta_pocs),
+            };
+            if st_pics + long_term_rps.poc_lsb_lt.len()
+                > sps.sps_max_dec_pic_buffering_minus1 as usize
+            {
+                return Err(DecodeError::InvalidSyntax(
+                    "reference picture set larger than the DPB",
+                ));
+            }
 
             if sps.sps_temporal_mvp_enabled_flag {
                 slice_temporal_mvp_enabled_flag = r.read_bit()? == 1;
@@ -721,7 +737,7 @@ fn parse_lt_ref_pic_set(
             "num_long_term_sps exceeds SPS count",
         ));
     }
-    let total = num_long_term_sps + num_long_term_pics;
+    let total = num_long_term_sps.saturating_add(num_long_term_pics);
     if total as usize > crate::sps::MAX_LONG_TERM_REF_PICS_SPS * 2 {
         return Err(DecodeError::InvalidSyntax(
             "long-term reference count out of range",

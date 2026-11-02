@@ -842,6 +842,18 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         sps_max_num_reorder_pics = r.read_ue()?;
         sps_max_latency_increase_plus1 = r.read_ue()?;
     }
+    // 7.4.3.2.1 / A.4.2: the DPB holds at most MaxDpbSize = 16 pictures,
+    // and the reorder count is below its size. As FFmpeg, a reorder count
+    // that is too large but possible enlarges the DPB instead.
+    const MAX_DPB_SIZE: u32 = 16;
+    if sps_max_dec_pic_buffering_minus1 >= MAX_DPB_SIZE || sps_max_num_reorder_pics >= MAX_DPB_SIZE
+    {
+        return Err(DecodeError::InvalidSyntax(
+            "sps_max_dec_pic_buffering / num_reorder_pics out of range",
+        ));
+    }
+    sps_max_dec_pic_buffering_minus1 =
+        sps_max_dec_pic_buffering_minus1.max(sps_max_num_reorder_pics);
 
     let log2_min_luma_coding_block_size_minus3 = r.read_ue()?;
     let log2_diff_max_min_luma_coding_block_size = r.read_ue()?;
@@ -968,6 +980,13 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
             num_short_term_ref_pic_sets as usize,
             &st_ref_pic_sets,
         )?;
+        // 7.4.8: a set lists at most sps_max_dec_pic_buffering_minus1
+        // pictures (each one a picture kept in the DPB).
+        if rps.num_delta_pocs() > sps_max_dec_pic_buffering_minus1 as usize {
+            return Err(DecodeError::InvalidSyntax(
+                "st_ref_pic_set larger than the DPB",
+            ));
+        }
         st_ref_pic_sets.push(rps);
     }
 
@@ -1065,6 +1084,148 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SPS of a fixture (one sub-layer) with
+    /// sps_max_dec_pic_buffering_minus1 and sps_max_num_reorder_pics
+    /// replaced.
+    fn sps_with_dpb_fields(fixture: &str, dec_minus1: u32, reorder: u32) -> Vec<u8> {
+        let data =
+            std::fs::read(format!("{}/testdata/{fixture}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let nals = crate::nal::parse_annex_b(&data);
+        let sps = nals
+            .iter()
+            .find(|n| n.nal_unit_type == crate::nal::NalUnitType::Sps)
+            .unwrap();
+        let bits: Vec<bool> = sps
+            .rbsp
+            .iter()
+            .flat_map(|&b| (0..8).map(move |i| b >> (7 - i) & 1 == 1))
+            .collect();
+        let mut pos = 0;
+        let ue = |pos: &mut usize| {
+            let zeros = bits[*pos..].iter().take_while(|&&b| !b).count();
+            let value = bits[*pos + zeros..*pos + 2 * zeros + 1]
+                .iter()
+                .fold(0u32, |v, &b| v << 1 | b as u32);
+            *pos += 2 * zeros + 1;
+            value - 1
+        };
+        // vps id, max_sub_layers_minus1 (0), nesting flag, profile_tier_level.
+        pos += 4 + 3 + 1 + 96;
+        ue(&mut pos); // sps_seq_parameter_set_id
+        if ue(&mut pos) == 3 {
+            pos += 1; // separate_colour_plane_flag
+        }
+        ue(&mut pos); // width
+        ue(&mut pos); // height
+        let conformance_window = bits[pos];
+        pos += 1;
+        if conformance_window {
+            for _ in 0..4 {
+                ue(&mut pos);
+            }
+        }
+        for _ in 0..3 {
+            ue(&mut pos); // bit depths, log2_max_pic_order_cnt_lsb_minus4
+        }
+        pos += 1; // sps_sub_layer_ordering_info_present_flag
+        let start = pos;
+        ue(&mut pos);
+        ue(&mut pos);
+        let write_ue = |out: &mut Vec<bool>, v: u32| {
+            let n = 32 - (v + 1).leading_zeros();
+            out.extend(std::iter::repeat_n(false, n as usize - 1));
+            out.extend((0..n).rev().map(|i| (v + 1) >> i & 1 == 1));
+        };
+        let mut out = bits[..start].to_vec();
+        write_ue(&mut out, dec_minus1);
+        write_ue(&mut out, reorder);
+        out.extend_from_slice(&bits[pos..]);
+        out.chunks(8)
+            .map(|c| {
+                c.iter()
+                    .enumerate()
+                    .fold(0u8, |b, (i, &v)| b | (v as u8) << (7 - i))
+            })
+            .collect()
+    }
+
+    /// A slice's short-term and long-term pictures together fit in the DPB
+    /// (7.4.7.1): x265's first P slice (one reference) with a DPB of one
+    /// picture is rejected.
+    #[test]
+    fn slice_rps_larger_than_dpb_is_rejected() {
+        use crate::nal::NalUnitType;
+        let data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/inter420_100x68.h265"
+        ))
+        .unwrap();
+        let nals = crate::nal::parse_annex_b(&data);
+        let pps_nal = nals.iter().find(|n| n.nal_unit_type == NalUnitType::Pps);
+        let mut pps = crate::pps::parse_pps(&pps_nal.unwrap().rbsp).unwrap();
+        let p_slice = nals
+            .iter()
+            .find(|n| matches!(n.nal_unit_type, NalUnitType::TrailR | NalUnitType::TrailN))
+            .unwrap();
+        for (dec, ok) in [(1, true), (0, false)] {
+            let sps = parse_sps(&sps_with_dpb_fields("inter420_100x68.h265", dec, 0)).expect("SPS");
+            pps.resolve_tile_geometry(&sps).unwrap();
+            let sh = crate::slice::parse_slice_segment_header(
+                &p_slice.rbsp,
+                p_slice.nal_unit_type,
+                &sps,
+                &pps,
+            );
+            match sh {
+                Ok(_) => assert!(ok),
+                Err(e) => {
+                    assert!(!ok);
+                    assert_eq!(
+                        e,
+                        DecodeError::InvalidSyntax("reference picture set larger than the DPB")
+                    );
+                }
+            }
+        }
+    }
+
+    /// The DPB holds at most 16 pictures (A.4.2); a reorder count above
+    /// the DPB size enlarges it (as FFmpeg) unless it is impossible; a
+    /// short-term RPS lists at most sps_max_dec_pic_buffering_minus1
+    /// pictures (7.4.8).
+    #[test]
+    fn dpb_size_limits() {
+        let x265 = |dec, reorder| sps_with_dpb_fields("inter420_100x68.h265", dec, reorder);
+        let ok = parse_sps(&x265(4, 2)).expect("valid DPB fields");
+        assert_eq!(
+            (
+                ok.sps_max_dec_pic_buffering_minus1,
+                ok.sps_max_num_reorder_pics
+            ),
+            (4, 2)
+        );
+        let raised = parse_sps(&x265(4, 6)).expect("reorder above DPB size");
+        assert_eq!(raised.sps_max_dec_pic_buffering_minus1, 6);
+        for (dec, reorder) in [(16, 0), (4, 16), (u32::MAX - 1, 0)] {
+            assert!(matches!(
+                parse_sps(&x265(dec, reorder)),
+                Err(DecodeError::InvalidSyntax(
+                    "sps_max_dec_pic_buffering / num_reorder_pics out of range"
+                ))
+            ));
+        }
+        // HM codes its RPSs in the SPS (x265 in the slice headers).
+        let hm = |dec| sps_with_dpb_fields("rext_chroma_qp_adj_dep_hm_444_96x64.h265", dec, 0);
+        let hm_ok = parse_sps(&hm(4)).expect("HM SPS");
+        assert!(hm_ok.st_ref_pic_sets.iter().any(|s| s.num_delta_pocs() > 0));
+        assert!(matches!(
+            parse_sps(&hm(0)),
+            Err(DecodeError::InvalidSyntax(
+                "st_ref_pic_set larger than the DPB"
+            ))
+        ));
+    }
 
     #[test]
     fn rejects_conformance_window_beyond_picture() {

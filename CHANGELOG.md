@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- DPB limits are enforced: `sps_max_dec_pic_buffering_minus1` and
+  `sps_max_num_reorder_pics` are below 16 (a reorder count above the DPB
+  size enlarges it, as in FFmpeg), and a reference picture set, in the
+  SPS or a slice header (with its long-term pictures), fits in the DPB.
+  A damaged stream could name about 100 missing references per picture,
+  each generated as a full-size picture. A POC named twice is generated
+  once, and the latency limit no longer overflows.
 - A new SPS changing the picture size or CTB size without an IRAP picture
   kept the old pictures as references: temporal MV prediction then read
   the collocated picture's motion field with the current picture's
