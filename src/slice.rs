@@ -337,6 +337,10 @@ pub fn parse_slice_segment_header(
                 return Err(DecodeError::InvalidSyntax("invalid slice_type"));
             }
         };
+        // 7.4.7.1: the slices of an IRAP picture are I slices.
+        if nal_unit_type.is_irap() && slice_type != SliceType::I {
+            return Err(DecodeError::InvalidSyntax("inter slice in an IRAP picture"));
+        }
 
         if pps.output_flag_present_flag {
             pic_output_flag = r.read_bit()? == 1;

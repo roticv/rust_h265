@@ -1602,6 +1602,7 @@ impl Decoder {
         // (populated above) — we only compute it once per picture (on the
         // first, independent slice).
         let mut starts_new_sequence = false;
+        let mut irap_no_rasl_output = false;
         if sh.first_slice_segment_in_pic_flag {
             // Spec 8.1.3: an IRAP picture has NoRaslOutputFlag = 1 when it
             // is IDR, BLA, the first picture in the bitstream, or the first
@@ -1613,6 +1614,7 @@ impl Decoder {
             // C.5.2.2: an IRAP with NoRaslOutputFlag = 1 other than the
             // first picture ends output of the previous sequence.
             starts_new_sequence = no_rasl_output_flag && self.seen_picture;
+            irap_no_rasl_output = no_rasl_output_flag;
             if nut.is_irap() {
                 // RASL pictures are skipped after any IRAP with NoRaslOutputFlag
                 // = 1: a BLA always, a CRA that starts decoding (spec 8.1.3).
@@ -1750,7 +1752,23 @@ impl Decoder {
                 let log2_max_poc_lsb = sps_for_rps.log2_max_pic_order_cnt_lsb;
                 let mut rps =
                     Self::derive_rps_from_slice_header_parts(&sh, &sps_st_rps, log2_max_poc_lsb);
-                Self::apply_rps_marking(&mut rps, &self.dpb, log2_max_poc_lsb);
+                if nut.is_irap() {
+                    // An IRAP picture predicts from nothing: its Curr sets
+                    // are empty (8.3.2), so no reference is generated for
+                    // them.
+                    rps.st_curr_before.clear();
+                    rps.st_curr_after.clear();
+                    rps.lt_curr.clear();
+                }
+                if irap_no_rasl_output {
+                    // 8.3.2: a picture starting a coded video sequence marks
+                    // every picture in the DPB unused; its RPS names only
+                    // pictures that will never be decoded (8.3.3), not
+                    // older pictures that happen to share a POC.
+                    self.dpb.unmark_all_references();
+                } else {
+                    Self::apply_rps_marking(&mut rps, &self.dpb, log2_max_poc_lsb);
+                }
                 self.current_rps = rps;
 
                 // Output process before decoding the picture (C.5.2.2).
@@ -1865,6 +1883,16 @@ impl Decoder {
                 };
                 let (l0, l1) =
                     Self::build_ref_pic_lists(&self.current_rps, &self.dpb, &sh, current)?;
+                // The DPB is cleared when the picture geometry changes, and
+                // missing references are generated with the current SPS.
+                debug_assert!(l0.iter().chain(&l1).all(|p| {
+                    (p.width, p.height, p.log2_ctb_size)
+                        == (
+                            sps.pic_width_in_luma_samples,
+                            sps.pic_height_in_luma_samples,
+                            sps.ctb_log2_size_y,
+                        )
+                }));
                 self.current_ref_list_l0 = l0;
                 self.current_ref_list_l1 = l1;
             }
@@ -2443,11 +2471,21 @@ impl Decoder {
             Some(Err(e)) => return Err(e.clone()),
             None => return Err(DecodeError::InvalidSyntax("PPS refers to a missing SPS")),
         };
-        // A bit-depth change invalidates every picture in the DPB.
-        // References must share the sample type and chroma geometry of
-        // the pictures predicted from them (motion compensation reads them
-        // with the current picture's chroma subsampling).
-        let format = |s: &Sps| (s.bit_depth_luma, s.bit_depth_chroma, s.chroma_format_idc);
+        // A change of picture format or geometry invalidates every picture
+        // in the DPB (as FFmpeg clears its references on an SPS change; in
+        // a conforming stream a new SPS starts a CVS anyway). References
+        // must share the sample type and chroma geometry of the pictures
+        // predicted from them (motion compensation reads them with the
+        // current picture's chroma subsampling), and temporal MV
+        // prediction indexes the collocated motion field and slice map
+        // with the current picture's coordinates and CTB size.
+        let format = |s: &Sps| {
+            (
+                (s.bit_depth_luma, s.bit_depth_chroma, s.chroma_format_idc),
+                (s.pic_width_in_luma_samples, s.pic_height_in_luma_samples),
+                (s.ctb_log2_size_y, s.min_cb_log2_size_y),
+            )
+        };
         let old_format = self.sps.as_deref().map(format);
         if old_format.is_some() && old_format != Some(format(&sps)) {
             self.dpb.clear();
@@ -5264,6 +5302,54 @@ mod tests {
             assert!(!plain.1.is_empty());
             assert!(decode_with_threads(&layered, threads) == plain);
         }
+    }
+
+    /// The slices of an IRAP picture are I slices (7.4.7.1): a P picture
+    /// relabelled as a CRA (with the no_output_of_prior_pics_flag bit an
+    /// IRAP slice header has after its first bit) is rejected.
+    #[test]
+    fn inter_slice_in_irap_is_rejected() {
+        let data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/inter420_100x68.h265"
+        ))
+        .unwrap();
+        let nals = parse_annex_b(&data);
+        let mut dec = Decoder::new();
+        let mut errors = Vec::new();
+        let mut relabelled = false;
+        for nal in &nals {
+            let mut nal_unit_type = nal.nal_unit_type;
+            let mut rbsp = nal.rbsp.to_vec();
+            if !relabelled && matches!(nal_unit_type, NalUnitType::TrailR | NalUnitType::TrailN) {
+                nal_unit_type = NalUnitType::Cra;
+                relabelled = true;
+                // Insert a 0 bit after the first: shift the rest right.
+                let mut shifted = vec![rbsp[0] & 0x80];
+                shifted.resize(rbsp.len() + 1, 0);
+                for (i, &b) in rbsp.iter().enumerate() {
+                    let rest = if i == 0 { b & 0x7f } else { b };
+                    shifted[i] |= rest >> 1;
+                    shifted[i + 1] |= rest << 7;
+                }
+                rbsp = shifted;
+            }
+            let nal = NalUnit {
+                nal_unit_type,
+                nuh_layer_id: 0,
+                temporal_id: 0,
+                rbsp: std::borrow::Cow::Owned(rbsp),
+                epb_positions: nal.epb_positions.clone(),
+            };
+            if let Err(e) = dec.decode_nal(&nal) {
+                errors.push(e);
+            }
+        }
+        assert!(relabelled);
+        assert_eq!(
+            errors,
+            [DecodeError::InvalidSyntax("inter slice in an IRAP picture")]
+        );
     }
 
     /// Decode `nals` with `threads` threads; returns the errors (as text, so

@@ -1947,6 +1947,11 @@ fn temporal_luma_motion_vector<P: Pixel>(
 
     let col_pic_poc = col_ref.poc;
     let min_pu_width = col_ref.min_pu_width;
+    // A position outside the collocated picture (a damaged stream can give
+    // it other dimensions: references are cleared when the size changes,
+    // but stay defensive) has no motion; indexing its motion field with
+    // the current picture's coordinates would wrap into rows not waited for.
+    let inside = |x: usize, y: usize| x < col_ref.width as usize && y < col_ref.height as usize;
     let log2_min_pu = col_ref.log2_min_pu_size;
     let log2_ctb = state.log2_ctb_size;
 
@@ -1966,7 +1971,7 @@ fn temporal_luma_motion_vector<P: Pixel>(
         let yc = (ybr & !15) as usize;
         let x_pu = xc >> log2_min_pu;
         let y_pu = yc >> log2_min_pu;
-        if y_pu * min_pu_width + x_pu < col_ref.tab_mvf.len() {
+        if inside(xc, yc) && y_pu * min_pu_width + x_pu < col_ref.tab_mvf.len() {
             let temp_col = col_ref.tab_mvf[y_pu * min_pu_width + x_pu];
             result = derive_temporal_colocated_mvs(
                 temp_col,
@@ -1985,7 +1990,7 @@ fn temporal_luma_motion_vector<P: Pixel>(
         let yc = ((y0 + (n_pb_h >> 1)) & !15) as usize;
         let x_pu = xc >> log2_min_pu;
         let y_pu = yc >> log2_min_pu;
-        if y_pu * min_pu_width + x_pu < col_ref.tab_mvf.len() {
+        if inside(xc, yc) && y_pu * min_pu_width + x_pu < col_ref.tab_mvf.len() {
             let temp_col = col_ref.tab_mvf[y_pu * min_pu_width + x_pu];
             result = derive_temporal_colocated_mvs(
                 temp_col,

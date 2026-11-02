@@ -290,6 +290,41 @@ impl DecodedRows {
         self.w_ctbs > 0 && rs / self.w_ctbs < self.rows
     }
 
+    /// The first CTB at or after `start` that a slice segment starting
+    /// there would find frozen (in a complete row) when it reaches it,
+    /// decoding CTBs in raster order: the CTB where the sequential loop
+    /// stops with an overlap error. Depends only on the CTBs decoded
+    /// before the segment, so the wavefront path, which decodes the rows
+    /// concurrently, stops at the same CTB.
+    ///
+    /// Row `r` is complete when CTB `rs` of it is reached only if every
+    /// CTB above and before `rs` is decoded (by earlier segments, or by
+    /// this one, which covers `[start, rs)`) and so is the rest of row `r`
+    /// from `rs` on (earlier segments alone).
+    pub(crate) fn first_frozen(&self, start: usize) -> Option<usize> {
+        let len = self.decoded.len();
+        if self.w_ctbs == 0 || self.decoded[..start.min(len)].iter().any(|&d| !d) {
+            // A CTB before the segment is missing: no row from there on
+            // completes before the segment ends.
+            return None;
+        }
+        let mut row = start / self.w_ctbs;
+        while row * self.w_ctbs < len {
+            let (row_start, row_end) = (row * self.w_ctbs, (row + 1) * self.w_ctbs);
+            // The row's decoded tail: CTBs from `tail` to the row's end.
+            let tail = (row_start..row_end)
+                .rev()
+                .find(|&rs| !self.decoded[rs])
+                .map_or(row_start, |rs| rs + 1);
+            let first = tail.max(start);
+            if first < row_end {
+                return Some(first);
+            }
+            row += 1;
+        }
+        None
+    }
+
     /// CTB `rs` is decoded. Returns whether that completed CTB rows.
     pub(crate) fn mark(&mut self, rs: usize) -> bool {
         if rs >= self.decoded.len() || self.decoded[rs] {
@@ -302,5 +337,47 @@ impl DecodedRows {
             self.rows += 1;
         }
         self.rows > before
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DecodedRows;
+
+    /// `first_frozen` matches the sequential loop: decode CTBs one by one
+    /// from `start`, stopping at the first one in a complete row. Random
+    /// maps of CTBs decoded by earlier segments, 4×3 CTBs.
+    #[test]
+    fn first_frozen_matches_sequential_decoding() {
+        let (w, h) = (4, 3);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..20000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let start = (seed >> 40) as usize % (w * h);
+            let mut rows = DecodedRows::new(w, h);
+            for rs in 0..w * h {
+                if seed >> rs & 1 == 1 {
+                    rows.mark(rs);
+                }
+            }
+            let expected = (start..w * h).find(|&rs| {
+                let frozen = rows.frozen(rs);
+                rows.mark(rs);
+                frozen
+            });
+            let mut fresh = DecodedRows::new(w, h);
+            for rs in 0..w * h {
+                if seed >> rs & 1 == 1 {
+                    fresh.mark(rs);
+                }
+            }
+            assert_eq!(
+                fresh.first_frozen(start),
+                expected,
+                "map {seed:x} start {start}"
+            );
+        }
     }
 }

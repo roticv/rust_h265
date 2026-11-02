@@ -235,9 +235,12 @@ pub(crate) fn decode_rows<P: Pixel>(
     // that `progress` reports finished (it waits for column `c + 1` of the
     // row above before decoding column `c`); in test builds `AccessCheck`
     // asserts this for every access.
-    // CTB rows complete before this slice: not to be rewritten (as in the
-    // sequential loop; rows this slice completes are behind it).
-    let frozen_rows = state.decoded_rows.rows();
+    // The CTB at which the sequential loop would find a complete row (the
+    // segment overlaps CTBs decoded before it) and stop: the same here.
+    let frozen_from = state
+        .decoded_rows
+        .first_frozen(start_rs as usize)
+        .unwrap_or(usize::MAX);
     let workers: Vec<PictureState<P>> = (0..n_workers)
         .map(|_| unsafe { state.worker_view() })
         .collect();
@@ -328,7 +331,7 @@ pub(crate) fn decode_rows<P: Pixel>(
                 outcome.end = RowEnd::Failed(DecodeError::InvalidSyntax("discarded"));
                 break;
             }
-            if r < frozen_rows {
+            if r * w + c >= frozen_from {
                 fail(
                     &mut outcome,
                     DecodeError::InvalidSyntax("slice segment overlaps CTB rows already decoded"),

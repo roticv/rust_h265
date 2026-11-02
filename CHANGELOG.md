@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A new SPS changing the picture size or CTB size without an IRAP picture
+  kept the old pictures as references: temporal MV prediction then read
+  the collocated picture's motion field with the current picture's
+  coordinates, rows it had not waited for under frame threading. The DPB
+  is now cleared on any change of picture geometry, as FFmpeg does
+  (`testdata/fuzz_resize_without_irap.h265`).
+- With `with_threads(n)`, a WPP slice segment overlapping CTBs decoded by
+  an earlier one could be accepted where sequential decoding rejected it
+  (the wavefront path only checked the CTB rows complete when the segment
+  started). Both now stop at the same CTB.
+- Inter slices in IRAP pictures are rejected (7.4.7.1), an IRAP picture's
+  reference picture set no longer generates stand-in references, and an
+  IRAP picture starting a coded video sequence marks every earlier
+  picture unused (8.3.2) instead of keeping those whose POC its RPS names.
 - NAL units of layers other than the base layer (`nuh_layer_id > 0`, as
   in SHVC and MV-HEVC streams such as stereo video) are ignored, as the
   spec requires. They were decoded as base-layer data: their parameter

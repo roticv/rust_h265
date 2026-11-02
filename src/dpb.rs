@@ -314,6 +314,9 @@ impl DecodedPicture {
     /// Reference lists in effect at luma position `(x, y)`: those of the
     /// slice containing that CTB, or `None` without per-slice information.
     pub fn ref_lists_at(&self, x: u32, y: u32) -> Option<&SliceRefLists> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
         let ctb = 1u32 << self.log2_ctb_size;
         let w_ctbs = self.width.div_ceil(ctb);
         let rs = ((y / ctb) * w_ctbs + x / ctb) as usize;
