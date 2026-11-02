@@ -1380,6 +1380,12 @@ impl Decoder {
     }
 
     fn decode_nal_inner(&mut self, nal: &NalUnit<'_>) -> Result<Option<Frame>, DecodeError> {
+        // Spec 7.4.2.2: a decoder of the base layer ignores NAL units with
+        // nuh_layer_id > 0 (the layers of SHVC / MV-HEVC streams, such as
+        // the second view of stereo video), parameter sets included.
+        if nal.nuh_layer_id > 0 {
+            return Ok(None);
+        }
         match nal.nal_unit_type {
             NalUnitType::Vps => {
                 self.vps = Some(parse_vps(&nal.rbsp)?);
@@ -1563,6 +1569,7 @@ impl Decoder {
             sh.slice_qp_y = parent.slice_qp_y;
             sh.slice_cb_qp_offset = parent.slice_cb_qp_offset;
             sh.slice_cr_qp_offset = parent.slice_cr_qp_offset;
+            sh.cu_chroma_qp_offset_enabled_flag = parent.cu_chroma_qp_offset_enabled_flag;
             sh.slice_deblocking_filter_disabled_flag = parent.slice_deblocking_filter_disabled_flag;
             sh.slice_beta_offset_div2 = parent.slice_beta_offset_div2;
             sh.slice_tc_offset_div2 = parent.slice_tc_offset_div2;
@@ -2345,12 +2352,7 @@ impl Decoder {
         let max_poc_lsb = 1i32 << log2_max_pic_order_cnt_lsb;
         let cur_poc = sh.poc;
         let cur_poc_lsb = sh.slice_pic_order_cnt_lsb as i32;
-        let num_lt_sps = sh.long_term_rps.poc_lsb_lt.len()
-            - sh.long_term_rps
-                .poc_lsb_lt
-                .len()
-                .min(sh.long_term_rps.delta_poc_msb_cycle_lt.len());
-        let _ = num_lt_sps; // suppress unused warning
+        let num_lt_sps = sh.long_term_rps.num_long_term_sps;
         let mut prev_delta_msb: i64 = 0;
 
         for (i, poc_lsb) in sh.long_term_rps.poc_lsb_lt.iter().enumerate() {
@@ -2362,17 +2364,18 @@ impl Decoder {
                 .unwrap_or(false);
 
             let ref_poc = if msb_present {
-                // Accumulate delta_poc_msb_cycle_lt per spec 7.4.7.1.
-                // FFmpeg: `if (i && i != nb_sps) delta += prev_delta_msb;`
-                // We don't track nb_sps separately — just accumulate when
-                // the entry isn't the first overall or first inline entry.
+                // DeltaPocMsbCycleLt (spec 7.4.7.1 eq. 7-52) accumulates
+                // within the SPS entries and within the slice-coded ones,
+                // restarting at the first of each. As HM and FFmpeg
+                // (`if (i && i != nb_sps) delta += prev_delta_msb;`), only
+                // entries with an MSB carry the sum.
                 let raw_delta = sh
                     .long_term_rps
                     .delta_poc_msb_cycle_lt
                     .get(i)
                     .copied()
                     .unwrap_or(0) as i64;
-                let delta = if i > 0 {
+                let delta = if i > 0 && i != num_lt_sps {
                     raw_delta + prev_delta_msb
                 } else {
                     raw_delta
@@ -2787,6 +2790,28 @@ mod tests {
             temporal_id: 0,
             poc: 10,
         }
+    }
+
+    /// DeltaPocMsbCycleLt (eq. 7-52) accumulates within the SPS-candidate
+    /// entries and within the slice-coded ones, restarting at the first
+    /// slice-coded entry. POC 100, MaxPicOrderCntLsb 16 (LSB 4): one SPS
+    /// entry with cycle 1 (POC 84), then slice entries with cycles 2 and 1
+    /// (2 and 2 + 1 = 3 cycles back: POCs 68 and 52).
+    #[test]
+    fn long_term_msb_cycles_restart_at_slice_entries() {
+        let mut sh =
+            test_slice_header_for_ref_lists(SliceType::P, 0, 0, RefPicListModification::default());
+        sh.poc = 100;
+        sh.slice_pic_order_cnt_lsb = 4;
+        sh.long_term_rps = LongTermRefPicSet {
+            poc_lsb_lt: vec![4, 4, 4],
+            used_by_curr_pic_lt_flag: vec![true; 3],
+            delta_poc_msb_present_flag: vec![true; 3],
+            delta_poc_msb_cycle_lt: vec![1, 2, 1],
+            num_long_term_sps: 1,
+        };
+        let rps = Decoder::derive_rps_from_slice_header_parts(&sh, &[], 4);
+        assert_eq!(rps.lt_curr, vec![84, 68, 52]);
     }
 
     fn test_decoded_picture(poc: i32) -> Arc<DecodedPicture> {
@@ -5205,6 +5230,42 @@ mod tests {
         }
     }
 
+    /// NAL units of other layers (nuh_layer_id > 0) are ignored: a copy of
+    /// every NAL unit tagged as layer 1 (which, decoded as the base layer,
+    /// would replace the parameter sets and start or extend pictures)
+    /// leaves the output unchanged.
+    #[test]
+    fn enhancement_layer_nal_units_are_ignored() {
+        let data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/inter420_100x68.h265"
+        ))
+        .unwrap();
+        let nals = parse_annex_b(&data);
+        let mut layered = Vec::new();
+        for nal in &nals {
+            layered.push(NalUnit {
+                nal_unit_type: nal.nal_unit_type,
+                nuh_layer_id: nal.nuh_layer_id,
+                temporal_id: nal.temporal_id,
+                rbsp: std::borrow::Cow::Borrowed(&nal.rbsp[..]),
+                epb_positions: nal.epb_positions.clone(),
+            });
+            layered.push(NalUnit {
+                nal_unit_type: nal.nal_unit_type,
+                nuh_layer_id: 1,
+                temporal_id: nal.temporal_id,
+                rbsp: std::borrow::Cow::Borrowed(&nal.rbsp[..]),
+                epb_positions: nal.epb_positions.clone(),
+            });
+        }
+        for threads in [1, 3] {
+            let plain = decode_with_threads(&nals, threads);
+            assert!(!plain.1.is_empty());
+            assert!(decode_with_threads(&layered, threads) == plain);
+        }
+    }
+
     /// Decode `nals` with `threads` threads; returns the errors (as text, so
     /// they compare; sorted, as frame threading reports slice-data errors
     /// on a later call than sequential decoding does) and every frame,
@@ -5516,6 +5577,10 @@ mod tests {
     ///   transform-skip shift).
     /// - hp_wp: HighPrecisionPredictionWeighting, WeightedPredP, fade-in input.
     /// - chroma_qp_adj: MaxCUChromaQpAdjustmentDepth 1 (chroma QP offset lists).
+    /// - chroma_qp_adj_dep: the same with 16x16 CTUs (MaxCUWidth/Height 16,
+    ///   MaxPartitionDepth 2, QuadtreeTULog2MaxSize 4) and a dependent slice
+    ///   segment every 2 CTUs (SliceSegmentMode 1, SliceSegmentArgument 2):
+    ///   dependent segments inherit cu_chroma_qp_offset_enabled_flag.
     /// - bypass_align: intra only (no GOP, IntraPeriod 1), QP 4, `Profile
     ///   high_throughput_444_16_intra`, AlignCABACBeforeBypass 1 (CABAC
     ///   bypass alignment; FFmpeg does not implement it).
@@ -5545,6 +5610,10 @@ mod tests {
             (
                 "rext_chroma_qp_adj_hm_444_96x64.h265",
                 "3d7cf6860d67488fb42bc6cf5cb713e0920f1699685ff57e1c759c066ee8668a",
+            ),
+            (
+                "rext_chroma_qp_adj_dep_hm_444_96x64.h265",
+                "4081d3ee2eda3e78a8ec1101a96e64d445a450891edb0b319b8038c4b246d761",
             ),
         ] {
             assert_eq!(decode_and_hash(name, 5), expected, "{name} hash mismatch");

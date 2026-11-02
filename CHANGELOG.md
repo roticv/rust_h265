@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- NAL units of layers other than the base layer (`nuh_layer_id > 0`, as
+  in SHVC and MV-HEVC streams such as stereo video) are ignored, as the
+  spec requires. They were decoded as base-layer data: their parameter
+  sets replaced the base layer's and their slices started or extended
+  base-layer pictures.
+- Dependent slice segments inherit `cu_chroma_qp_offset_enabled_flag`
+  from their slice. A range-extensions stream with chroma QP offset lists
+  and dependent slice segments lost CABAC sync (new HM fixture
+  `rext_chroma_qp_adj_dep_hm_444_96x64.h265`).
+- Long-term reference POCs: the MSB cycle sum (`DeltaPocMsbCycleLt`,
+  eq. 7-52) restarts at the first long-term entry coded in the slice
+  header, after the SPS candidates, as in HM and FFmpeg. It carried on,
+  giving a slice using both kinds a wrong reference.
 - `with_threads(n)` with `n > 1` could hang on a damaged stream whose
   reference picture set names the current picture's own POC: the
   picture, already in the DPB, was put in its own reference lists and

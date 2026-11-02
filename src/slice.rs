@@ -43,6 +43,10 @@ pub struct LongTermRefPicSet {
     /// Optional POC MSB delta, per spec 7.4.7.1 "long-term refs".
     pub delta_poc_msb_present_flag: Vec<bool>,
     pub delta_poc_msb_cycle_lt: Vec<u32>,
+    /// `num_long_term_sps`: the first this many entries come from the
+    /// SPS candidates, the rest are coded in the slice header (the MSB
+    /// cycle accumulation restarts at the first of those, eq. 7-52).
+    pub num_long_term_sps: usize,
 }
 
 /// Parsed `ref_pic_list_modification()` syntax (spec 7.3.6.2).
@@ -725,6 +729,7 @@ fn parse_lt_ref_pic_set(
         used_by_curr_pic_lt_flag: Vec::with_capacity(total as usize),
         delta_poc_msb_present_flag: Vec::with_capacity(total as usize),
         delta_poc_msb_cycle_lt: Vec::with_capacity(total as usize),
+        num_long_term_sps: num_long_term_sps as usize,
     };
 
     for i in 0..total {
