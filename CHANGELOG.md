@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lists now skip the current picture, as sequential decoding does (found
   by the `decode_threaded` fuzz target;
   `testdata/fuzz_threaded_self_reference.h265`).
+- An SPS whose picture width or height is not a multiple of the minimum
+  coding block size (spec 7.4.3.2.1) is rejected, as FFmpeg does. It was
+  decoded, and a picture narrower than 4 samples collapsed the
+  boundary-strength grid to one column, so the output depended on when
+  the deblocking filter ran: 1 and 3 threads differed (`decode_threaded`
+  fuzz target; `testdata/fuzz_threaded_width_1.h265`).
 
 ## [0.4.0] - 2026-10-30
 

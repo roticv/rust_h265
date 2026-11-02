@@ -858,6 +858,16 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, DecodeError> {
         return Err(DecodeError::InvalidSyntax("CtbLog2SizeY out of range"));
     }
     let ctb_size_y: u32 = 1 << ctb_log2_size_y;
+    // Spec 7.4.3.2.1: the picture size is a multiple of MinCbSizeY (FFmpeg
+    // rejects it too). The 4×4-grid tables (boundary strengths, motion
+    // field) rely on it: a picture 1 sample wide has a grid 0 units wide.
+    let min_cb_mask = (1u32 << min_cb_log2_size_y) - 1;
+    if pic_width_in_luma_samples & min_cb_mask != 0 || pic_height_in_luma_samples & min_cb_mask != 0
+    {
+        return Err(DecodeError::InvalidSyntax(
+            "pic_width/height_in_luma_samples not a multiple of MinCbSizeY",
+        ));
+    }
 
     let log2_min_luma_transform_block_size_minus2 = r.read_ue()?;
     let log2_diff_max_min_luma_transform_block_size = r.read_ue()?;
