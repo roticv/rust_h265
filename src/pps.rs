@@ -103,7 +103,24 @@ impl Pps {
     /// For `tiles_enabled_flag = 0` this produces a single-tile layout:
     /// `column_widths_in_ctbs = [pic_width_in_ctbs]`,
     /// `row_heights_in_ctbs = [pic_height_in_ctbs]`.
+    ///
+    /// Also checks the PPS values whose range depends on the SPS (7.4.3.3),
+    /// as this runs once per activation.
     pub fn resolve_tile_geometry(&mut self, sps: &Sps) -> Result<(), DecodeError> {
+        let qp_bd_offset_y = 6 * (sps.bit_depth_luma as i32 - 8);
+        let log2_diff_max_min_cb = (sps.ctb_log2_size_y - sps.min_cb_log2_size_y) as u32;
+        if self.init_qp < -qp_bd_offset_y
+            || self.diff_cu_qp_delta_depth > log2_diff_max_min_cb
+            || self.diff_cu_chroma_qp_offset_depth > log2_diff_max_min_cb
+            || self.log2_parallel_merge_level_minus2 + 2 > sps.ctb_log2_size_y as u32
+            || self.log2_max_transform_skip_block_size > sps.max_tb_log2_size_y
+            || self.log2_sao_offset_scale_luma as i32 > (sps.bit_depth_luma as i32 - 10).max(0)
+            || self.log2_sao_offset_scale_chroma as i32 > (sps.bit_depth_chroma as i32 - 10).max(0)
+        {
+            return Err(DecodeError::InvalidSyntax(
+                "PPS value out of range for its SPS",
+            ));
+        }
         let pic_w_ctbs = sps.pic_width_in_ctbs_y() as usize;
         let pic_h_ctbs = sps.pic_height_in_ctbs_y() as usize;
 
@@ -149,6 +166,13 @@ impl Pps {
                 .iter_mut()
                 .zip(self.column_width_minus1.iter())
             {
+                // Each width is below the picture's (7.4.3.3), so the sum
+                // cannot overflow.
+                if *raw as usize >= pic_w_ctbs {
+                    return Err(DecodeError::InvalidSyntax(
+                        "tile column widths sum too large",
+                    ));
+                }
                 *w_i = *raw + 1;
                 sum += *w_i;
             }
@@ -165,6 +189,9 @@ impl Pps {
                 .iter_mut()
                 .zip(self.row_height_minus1.iter())
             {
+                if *raw as usize >= pic_h_ctbs {
+                    return Err(DecodeError::InvalidSyntax("tile row heights sum too large"));
+                }
                 *h_i = *raw + 1;
                 sum += *h_i;
             }
@@ -198,8 +225,18 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
     let cabac_init_present_flag = r.read_bit()? == 1;
     let num_ref_idx_l0_default_active_minus1 = r.read_ue()?;
     let num_ref_idx_l1_default_active_minus1 = r.read_ue()?;
+    // 7.4.3.3.1: 0..=14 (at most 15 active references).
+    if num_ref_idx_l0_default_active_minus1 > 14 || num_ref_idx_l1_default_active_minus1 > 14 {
+        return Err(DecodeError::InvalidSyntax(
+            "num_ref_idx_default_active_minus1 out of range",
+        ));
+    }
     let init_qp_minus26 = r.read_se()?;
-    let init_qp = init_qp_minus26.saturating_add(26);
+    // -(26 + QpBdOffsetY)..=25; the bit depth is checked at activation.
+    if !(-(26 + 48)..=25).contains(&init_qp_minus26) {
+        return Err(DecodeError::InvalidSyntax("init_qp_minus26 out of range"));
+    }
+    let init_qp = init_qp_minus26 + 26;
     let constrained_intra_pred_flag = r.read_bit()? == 1;
     let transform_skip_enabled_flag = r.read_bit()? == 1;
 
@@ -211,6 +248,11 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
     };
     let pps_cb_qp_offset = r.read_se()?;
     let pps_cr_qp_offset = r.read_se()?;
+    if !(-12..=12).contains(&pps_cb_qp_offset) || !(-12..=12).contains(&pps_cr_qp_offset) {
+        return Err(DecodeError::InvalidSyntax(
+            "pps_cb/cr_qp_offset out of range",
+        ));
+    }
     let pps_slice_chroma_qp_offsets_present_flag = r.read_bit()? == 1;
     let weighted_pred_flag = r.read_bit()? == 1;
     let weighted_bipred_flag = r.read_bit()? == 1;
@@ -274,6 +316,12 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
         if !pps_deblocking_filter_disabled_flag {
             pps_beta_offset_div2 = r.read_se()?;
             pps_tc_offset_div2 = r.read_se()?;
+            if !(-6..=6).contains(&pps_beta_offset_div2) || !(-6..=6).contains(&pps_tc_offset_div2)
+            {
+                return Err(DecodeError::InvalidSyntax(
+                    "pps_beta/tc_offset_div2 out of range",
+                ));
+            }
         }
     }
 
@@ -288,6 +336,12 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
 
     let lists_modification_present_flag = r.read_bit()? == 1;
     let log2_parallel_merge_level_minus2 = r.read_ue()?;
+    // At most CtbLog2SizeY - 2 (checked at activation), so at most 4.
+    if log2_parallel_merge_level_minus2 > 4 {
+        return Err(DecodeError::InvalidSyntax(
+            "log2_parallel_merge_level_minus2 out of range",
+        ));
+    }
     let slice_segment_header_extension_present_flag = r.read_bit()? == 1;
 
     // PPS extensions (spec 7.3.2.3.1).
@@ -408,4 +462,73 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
         log2_sao_offset_scale_luma,
         log2_sao_offset_scale_chroma,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The SPS and PPS of an x265 fixture (320x240, 16x16 CTBs: 20x15 CTBs).
+    fn fixture_sets() -> (Sps, Pps) {
+        let data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/motion_320x240.h265"
+        ))
+        .unwrap();
+        let nals = crate::nal::parse_annex_b(&data);
+        let rbsp = |t| &nals.iter().find(|n| n.nal_unit_type == t).unwrap().rbsp;
+        let sps = crate::sps::parse_sps(rbsp(crate::nal::NalUnitType::Sps)).unwrap();
+        let pps = parse_pps(rbsp(crate::nal::NalUnitType::Pps)).unwrap();
+        (sps, pps)
+    }
+
+    /// PPS values whose range depends on the SPS (7.4.3.3) are checked
+    /// when the PPS is activated with it.
+    #[test]
+    fn pps_ranges_checked_against_sps() {
+        let (sps, pps) = fixture_sets();
+        assert_eq!(sps.ctb_log2_size_y, 4);
+        pps.clone()
+            .resolve_tile_geometry(&sps)
+            .expect("fixture PPS");
+        let changes: [fn(&mut Pps); 5] = [
+            |p| p.init_qp = -1,                         // below -QpBdOffsetY (0)
+            |p| p.diff_cu_qp_delta_depth = 4,           // above log2_diff_max_min (2 or less)
+            |p| p.log2_parallel_merge_level_minus2 = 3, // Log2ParMrgLevel above CtbLog2SizeY
+            |p| p.log2_sao_offset_scale_luma = 1,       // above Max(0, 8 - 10)
+            |p| p.log2_max_transform_skip_block_size = 6,
+        ];
+        for change in changes {
+            let mut p = pps.clone();
+            change(&mut p);
+            assert_eq!(
+                p.resolve_tile_geometry(&sps),
+                Err(DecodeError::InvalidSyntax(
+                    "PPS value out of range for its SPS"
+                ))
+            );
+        }
+    }
+
+    /// Tile column widths each below the picture width (7.4.3.3): a width
+    /// that would wrap the u32 sum is rejected, not summed.
+    #[test]
+    fn tile_width_overflow_is_rejected() {
+        let (sps, mut pps) = fixture_sets();
+        pps.tiles_enabled_flag = true;
+        pps.uniform_spacing_flag = false;
+        pps.num_tile_columns = 3;
+        pps.num_tile_rows = 1;
+        pps.column_width_minus1 = vec![u32::MAX - 1, 1];
+        pps.row_height_minus1 = Vec::new();
+        assert_eq!(
+            pps.clone().resolve_tile_geometry(&sps),
+            Err(DecodeError::InvalidSyntax(
+                "tile column widths sum too large"
+            ))
+        );
+        pps.column_width_minus1 = vec![2, 3];
+        pps.resolve_tile_geometry(&sps).expect("3 + 4 + 13 columns");
+        assert_eq!(pps.column_widths_in_ctbs, [3, 4, 13]);
+    }
 }

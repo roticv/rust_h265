@@ -128,7 +128,8 @@ impl Substreams<'_> {
             .ok_or(DecodeError::InvalidSyntax(
                 "slice missing entry_point_offset for substream",
             ))?;
-        let nal_target = self.nal_data_start + nal_offset;
+        // Saturating: a damaged offset fails in reinit_at.
+        let nal_target = self.nal_data_start.saturating_add(nal_offset);
         let epbs = self
             .epb_positions
             .iter()

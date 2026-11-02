@@ -1770,8 +1770,10 @@ fn check_mvset(
     if col_lt != curr_ref_lt {
         return None;
     }
-    let col_poc_diff = col_pic_poc - col_ref_poc;
-    let cur_poc_diff = curr_poc - curr_ref_poc;
+    // Saturating: a damaged stream's POCs may be far apart, and mv_scale
+    // clamps the differences to -128..=127 anyway.
+    let col_poc_diff = col_pic_poc.saturating_sub(col_ref_poc);
+    let cur_poc_diff = curr_poc.saturating_sub(curr_ref_poc);
 
     if curr_ref_lt || col_poc_diff == cur_poc_diff || col_poc_diff == 0 {
         Some(col_mv)
@@ -2080,8 +2082,8 @@ fn amvp_scaled_ref_mv<P: Pixel>(
         // FFmpeg still returns the MV here).
         Some(neighbor_mv)
     } else {
-        let td = slice_params.poc - neighbor_ref_poc;
-        let tb = slice_params.poc - curr_ref_poc;
+        let td = slice_params.poc.saturating_sub(neighbor_ref_poc);
+        let tb = slice_params.poc.saturating_sub(curr_ref_poc);
         Some(mv_scale(neighbor_mv, td, tb))
     }
 }

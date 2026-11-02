@@ -504,7 +504,8 @@ fn validate_conformance_window(
         .ok_or(DecodeError::InvalidSyntax(
             "conformance window height overflow",
         ))?;
-    if cropped_x > width || cropped_y > height {
+    // 7.4.3.2.1: the window keeps at least one sample in each direction.
+    if cropped_x >= width || cropped_y >= height {
         return Err(DecodeError::InvalidSyntax(
             "conformance window exceeds picture dimensions",
         ));

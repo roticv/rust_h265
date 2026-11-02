@@ -80,16 +80,10 @@ pub fn parse_vps(rbsp: &[u8]) -> Result<Vps, DecodeError> {
         if vps_poc_proportional_to_timing_flag {
             let _vps_num_ticks_poc_diff_one_minus1 = r.read_ue()?;
         }
-        let vps_num_hrd_parameters = r.read_ue()?;
-        if vps_num_hrd_parameters > 0 {
-            // hrd_parameters() is significant work and we don't need it.
-            return Err(DecodeError::Unsupported("hrd_parameters in VPS"));
-        }
+        // hrd_parameters() (and the extension flag after them) are not
+        // needed: stop here rather than fail a valid VPS.
+        let _vps_num_hrd_parameters = r.read_ue()?;
     }
-
-    // vps_extension_flag — we ignore extensions and rely on the next NAL
-    // start code to bound the VPS rather than parsing rbsp_trailing_bits.
-    let _vps_extension_flag = r.read_bit()?;
 
     Ok(Vps {
         vps_video_parameter_set_id,

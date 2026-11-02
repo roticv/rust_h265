@@ -540,6 +540,11 @@ pub fn parse_slice_segment_header(
                 };
                 if active_list_max > 0 {
                     collocated_ref_idx = r.read_ue()?;
+                    if collocated_ref_idx > active_list_max {
+                        return Err(DecodeError::InvalidSyntax(
+                            "collocated_ref_idx out of range",
+                        ));
+                    }
                 }
             }
 
@@ -566,14 +571,27 @@ pub fn parse_slice_segment_header(
         }
 
         slice_qp_delta = r.read_se()?;
-        slice_qp_y = pps.init_qp + slice_qp_delta;
-        if !(-(6 * sps.bit_depth_luma as i32 - 6)..=51).contains(&slice_qp_y) {
-            return Err(DecodeError::InvalidSyntax("SliceQpY out of range"));
-        }
+        // 7.4.7.1: SliceQpY is in -QpBdOffsetY..=51.
+        let qp_bd_offset_y = 6 * (sps.bit_depth_luma as i32 - 8);
+        slice_qp_y = pps
+            .init_qp
+            .checked_add(slice_qp_delta)
+            .filter(|qp| (-qp_bd_offset_y..=51).contains(qp))
+            .ok_or(DecodeError::InvalidSyntax("SliceQpY out of range"))?;
 
         if pps.pps_slice_chroma_qp_offsets_present_flag {
             slice_cb_qp_offset = r.read_se()?;
             slice_cr_qp_offset = r.read_se()?;
+            // Each, and each added to the PPS offset, in -12..=12.
+            let in_range =
+                |o: i32, p: i32| (-12..=12).contains(&o) && (-12..=12).contains(&(o + p));
+            if !in_range(slice_cb_qp_offset, pps.pps_cb_qp_offset)
+                || !in_range(slice_cr_qp_offset, pps.pps_cr_qp_offset)
+            {
+                return Err(DecodeError::InvalidSyntax(
+                    "slice_cb/cr_qp_offset out of range",
+                ));
+            }
         }
 
         if pps.chroma_qp_offset_list_enabled_flag {
@@ -587,6 +605,13 @@ pub fn parse_slice_segment_header(
                 if !slice_deblocking_filter_disabled_flag {
                     slice_beta_offset_div2 = r.read_se()?;
                     slice_tc_offset_div2 = r.read_se()?;
+                    if !(-6..=6).contains(&slice_beta_offset_div2)
+                        || !(-6..=6).contains(&slice_tc_offset_div2)
+                    {
+                        return Err(DecodeError::InvalidSyntax(
+                            "slice_beta/tc_offset_div2 out of range",
+                        ));
+                    }
                 }
             }
         }
@@ -606,10 +631,16 @@ pub fn parse_slice_segment_header(
     let mut entry_point_offsets: Vec<u32> = Vec::new();
     if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag {
         let num_entry_point_offsets = r.read_ue()?;
-        // Sanity cap: max valid is ~(pic_w_ctbs * pic_h_ctbs) which for
-        // 16384×16384 at CTU=16 is 1M. Cap at 4096 to prevent OOM on
-        // crafted input while allowing any realistic stream.
-        if num_entry_point_offsets > 4096 {
+        // 7.4.7.1: one substream per CTB row (WPP), per tile, or per CTB
+        // row of each tile column (both).
+        let h_ctbs = sps.pic_height_in_ctbs_y() as usize;
+        let (cols, rows) = (pps.num_tile_columns, pps.num_tile_rows);
+        let max_substreams = match (pps.tiles_enabled_flag, pps.entropy_coding_sync_enabled_flag) {
+            (true, true) => cols * h_ctbs,
+            (true, false) => cols * rows,
+            _ => h_ctbs,
+        };
+        if num_entry_point_offsets as usize >= max_substreams.max(1) {
             return Err(DecodeError::InvalidSyntax(
                 "num_entry_point_offsets too large",
             ));
@@ -820,6 +851,24 @@ fn parse_pred_weight_table(
     }
     wt.chroma_log2_weight_denom = chroma_log2_weight_denom as u8;
 
+    // 7.4.7.3: delta weights in -128..=127, luma offsets in
+    // -WpOffsetHalfRangeY..WpOffsetHalfRangeY, delta chroma offsets in
+    // -4 * WpOffsetHalfRangeC..4 * WpOffsetHalfRangeC.
+    let half_y: i64 = if wt.high_precision_offsets {
+        1 << (sps.bit_depth_luma - 1)
+    } else {
+        128
+    };
+    let check = |v: i32, half: i64| {
+        if (-half..half).contains(&(v as i64)) {
+            Ok(v)
+        } else {
+            Err(DecodeError::InvalidSyntax(
+                "pred_weight_table value out of range",
+            ))
+        }
+    };
+
     let luma_denom = 1i16 << wt.luma_log2_weight_denom;
     let chroma_denom = 1i16 << wt.chroma_log2_weight_denom;
 
@@ -836,17 +885,17 @@ fn parse_pred_weight_table(
     }
     for i in 0..nb_ref_l0 as usize {
         if luma_weight_l0_flag[i] {
-            let delta = r.read_se()? as i16;
+            let delta = check(r.read_se()?, 128)? as i16;
             wt.luma_weight_l0[i] = luma_denom.saturating_add(delta);
-            wt.luma_offset_l0[i] = r.read_se()? as i16;
+            wt.luma_offset_l0[i] = check(r.read_se()?, half_y)? as i16;
         } else {
             wt.luma_weight_l0[i] = luma_denom;
             wt.luma_offset_l0[i] = 0;
         }
         if chroma_format_idc != 0 && i < chroma_weight_l0_flag.len() && chroma_weight_l0_flag[i] {
             for j in 0..2 {
-                let delta_w = r.read_se()? as i16;
-                let delta_o = r.read_se()?;
+                let delta_w = check(r.read_se()?, 128)? as i16;
+                let delta_o = check(r.read_se()?, 4 * half_c)?;
                 wt.chroma_weight_l0[i][j] = chroma_denom.saturating_add(delta_w);
                 // Spec equation 7-59: effective offset includes the shift-back.
                 // Use i64 to avoid overflow from malformed read_se() values.
@@ -875,9 +924,9 @@ fn parse_pred_weight_table(
         }
         for i in 0..nb_ref_l1 as usize {
             if luma_weight_l1_flag[i] {
-                let delta = r.read_se()? as i16;
+                let delta = check(r.read_se()?, 128)? as i16;
                 wt.luma_weight_l1[i] = luma_denom.saturating_add(delta);
-                wt.luma_offset_l1[i] = r.read_se()? as i16;
+                wt.luma_offset_l1[i] = check(r.read_se()?, half_y)? as i16;
             } else {
                 wt.luma_weight_l1[i] = luma_denom;
                 wt.luma_offset_l1[i] = 0;
@@ -885,8 +934,8 @@ fn parse_pred_weight_table(
             if chroma_format_idc != 0 && i < chroma_weight_l1_flag.len() && chroma_weight_l1_flag[i]
             {
                 for j in 0..2 {
-                    let delta_w = r.read_se()? as i16;
-                    let delta_o = r.read_se()?;
+                    let delta_w = check(r.read_se()?, 128)? as i16;
+                    let delta_o = check(r.read_se()?, 4 * half_c)?;
                     wt.chroma_weight_l1[i][j] = chroma_denom.saturating_add(delta_w);
                     // Use i64 to avoid overflow from malformed read_se() values.
                     let w64 = wt.chroma_weight_l1[i][j] as i64;

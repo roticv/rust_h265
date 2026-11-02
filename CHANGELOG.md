@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Range checks from 7.4.3.3, 7.4.7.1 and 7.4.7.3 that FFmpeg also makes,
+  for values that overflowed integer arithmetic (a panic in builds with
+  overflow checks, such as fuzzing) or reached code assuming them:
+  - PPS: `init_qp_minus26` (against the bit depth), `pps_cb/cr_qp_offset`,
+    the deblocking offsets, `num_ref_idx_default_active_minus1`, and,
+    against the SPS, `diff_cu_qp_delta_depth`,
+    `diff_cu_chroma_qp_offset_depth`, `log2_parallel_merge_level`,
+    `log2_max_transform_skip_block_size` and `log2_sao_offset_scale`.
+  - Tile column widths and row heights are each below the picture size
+    (a huge value wrapped the sum and built a broken tile layout).
+  - Slice header: `collocated_ref_idx`, the slice chroma QP offsets (and
+    their sums with the PPS's), the deblocking offsets, the weight table
+    values, and `num_entry_point_offsets` (bounded by the tile / WPP
+    layout instead of 4096, which could reject a large valid picture).
+  - SliceQpY's lower bound is -QpBdOffsetY (it accepted down to -42 at 8
+    bits), computed without overflow.
+  - POCs, including long-term reference POCs, stay in the i32 range;
+    POC differences in MV scaling saturate.
+  - The conformance window leaves at least one sample in each direction.
+- A VPS with HRD parameters is accepted instead of failing as
+  unsupported (nothing after them is used).
 - DPB limits are enforced: `sps_max_dec_pic_buffering_minus1` and
   `sps_max_num_reorder_pics` are below 16 (a reorder count above the DPB
   size enlarges it, as in FFmpeg), and a reference picture set, in the

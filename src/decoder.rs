@@ -532,7 +532,8 @@ impl PictureDecode {
                             ));
                         }
                         let nal_offset_from_start = sh.entry_point_offsets[ep_idx - 1];
-                        let nal_target = nal_slice_data_start + nal_offset_from_start;
+                        // Saturating: a damaged offset fails in reinit_at.
+                        let nal_target = nal_slice_data_start.saturating_add(nal_offset_from_start);
                         let epbs_in_data_prefix = epb_positions
                             .iter()
                             .filter(|&&p| p >= nal_slice_data_start && p < nal_target)
@@ -1634,7 +1635,8 @@ impl Decoder {
                     sh.slice_pic_order_cnt_lsb,
                     sps.log2_max_pic_order_cnt_lsb,
                     no_rasl_output_flag,
-                );
+                )
+                .ok_or(DecodeError::InvalidSyntax("PicOrderCntVal out of range"))?;
             }
         } else if matches!(nut, NalUnitType::RaslN | NalUnitType::RaslR) && self.skip_rasl {
             // Remaining slice segments of a skipped RASL picture.
@@ -1726,7 +1728,6 @@ impl Decoder {
             }
             nss
         };
-
         let pic_width_in_ctbs = sps.pic_width_in_ctbs_y();
         let pic_height_in_ctbs = sps.pic_height_in_ctbs_y();
         let total_ctbs = pic_width_in_ctbs * pic_height_in_ctbs;
@@ -1751,7 +1752,7 @@ impl Decoder {
                 let sps_st_rps = sps_for_rps.st_ref_pic_sets.clone();
                 let log2_max_poc_lsb = sps_for_rps.log2_max_pic_order_cnt_lsb;
                 let mut rps =
-                    Self::derive_rps_from_slice_header_parts(&sh, &sps_st_rps, log2_max_poc_lsb);
+                    Self::derive_rps_from_slice_header_parts(&sh, &sps_st_rps, log2_max_poc_lsb)?;
                 if nut.is_irap() {
                     // An IRAP picture predicts from nothing: its Curr sets
                     // are empty (8.3.2), so no reference is generated for
@@ -2305,15 +2306,15 @@ impl Decoder {
         slice_pic_order_cnt_lsb: u32,
         log2_max_pic_order_cnt_lsb: u8,
         irap_no_rasl_output: bool,
-    ) -> i32 {
+    ) -> Option<i32> {
         let max_poc_lsb = 1i32 << log2_max_pic_order_cnt_lsb;
         let prev_poc_lsb = prev_tid0_poc.rem_euclid(max_poc_lsb);
         let prev_poc_msb = prev_tid0_poc - prev_poc_lsb;
         let cur_lsb = slice_pic_order_cnt_lsb as i32;
         let mut poc_msb = if cur_lsb < prev_poc_lsb && (prev_poc_lsb - cur_lsb) >= max_poc_lsb / 2 {
-            prev_poc_msb + max_poc_lsb
+            prev_poc_msb.checked_add(max_poc_lsb)?
         } else if cur_lsb > prev_poc_lsb && (cur_lsb - prev_poc_lsb) > max_poc_lsb / 2 {
-            prev_poc_msb - max_poc_lsb
+            prev_poc_msb.checked_sub(max_poc_lsb)?
         } else {
             prev_poc_msb
         };
@@ -2322,7 +2323,8 @@ impl Decoder {
         if irap_no_rasl_output {
             poc_msb = 0;
         }
-        poc_msb + cur_lsb
+        // PicOrderCntVal is in the i32 range (8.3.1).
+        poc_msb.checked_add(cur_lsb)
     }
 
     /// Phase 3d-1: derive the reference picture sets for the current
@@ -2341,13 +2343,16 @@ impl Decoder {
         sh: &SliceHeader,
         sps_st_ref_pic_sets: &[ShortTermRps],
         log2_max_pic_order_cnt_lsb: u8,
-    ) -> ReferencePictureSets {
+    ) -> Result<ReferencePictureSets, DecodeError> {
         let mut rps = ReferencePictureSets::default();
 
         // IDR pictures never reference anything from the DPB.
         if sh.nal_unit_type.is_idr() {
-            return rps;
+            return Ok(rps);
         }
+        // Reference POCs are in the i32 range too (8.3.1; FFmpeg rejects a
+        // long-term POC beyond it).
+        let out_of_range = || DecodeError::InvalidSyntax("reference POC out of range");
 
         // Resolve the active short-term RPS.
         let st_ref: Option<&ShortTermRps> = if sh.short_term_ref_pic_set_sps_flag {
@@ -2360,7 +2365,7 @@ impl Decoder {
             // Short-term "before current" (negative deltas the current
             // picture uses).
             for (i, delta) in st.delta_poc_s0.iter().enumerate() {
-                let ref_poc = sh.poc + delta;
+                let ref_poc = sh.poc.checked_add(*delta).ok_or_else(out_of_range)?;
                 if st.used_by_curr_pic_s0_flag.get(i).copied().unwrap_or(false) {
                     rps.st_curr_before.push(ref_poc);
                 } else {
@@ -2370,7 +2375,7 @@ impl Decoder {
             // Short-term "after current" (positive deltas the current
             // picture uses).
             for (i, delta) in st.delta_poc_s1.iter().enumerate() {
-                let ref_poc = sh.poc + delta;
+                let ref_poc = sh.poc.checked_add(*delta).ok_or_else(out_of_range)?;
                 if st.used_by_curr_pic_s1_flag.get(i).copied().unwrap_or(false) {
                     rps.st_curr_after.push(ref_poc);
                 } else {
@@ -2416,8 +2421,12 @@ impl Decoder {
                 };
                 prev_delta_msb = delta;
                 // FFmpeg: poc = rps->poc[i] + cur_poc - delta * max_poc_lsb - poc_lsb
-                (*poc_lsb as i64 + cur_poc as i64 - delta * max_poc_lsb as i64 - cur_poc_lsb as i64)
-                    as i32
+                i32::try_from(
+                    *poc_lsb as i64 + cur_poc as i64
+                        - delta * max_poc_lsb as i64
+                        - cur_poc_lsb as i64,
+                )
+                .map_err(|_| out_of_range())?
             } else {
                 *poc_lsb as i32
             };
@@ -2436,7 +2445,7 @@ impl Decoder {
             rps.lt_poc_msb_present.push(msb_present);
         }
 
-        rps
+        Ok(rps)
     }
 
     /// Phase 3d-2: build `RefPicList0` / `RefPicList1` for a P or B slice
@@ -2710,7 +2719,7 @@ mod tests {
         // prev_tid0_poc = 4 (MSB=0, LSB=4), cur LSB = 5.
         // prev_lsb = 4, diff = 1 → neither branch fires, poc_msb = 0.
         // poc = 0 + 5 = 5.
-        assert_eq!(Decoder::compute_poc(4, 5, 4, false), 5);
+        assert_eq!(Decoder::compute_poc(4, 5, 4, false), Some(5));
     }
 
     #[test]
@@ -2721,7 +2730,7 @@ mod tests {
         //   cur_lsb < prev_lsb (1 < 15) && (prev_lsb - cur_lsb) >= max_poc_lsb/2
         //   (15 - 1) = 14 >= 8 → yes, so poc_msb = prev_poc_msb + max_poc_lsb = 16.
         //   poc = 16 + 1 = 17.
-        assert_eq!(Decoder::compute_poc(15, 1, 4, false), 17);
+        assert_eq!(Decoder::compute_poc(15, 1, 4, false), Some(17));
     }
 
     #[test]
@@ -2735,7 +2744,7 @@ mod tests {
         //   15 > 1, 15 - 1 = 14 > 8 → backward wrap branch fires.
         //   poc_msb = 16 - 16 = 0.
         //   poc = 0 + 15 = 15.
-        assert_eq!(Decoder::compute_poc(17, 15, 4, false), 15);
+        assert_eq!(Decoder::compute_poc(17, 15, 4, false), Some(15));
     }
 
     #[test]
@@ -2744,15 +2753,15 @@ mod tests {
         // `prev_tid0_poc`. With prev = 20 (MSB=16, LSB=4) and cur LSB=5,
         // a non-BLA picture would give poc = 16 + 5 = 21, but a
         // BLA_W_LP explicitly sets poc_msb to 0 → poc = 5.
-        assert_eq!(Decoder::compute_poc(20, 5, 4, true), 5);
+        assert_eq!(Decoder::compute_poc(20, 5, 4, true), Some(5));
         // For TrailR the normal path returns 21.
-        assert_eq!(Decoder::compute_poc(20, 5, 4, false), 21);
+        assert_eq!(Decoder::compute_poc(20, 5, 4, false), Some(21));
     }
 
     #[test]
     fn poc_compute_equal_lsb_passes_through() {
         // prev_tid0_poc = 32 (MSB=32, LSB=0), cur LSB=0 → poc_msb=32.
-        assert_eq!(Decoder::compute_poc(32, 0, 4, false), 32);
+        assert_eq!(Decoder::compute_poc(32, 0, 4, false), Some(32));
     }
 
     /// Spec 8.3.1: an IRAP picture with NoRaslOutputFlag = 1 (first picture
@@ -2763,9 +2772,9 @@ mod tests {
     fn test_compute_poc_cra_starting_sequence_has_zero_msb() {
         // max_poc_lsb = 16, prev = 0, cur LSB = 13: diff 13 > 8 would wrap
         // MSB to -16 (POC -3) for an ordinary picture...
-        assert_eq!(Decoder::compute_poc(0, 13, 4, false), -3);
+        assert_eq!(Decoder::compute_poc(0, 13, 4, false), Some(-3));
         // ...but a sequence-starting IRAP keeps MSB = 0 → POC = 13.
-        assert_eq!(Decoder::compute_poc(0, 13, 4, true), 13);
+        assert_eq!(Decoder::compute_poc(0, 13, 4, true), Some(13));
     }
 
     /// Spec 8.3.1: after a mid-stream CRA (NoRaslOutputFlag = 0, open GOP),
@@ -2776,9 +2785,9 @@ mod tests {
     #[test]
     fn test_compute_poc_after_mid_stream_cra_keeps_msb() {
         // Correct seed (CRA's own POC) → 151.
-        assert_eq!(Decoder::compute_poc(150, 151, 8, false), 151);
+        assert_eq!(Decoder::compute_poc(150, 151, 8, false), Some(151));
         // The buggy seed of 0 would have produced 151 - 256 = -105.
-        assert_eq!(Decoder::compute_poc(0, 151, 8, false), -105);
+        assert_eq!(Decoder::compute_poc(0, 151, 8, false), Some(-105));
     }
 
     // ----- Phase 3d-2: RefPicList0 / RefPicList1 construction tests -----
@@ -2854,7 +2863,7 @@ mod tests {
             delta_poc_msb_cycle_lt: vec![1, 2, 1],
             num_long_term_sps: 1,
         };
-        let rps = Decoder::derive_rps_from_slice_header_parts(&sh, &[], 4);
+        let rps = Decoder::derive_rps_from_slice_header_parts(&sh, &[], 4).unwrap();
         assert_eq!(rps.lt_curr, vec![84, 68, 52]);
     }
 
