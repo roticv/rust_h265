@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-02
+
 ### Fixed
 
 - Range checks from 7.4.3.3, 7.4.7.1 and 7.4.7.3 that FFmpeg also makes,
