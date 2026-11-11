@@ -1973,14 +1973,19 @@ fn temporal_luma_motion_vector<P: Pixel>(
         let yc = (ybr & !15) as usize;
         let x_pu = xc >> log2_min_pu;
         let y_pu = yc >> log2_min_pu;
-        if inside(xc, yc) && y_pu * min_pu_width + x_pu < col_ref.tab_mvf.len() {
+        // A collocated CTB without slice lists (lost or failed in a damaged
+        // stream) gives no candidate here; the centre is still tried.
+        if inside(xc, yc)
+            && y_pu * min_pu_width + x_pu < col_ref.tab_mvf.len()
+            && let Some(lists) = col_ref.ref_lists_at(xc as u32, yc as u32)
+        {
             let temp_col = col_ref.tab_mvf[y_pu * min_pu_width + x_pu];
             result = derive_temporal_colocated_mvs(
                 temp_col,
                 ref_idx_lx,
                 x,
                 col_pic_poc,
-                col_ref.ref_lists_at(xc as u32, yc as u32)?,
+                lists,
                 slice_params,
             );
         }
@@ -2082,7 +2087,12 @@ fn amvp_scaled_ref_mv<P: Pixel>(
         // FFmpeg still returns the MV here).
         Some(neighbor_mv)
     } else {
-        let td = slice_params.poc.saturating_sub(neighbor_ref_poc);
+        // A neighbour reference with the current POC (only in a damaged
+        // stream) scales with td = 1, as FFmpeg's `dist_scale` does.
+        let td = match slice_params.poc.saturating_sub(neighbor_ref_poc) {
+            0 => 1,
+            td => td,
+        };
         let tb = slice_params.poc.saturating_sub(curr_ref_poc);
         Some(mv_scale(neighbor_mv, td, tb))
     }
@@ -2681,30 +2691,30 @@ fn inter_boundary_strength_full(
         if curr_l0_poc == neigh_l0_poc && curr_l0_poc == curr_l1_poc && neigh_l0_poc == neigh_l1_poc
         {
             // Either ordering must satisfy the threshold
-            let order_a = (neigh.mv[0].x - curr.mv[0].x).abs() >= 4
-                || (neigh.mv[0].y - curr.mv[0].y).abs() >= 4
-                || (neigh.mv[1].x - curr.mv[1].x).abs() >= 4
-                || (neigh.mv[1].y - curr.mv[1].y).abs() >= 4;
-            let order_b = (neigh.mv[1].x - curr.mv[0].x).abs() >= 4
-                || (neigh.mv[1].y - curr.mv[0].y).abs() >= 4
-                || (neigh.mv[0].x - curr.mv[1].x).abs() >= 4
-                || (neigh.mv[0].y - curr.mv[1].y).abs() >= 4;
+            let order_a = (i32::from(neigh.mv[0].x) - i32::from(curr.mv[0].x)).abs() >= 4
+                || (i32::from(neigh.mv[0].y) - i32::from(curr.mv[0].y)).abs() >= 4
+                || (i32::from(neigh.mv[1].x) - i32::from(curr.mv[1].x)).abs() >= 4
+                || (i32::from(neigh.mv[1].y) - i32::from(curr.mv[1].y)).abs() >= 4;
+            let order_b = (i32::from(neigh.mv[1].x) - i32::from(curr.mv[0].x)).abs() >= 4
+                || (i32::from(neigh.mv[1].y) - i32::from(curr.mv[0].y)).abs() >= 4
+                || (i32::from(neigh.mv[0].x) - i32::from(curr.mv[1].x)).abs() >= 4
+                || (i32::from(neigh.mv[0].y) - i32::from(curr.mv[1].y)).abs() >= 4;
             if order_a && order_b { 1 } else { 0 }
         } else if curr_l0_poc == neigh_l0_poc && curr_l1_poc == neigh_l1_poc {
-            if (neigh.mv[0].x - curr.mv[0].x).abs() >= 4
-                || (neigh.mv[0].y - curr.mv[0].y).abs() >= 4
-                || (neigh.mv[1].x - curr.mv[1].x).abs() >= 4
-                || (neigh.mv[1].y - curr.mv[1].y).abs() >= 4
+            if (i32::from(neigh.mv[0].x) - i32::from(curr.mv[0].x)).abs() >= 4
+                || (i32::from(neigh.mv[0].y) - i32::from(curr.mv[0].y)).abs() >= 4
+                || (i32::from(neigh.mv[1].x) - i32::from(curr.mv[1].x)).abs() >= 4
+                || (i32::from(neigh.mv[1].y) - i32::from(curr.mv[1].y)).abs() >= 4
             {
                 1
             } else {
                 0
             }
         } else if curr_l1_poc == neigh_l0_poc && curr_l0_poc == neigh_l1_poc {
-            if (neigh.mv[1].x - curr.mv[0].x).abs() >= 4
-                || (neigh.mv[1].y - curr.mv[0].y).abs() >= 4
-                || (neigh.mv[0].x - curr.mv[1].x).abs() >= 4
-                || (neigh.mv[0].y - curr.mv[1].y).abs() >= 4
+            if (i32::from(neigh.mv[1].x) - i32::from(curr.mv[0].x)).abs() >= 4
+                || (i32::from(neigh.mv[1].y) - i32::from(curr.mv[0].y)).abs() >= 4
+                || (i32::from(neigh.mv[0].x) - i32::from(curr.mv[1].x)).abs() >= 4
+                || (i32::from(neigh.mv[0].y) - i32::from(curr.mv[1].y)).abs() >= 4
             {
                 1
             } else {
@@ -2750,7 +2760,9 @@ fn inter_boundary_strength_full(
             )
         };
         if ref_a_poc == ref_b_poc {
-            if (a.x - b.x).abs() >= 4 || (a.y - b.y).abs() >= 4 {
+            if (i32::from(a.x) - i32::from(b.x)).abs() >= 4
+                || (i32::from(a.y) - i32::from(b.y)).abs() >= 4
+            {
                 1
             } else {
                 0
@@ -5333,6 +5345,23 @@ fn compute_luma_intra_pred_mode<P: Pixel>(
 
 #[cfg(test)]
 mod tests {
+
+    /// Neighbouring MVs at opposite ends of the i16 range: the difference
+    /// must be taken in i32 (no overflow, and a strength of 1).
+    #[test]
+    fn boundary_strength_extreme_mvs() {
+        let field = |x: i16, flag: u8| MvField {
+            mv: [Mv { x, y: 0 }, Mv { x, y: 0 }],
+            ref_idx: [0, 0],
+            pred_flag: flag,
+        };
+        let pocs = [vec![0], vec![0]];
+        for flag in [1, 3] {
+            let (a, b) = (field(i16::MAX, flag), field(i16::MIN, flag));
+            assert_eq!(inter_boundary_strength(&a, &b, &pocs, &pocs), 1);
+            assert_eq!(inter_boundary_strength(&b, &a, &pocs, &pocs), 1);
+        }
+    }
     use super::*;
     use crate::cabac::CabacContexts;
     use crate::nal::{NalUnitType, parse_annex_b};

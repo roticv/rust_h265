@@ -842,12 +842,15 @@ fn parse_pred_weight_table(
 
     let mut chroma_log2_weight_denom = luma_log2_weight_denom as i32;
     if chroma_format_idc != 0 {
-        chroma_log2_weight_denom += r.read_se()?;
-        if !(0..=7).contains(&chroma_log2_weight_denom) {
+        // delta_chroma_log2_weight_denom can be near i32::MAX in a damaged
+        // header: add in i64 before the range check, as FFmpeg does.
+        let denom = i64::from(chroma_log2_weight_denom) + i64::from(r.read_se()?);
+        if !(0..=7).contains(&denom) {
             return Err(DecodeError::InvalidSyntax(
                 "chroma_log2_weight_denom out of range",
             ));
         }
+        chroma_log2_weight_denom = denom as i32;
     }
     wt.chroma_log2_weight_denom = chroma_log2_weight_denom as u8;
 
@@ -1029,6 +1032,34 @@ mod tests {
             log2_sao_offset_scale_luma: 0,
             log2_sao_offset_scale_chroma: 0,
         }
+    }
+
+    /// A damaged `delta_chroma_log2_weight_denom` of i32::MAX must be
+    /// rejected, not overflow when added to the luma denominator.
+    #[test]
+    fn chroma_weight_denom_delta_does_not_overflow() {
+        // luma_log2_weight_denom = ue(1), then se() code 2^32 - 3 (+i32::MAX):
+        // 31 leading zeros, the marker bit, suffix 2^31 - 2.
+        let mut bits = String::from("010");
+        bits.push_str(&"0".repeat(31));
+        bits.push('1');
+        bits.push_str(&"1".repeat(30));
+        bits.push('0');
+        bits.push_str("10000000");
+        let bytes: Vec<u8> = bits
+            .as_bytes()
+            .chunks(8)
+            .map(|c| {
+                let mut b = 0u8;
+                for (i, &bit) in c.iter().enumerate() {
+                    b |= ((bit == b'1') as u8) << (7 - i);
+                }
+                b
+            })
+            .collect();
+        let mut r = BitstreamReader::new(&bytes);
+        let res = parse_pred_weight_table(&mut r, SliceType::P, 1, 0, 1, &minimal_sps());
+        assert!(matches!(res, Err(DecodeError::InvalidSyntax(_))), "{res:?}");
     }
 
     fn minimal_sps() -> Sps {
