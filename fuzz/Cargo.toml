@@ -41,3 +41,8 @@ doc = false
 name = "decode_threaded"
 path = "fuzz_targets/decode_threaded.rs"
 doc = false
+
+[[bin]]
+name = "slice_data"
+path = "fuzz_targets/slice_data.rs"
+doc = false

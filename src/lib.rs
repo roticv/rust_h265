@@ -142,6 +142,8 @@ pub(crate) mod dpb;
 // --- Public modules ---
 pub mod decoder;
 pub mod error;
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod nal;
 
 // --- Top-level re-exports for convenience ---

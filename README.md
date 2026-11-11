@@ -227,7 +227,7 @@ rejected as unsupported.
 
 ### Fuzzing
 
-Three fuzz targets using [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz)
+Fuzz targets using [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz)
 (requires nightly Rust):
 
 ```sh
@@ -239,6 +239,10 @@ cargo +nightly fuzz run parse_nal_headers
 
 # Single synthetic NAL with controlled type/payload:
 cargo +nightly fuzz run decode_single_nal
+
+# Slice data of the in-tree fixtures, with parameter sets and slice headers
+# kept intact, so every input reaches CABAC and the CU / TU syntax:
+cargo +nightly fuzz run slice_data
 ```
 
 ## License
