@@ -1421,6 +1421,26 @@ fn tab_mvf_at<P: Pixel>(state: &PictureState<P>, x: i32, y: i32) -> MvField {
     state.tab_mvf[y_pu * state.min_pu_width + x_pu]
 }
 
+/// Whether the A0 / B0 candidate at `(x_n, y_n)` is decoded before the PU
+/// at `(x0, y0)` (spec 6.4.1 z-scan order; FFmpeg `PRED_BLOCK_AVAILABLE`).
+/// Within a tile, raster CTB order is decode order, so the picture-wide
+/// z-scan table orders them (the caller has checked slice and tile).
+/// Without it, a below-left or later above-right position is taken as
+/// available whenever its motion field holds an inter PU, as it can after a
+/// slice overlapping an earlier one in a damaged stream. Only for A0 / B0:
+/// A1, B1 and B2 always precede the PU or lie in its own coding block,
+/// where spec 6.4.2 makes them available whatever their z-scan order.
+fn zscan_available<P: Pixel>(
+    state: &PictureState<P>,
+    x0: i32,
+    y0: i32,
+    x_n: i32,
+    y_n: i32,
+) -> bool {
+    let s = state.log2_min_tb_size as i32;
+    state.zscan_addr(x_n >> s, y_n >> s) <= state.zscan_addr(x0 >> s, y0 >> s)
+}
+
 /// Check whether the neighbor at `(x_n, y_n)` is available as a spatial
 /// merge candidate for a PU at `(x0, y0)`.  The position must be inside
 /// the picture, belong to an inter-coded PU (`pred_flag != 0`), be in the
@@ -1544,6 +1564,7 @@ fn build_merge_candidates<P: Pixel>(
 
     // --- B0 (above-right) ---
     let is_available_b0 = spatial_cand_available(state, x0i, y0i, x_b0, y_b0)
+        && zscan_available(state, x0i, y0i, x_b0, y_b0)
         && x_b0 < state.width as i32
         && !is_diff_mer(pl, x_b0, y_b0, x0i, y0i)
         && !(is_available_b1
@@ -1557,6 +1578,7 @@ fn build_merge_candidates<P: Pixel>(
 
     // --- A0 (below-left) ---
     let is_available_a0 = spatial_cand_available(state, x0i, y0i, x_a0, y_a0)
+        && zscan_available(state, x0i, y0i, x_a0, y_a0)
         && y_a0 < state.height as i32
         && !is_diff_mer(pl, x_a0, y_a0, x0i, y0i)
         && !(is_available_a1
@@ -2119,8 +2141,10 @@ fn amvp_spatial_candidate<P: Pixel>(
     let pred_flag_l1 = 1 - ref_idx_curr;
 
     // Pass 1: same-ref check (exact POC match, no scaling).
-    for &(x_n, y_n) in positions {
-        if !spatial_cand_available(state, x0, y0, x_n, y_n) {
+    for (i, &(x_n, y_n)) in positions.iter().enumerate() {
+        if !spatial_cand_available(state, x0, y0, x_n, y_n)
+            || (i == 0 && !zscan_available(state, x0, y0, x_n, y_n))
+        {
             continue;
         }
         if let Some(mv) = amvp_same_ref_mv(
@@ -2156,8 +2180,10 @@ fn amvp_spatial_candidate<P: Pixel>(
     if same_ref_only {
         return (None, false);
     }
-    for &(x_n, y_n) in positions {
-        if !spatial_cand_available(state, x0, y0, x_n, y_n) {
+    for (i, &(x_n, y_n)) in positions.iter().enumerate() {
+        if !spatial_cand_available(state, x0, y0, x_n, y_n)
+            || (i == 0 && !zscan_available(state, x0, y0, x_n, y_n))
+        {
             continue;
         }
         if let Some(mv) = amvp_scaled_ref_mv(
@@ -2219,12 +2245,13 @@ fn build_amvp_candidates<P: Pixel>(
     ];
 
     // Check if any left candidate is available (for isScaledFlag_L0).
-    let is_scaled_flag_l0 = left_positions.iter().any(|&(x_n, y_n)| {
+    let is_scaled_flag_l0 = left_positions.iter().enumerate().any(|(i, &(x_n, y_n))| {
         // Bounds check for A0 (y0 + nPbH may exceed picture height).
         if y_n >= state.height as i32 {
             return false;
         }
         spatial_cand_available(state, x0i, y0i, x_n, y_n)
+            && (i != 0 || zscan_available(state, x0i, y0i, x_n, y_n))
     });
 
     let (left_mv, left_available) = amvp_spatial_candidate(
@@ -2268,8 +2295,10 @@ fn build_amvp_candidates<P: Pixel>(
             let pred_flag_l0 = list_idx;
             let pred_flag_l1 = 1 - list_idx;
             let mut new_above_mv = None;
-            for &(x_n, y_n) in &above_positions {
-                if !spatial_cand_available(state, x0i, y0i, x_n, y_n) {
+            for (i, &(x_n, y_n)) in above_positions.iter().enumerate() {
+                if !spatial_cand_available(state, x0i, y0i, x_n, y_n)
+                    || (i == 0 && !zscan_available(state, x0i, y0i, x_n, y_n))
+                {
                     continue;
                 }
                 if let Some(mv) = amvp_scaled_ref_mv(
