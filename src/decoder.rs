@@ -1784,6 +1784,21 @@ impl Decoder {
         // tile-scan order (`slice_start_ts` above is the tile-scan position
         // of the raster `slice_segment_address`).
         if sh.first_slice_segment_in_pic_flag {
+            // POCs are unique within a coded video sequence (spec 8.3.1):
+            // a reference picture with this POC makes every reference by
+            // POC ambiguous (FFmpeg: "Duplicate POC in a sequence"). A
+            // picture starting a sequence unmarks them all below.
+            if !irap_no_rasl_output
+                && self
+                    .dpb
+                    .pictures()
+                    .iter()
+                    .any(|p| p.poc == sh.poc && p.is_reference())
+            {
+                return Err(DecodeError::InvalidSyntax(
+                    "duplicate POC in a coded video sequence",
+                ));
+            }
             // Phase 3d-6: build the reference picture lists at picture start
             // (before the CTB loop) so that motion compensation can access
             // the reference frame pixel data. Previously these were built at
@@ -5660,6 +5675,31 @@ mod tests {
         assert_eq!(nals[i].nal_unit_type, NalUnitType::IdrNLp);
         nals[i].nal_unit_type = NalUnitType::IdrWRadl;
         assert_error_with_any_threads(&nals, "slice NAL unit type differs");
+    }
+
+    /// A picture repeating the POC of a reference picture in the same coded
+    /// video sequence is rejected (FFmpeg: "Duplicate POC in a sequence"),
+    /// so references by POC stay unambiguous.
+    #[test]
+    fn duplicate_poc_is_rejected() {
+        let data = read_fixture("bframes3_128x128.h265");
+        let mut nals = parse_annex_b(&data);
+        let frames = decode_with_threads(&nals, 1).1.len();
+        // Repeat the first trailing picture (a single-slice reference).
+        let i = nals
+            .iter()
+            .position(|n| n.nal_unit_type == NalUnitType::TrailR)
+            .expect("a trailing reference picture");
+        let copy = NalUnit {
+            nal_unit_type: nals[i].nal_unit_type,
+            nuh_layer_id: nals[i].nuh_layer_id,
+            temporal_id: nals[i].temporal_id,
+            rbsp: nals[i].rbsp.clone(),
+            epb_positions: nals[i].epb_positions.clone(),
+        };
+        nals.insert(i + 1, copy);
+        assert_error_with_any_threads(&nals, "duplicate POC");
+        assert_eq!(decode_with_threads(&nals, 1).1.len(), frames);
     }
 
     fn read_fixture(name: &str) -> Vec<u8> {
