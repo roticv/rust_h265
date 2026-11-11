@@ -131,6 +131,9 @@ struct PictureInProgress {
     /// address (the value `tab_slice_addr_rs` holds for its CTBs). Stored in
     /// the decoded picture for temporal MV prediction by later pictures.
     slice_ref_pocs: Vec<(i32, crate::dpb::SliceRefLists)>,
+    /// NAL unit type of the picture's first slice; every slice of a picture
+    /// has the same one (spec 7.4.2.4.4).
+    nal_unit_type: NalUnitType,
 }
 
 /// Tile scan derivation tables for a given (SPS, PPS) pair (spec 6.5.1).
@@ -406,6 +409,22 @@ impl PictureDecode {
         let pic_width_in_ctbs = sps.pic_width_in_ctbs_y();
         let total_ctbs = pic_width_in_ctbs * sps.pic_height_in_ctbs_y();
 
+        if sh.dependent_slice_segment_flag {
+            // The CTB before a dependent segment must belong to its slice:
+            // otherwise the segment before it was lost or failed, and its
+            // CABAC state and slice address are not this segment's.
+            let prev_rs = slice_start_ts
+                .checked_sub(1)
+                .and_then(|ts| tile_tables.ctb_addr_ts_to_rs.get(ts as usize))
+                .map(|&rs| rs as usize);
+            let prev_slice = prev_rs.map(|rs| match &self.state {
+                PictureStateEnum::U8(st) => st.tab_slice_addr_rs[rs],
+                PictureStateEnum::U16(st) => st.tab_slice_addr_rs[rs],
+            });
+            if prev_slice != Some(recorded_slice_addr) {
+                return Err(DecodeError::InvalidSyntax("previous slice segment missing"));
+            }
+        }
         let mut contexts = if sh.dependent_slice_segment_flag && slice_starts_tile {
             // The first CTB of a tile always starts from initialised contexts
             // (spec 9.3.1), even in a dependent slice segment.
@@ -828,6 +847,10 @@ pub struct Decoder {
     /// 8.1.3 / 8.3.2): their references precede the CRA and were never
     /// decoded. Cleared at the next IRAP picture.
     skip_rasl: bool,
+    /// The last slice segment got through its header and reference lists
+    /// (FFmpeg `slice_initialized`). A dependent slice segment needs it:
+    /// otherwise it would inherit a failed or missing segment's state.
+    slice_initialized: bool,
     /// Phase 3d-1: most recently derived reference picture sets for the
     /// current picture. Populated by `derive_rps_from_slice_header`; no
     /// consumer yet other than the decoder's own bookkeeping.
@@ -1502,6 +1525,9 @@ impl Decoder {
         nal: &NalUnit<'_>,
         nut: NalUnitType,
     ) -> Result<Option<Frame>, DecodeError> {
+        // Cleared until this segment's reference lists are built, whatever
+        // happens to it before then (as FFmpeg does).
+        let previous_slice_initialized = std::mem::replace(&mut self.slice_initialized, false);
         // first_slice_segment_in_pic_flag is the slice header's first bit.
         if nal.rbsp.first().is_some_and(|b| b & 0x80 != 0) {
             // The previous picture never completed: slices were lost or
@@ -1545,6 +1571,19 @@ impl Decoder {
 
         let mut sh = parse_slice_segment_header(&nal.rbsp, nut, sps, pps)?;
         sh.temporal_id = nal.temporal_id;
+        if sh.dependent_slice_segment_flag && !previous_slice_initialized {
+            return Err(DecodeError::InvalidSyntax(
+                "independent slice segment missing",
+            ));
+        }
+        if !sh.first_slice_segment_in_pic_flag
+            && let Some(pic) = self.current_picture.as_ref()
+            && pic.nal_unit_type != nut
+        {
+            return Err(DecodeError::InvalidSyntax(
+                "slice NAL unit type differs from the picture's first slice",
+            ));
+        }
 
         // Phase 3c-4: a dependent slice segment inherits the slice-header
         // fields that the parser deliberately left at their defaults —
@@ -1680,6 +1719,13 @@ impl Decoder {
             .ok_or(DecodeError::InvalidSyntax(
                 "slice_segment_address out of range",
             ))?;
+        if sh.dependent_slice_segment_flag && slice_start_ts == 0 {
+            // A dependent segment continues a slice, so it cannot start the
+            // picture (FFmpeg: "Impossible slice segment").
+            return Err(DecodeError::InvalidSyntax(
+                "dependent slice segment at the start of the picture",
+            ));
+        }
         let tile_of_ts = |ts: u32| {
             tile_tables
                 .ctb_addr_ts_to_rs
@@ -1851,6 +1897,7 @@ impl Decoder {
                 last_independent_slice_header: sh.clone(),
                 total_ctbs,
                 slice_ref_pocs: Vec::new(),
+                nal_unit_type: nut,
             });
         } else {
             let pic = self
@@ -1905,6 +1952,7 @@ impl Decoder {
                 pic.slice_ref_pocs.push(entry);
             }
         }
+        self.slice_initialized = true;
 
         // Borrow the in-flight picture mutably for the rest of decode.
         let pic = self
@@ -5519,6 +5567,99 @@ mod tests {
             );
         }
         eprintln!("{} bitstreams match", files.len());
+    }
+
+    /// `(index, first_slice_segment_in_pic_flag, dependent_slice_segment_flag)`
+    /// of every slice segment of a stream.
+    fn slice_segments(nals: &[NalUnit]) -> Vec<(usize, bool, bool)> {
+        let (mut sps, mut pps) = (None, None);
+        let mut out = Vec::new();
+        for (i, nal) in nals.iter().enumerate() {
+            match nal.nal_unit_type {
+                NalUnitType::Sps => sps = Some(crate::sps::parse_sps(&nal.rbsp).unwrap()),
+                NalUnitType::Pps => pps = Some(crate::pps::parse_pps(&nal.rbsp).unwrap()),
+                t if t.is_vcl() => {
+                    let (sps, pps) = (sps.as_ref().unwrap(), pps.as_mut().unwrap());
+                    if pps.column_widths_in_ctbs.is_empty() {
+                        pps.resolve_tile_geometry(sps).unwrap();
+                    }
+                    let sh = parse_slice_segment_header(&nal.rbsp, t, sps, pps).unwrap();
+                    out.push((
+                        i,
+                        sh.first_slice_segment_in_pic_flag,
+                        sh.dependent_slice_segment_flag,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The first dependent slice segment whose preceding segment is not the
+    /// first of its picture.
+    fn dependent_after_non_first(nals: &[NalUnit]) -> usize {
+        let segs = slice_segments(nals);
+        segs.windows(2)
+            .find(|w| !w[0].1 && w[1].2)
+            .map(|w| w[1].0)
+            .expect("a dependent segment after a non-first segment")
+    }
+
+    fn assert_error_with_any_threads(nals: &[NalUnit], expected: &str) {
+        let single = decode_with_threads(nals, 1);
+        assert!(
+            single.0.iter().any(|e| e.contains(expected)),
+            "expected {expected:?} in {:?}",
+            single.0
+        );
+        assert!(
+            single == decode_with_threads(nals, 3),
+            "thread counts differ"
+        );
+    }
+
+    /// A dependent slice segment whose preceding segment was lost must not
+    /// decode with the CABAC state of the segment before that (FFmpeg:
+    /// "Previous slice segment missing").
+    #[test]
+    fn dependent_segment_after_lost_segment_is_rejected() {
+        let data = read_fixture("rext_chroma_qp_adj_dep_hm_444_96x64.h265");
+        let mut nals = parse_annex_b(&data);
+        let d = dependent_after_non_first(&nals);
+        nals.remove(d - 1);
+        assert_error_with_any_threads(&nals, "previous slice segment missing");
+    }
+
+    /// A dependent slice segment after a segment whose header failed must
+    /// not inherit an older segment's header (FFmpeg: "Independent slice
+    /// segment missing").
+    #[test]
+    fn dependent_segment_after_failed_header_is_rejected() {
+        let data = read_fixture("rext_chroma_qp_adj_dep_hm_444_96x64.h265");
+        let mut nals = parse_annex_b(&data);
+        let d = dependent_after_non_first(&nals);
+        // Keep only first_slice_segment_in_pic_flag = 0: the header ends
+        // before its PPS id.
+        nals[d - 1].rbsp = std::borrow::Cow::Owned(vec![0x00]);
+        assert_error_with_any_threads(&nals, "independent slice segment missing");
+    }
+
+    /// Every slice of a picture has the NAL unit type of its first slice
+    /// (FFmpeg: "Non-matching NAL types of the VCL NALUs").
+    #[test]
+    fn slice_with_different_nal_type_is_rejected() {
+        let data = read_fixture("multi_slice.h265");
+        let mut nals = parse_annex_b(&data);
+        // The second slice of the IDR picture becomes the other IDR type
+        // (same slice header syntax).
+        let (i, ..) = *slice_segments(&nals)
+            .iter()
+            .find(|&&(_, first, _)| !first)
+            .expect("a non-first slice");
+        assert_eq!(nals[i].nal_unit_type, NalUnitType::IdrNLp);
+        nals[i].nal_unit_type = NalUnitType::IdrWRadl;
+        assert_error_with_any_threads(&nals, "slice NAL unit type differs");
     }
 
     fn read_fixture(name: &str) -> Vec<u8> {
