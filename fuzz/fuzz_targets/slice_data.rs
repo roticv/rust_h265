@@ -16,7 +16,11 @@
 //!
 //! Decoding carries on through errors, so later pictures still decode on
 //! top of damaged references. The fuzzer looks for panics (overflow checks
-//! are on in cargo-fuzz builds) and memory errors.
+//! are on in cargo-fuzz builds) and memory errors, and decodes each input
+//! with one thread and with three, requiring the same frames (every sample)
+//! and errors. Damaged slices must decode deterministically: a sample left
+//! unwritten (holding whatever a recycled buffer held) or a check that
+//! depends on decode timing shows up as a difference.
 //!
 //! Run: `cargo +nightly fuzz run slice_data`
 
@@ -25,7 +29,7 @@
 use std::borrow::Cow;
 
 use libfuzzer_sys::fuzz_target;
-use rust_h265::{Decoder, NalUnit};
+use rust_h265::{Decoder, Frame, NalUnit, PixelData};
 
 macro_rules! fixtures {
     ($($name:literal),* $(,)?) => {
@@ -118,16 +122,46 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    decode(&nals);
+    let single = decode(&nals, 1);
+    let threaded = decode(&nals, 3);
+    assert!(
+        single == threaded,
+        "threaded decoding differs from single-threaded"
+    );
 });
 
-fn decode(nals: &[NalUnit<'_>]) {
-    let mut decoder = Decoder::new();
+/// Every frame (POC and samples) in output order and the sorted errors.
+type Decoded = (Vec<String>, Vec<(i32, Vec<u8>)>);
+
+fn decode(nals: &[NalUnit<'_>], threads: usize) -> Decoded {
+    let mut decoder = Decoder::new().with_threads(threads);
+    let (mut errors, mut frames) = (Vec::new(), Vec::new());
+    let mut take = |f: Frame| {
+        let mut bytes = Vec::new();
+        for plane in [&f.y, &f.u, &f.v] {
+            match plane {
+                PixelData::U8(p) => bytes.extend_from_slice(p),
+                PixelData::U16(p) => bytes.extend(p.iter().flat_map(|s| s.to_le_bytes())),
+            }
+        }
+        frames.push((f.pic_order_cnt, bytes));
+    };
     for nal in nals {
         // Carry on through errors: later pictures predict from the damaged
         // ones, which is where many overflows show up.
-        let _ = decoder.decode_nal(nal);
+        match decoder.decode_nal(nal) {
+            Ok(Some(f)) => take(f),
+            Ok(None) => {}
+            Err(e) => errors.push(format!("{e:?}")),
+        }
     }
-    while decoder.flush().is_some() {}
-    while decoder.next_error().is_some() {}
+    while let Some(f) = decoder.flush() {
+        take(f);
+    }
+    while let Some(e) = decoder.next_error() {
+        errors.push(format!("{e:?}"));
+    }
+    // Frame threading reports slice-data errors on later calls.
+    errors.sort();
+    (errors, frames)
 }

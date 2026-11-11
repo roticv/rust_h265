@@ -241,7 +241,8 @@ cargo +nightly fuzz run parse_nal_headers
 cargo +nightly fuzz run decode_single_nal
 
 # Slice data of the in-tree fixtures, with parameter sets and slice headers
-# kept intact, so every input reaches CABAC and the CU / TU syntax:
+# kept intact, so every input reaches CABAC and the CU / TU syntax; each
+# input is decoded with 1 and 3 threads and the outputs must match:
 cargo +nightly fuzz run slice_data
 ```
 
