@@ -179,12 +179,12 @@ pub fn parse_scaling_list_data(
                     };
 
                     let scaling_list_delta_coef = r.read_se()?;
-                    // Spec range: -128..127. Clamp on malformed input to
-                    // avoid overflow in the mod-256 arithmetic.
-                    let delta = scaling_list_delta_coef.clamp(-128, 127);
-                    // Wrapping mod-256 arithmetic matching FFmpeg's
-                    // `(next_coef + 256U + scaling_list_delta_coef) % 256`.
-                    next_coef = (next_coef + delta + 256).rem_euclid(256);
+                    // Mod-256 arithmetic as FFmpeg's `(next_coef + 256U +
+                    // scaling_list_delta_coef) % 256`, also for a delta
+                    // outside the spec range -128..127 (in i64: the delta
+                    // can be near i32::MAX).
+                    next_coef = (i64::from(next_coef) + i64::from(scaling_list_delta_coef))
+                        .rem_euclid(256) as i32;
                     sl.sl[size_id as usize][matrix_id][pos] = next_coef as u8;
                 }
             }
@@ -198,6 +198,36 @@ pub fn parse_scaling_list_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An out-of-range scaling_list_delta_coef wraps mod 256, as FFmpeg's
+    /// `(next_coef + 256U + delta) % 256`, rather than being clamped.
+    #[test]
+    fn out_of_range_delta_wraps() {
+        // 4x4 matrix 0 coded explicitly: delta +200 (se code 399), then 15
+        // zero deltas; every other matrix uses its default (flag 0, ue 0).
+        let mut bits = String::from("1");
+        bits.push_str(&"0".repeat(8));
+        bits.push_str("110010000");
+        bits.push_str(&"1".repeat(15));
+        bits.push_str(&"01".repeat(5 + 6 + 6 + 2));
+        bits.push('1');
+        while bits.len() % 8 != 0 {
+            bits.push('0');
+        }
+        let bytes: Vec<u8> = bits
+            .as_bytes()
+            .chunks(8)
+            .map(|c| c.iter().fold(0u8, |b, &bit| (b << 1) | (bit - b'0')))
+            .collect();
+        let mut sl = ScalingList::default_scaling_list();
+        parse_scaling_list_data(&mut BitstreamReader::new(&bytes), &mut sl).expect("parse");
+        // (8 + 200) % 256, not 8 + 127.
+        assert!(
+            sl.sl[0][0][..16].iter().all(|&c| c == 208),
+            "{:?}",
+            &sl.sl[0][0][..16]
+        );
+    }
 
     #[test]
     fn test_default_scaling_list() {
