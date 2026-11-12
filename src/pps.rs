@@ -92,6 +92,10 @@ pub struct Pps {
     /// `log2_sao_offset_scale_luma` / `_chroma` (PPS range extension).
     pub log2_sao_offset_scale_luma: u8,
     pub log2_sao_offset_scale_chroma: u8,
+    /// Why `pps_range_extension()` failed to parse, if it did. Reported at
+    /// activation with a range-extensions profile, ignored (with the range
+    /// fields) otherwise, as FFmpeg parses it only for those profiles.
+    pub range_extension_error: Option<DecodeError>,
 }
 
 impl Pps {
@@ -107,6 +111,24 @@ impl Pps {
     /// Also checks the PPS values whose range depends on the SPS (7.4.3.3),
     /// as this runs once per activation.
     pub fn resolve_tile_geometry(&mut self, sps: &Sps) -> Result<(), DecodeError> {
+        // pps_range_extension() applies only with a range-extensions profile
+        // (FFmpeg: profile_idc >= RExt); a Main / Main 10 / Main Still
+        // Picture stream that sets it decodes as if it were absent.
+        if sps.profile_tier_level.general_profile_idc < 4 {
+            self.log2_max_transform_skip_block_size = 2;
+            self.cross_component_prediction_enabled_flag = false;
+            self.chroma_qp_offset_list_enabled_flag = false;
+            self.diff_cu_chroma_qp_offset_depth = 0;
+            self.chroma_qp_offset_list_len_minus1 = 0;
+            self.cb_qp_offset_list = [0; 6];
+            self.cr_qp_offset_list = [0; 6];
+            self.log2_sao_offset_scale_luma = 0;
+            self.log2_sao_offset_scale_chroma = 0;
+            self.range_extension_error = None;
+        }
+        if let Some(e) = &self.range_extension_error {
+            return Err(e.clone());
+        }
         let qp_bd_offset_y = 6 * (sps.bit_depth_luma as i32 - 8);
         let log2_diff_max_min_cb = (sps.ctb_log2_size_y - sps.min_cb_log2_size_y) as u32;
         if self.init_qp < -qp_bd_offset_y
@@ -353,6 +375,7 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
     let mut cb_qp_offset_list = [0i32; 6];
     let mut cr_qp_offset_list = [0i32; 6];
     let (mut log2_sao_offset_scale_luma, mut log2_sao_offset_scale_chroma) = (0u8, 0u8);
+    let mut range_extension_error = None;
     if r.read_bit()? == 1 {
         let range = r.read_bit()? == 1;
         let _multilayer = r.read_bit()?;
@@ -360,50 +383,58 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
         let scc = r.read_bit()? == 1;
         let _extension_4bits = r.read_bits(4)?;
         if range {
-            // pps_range_extension() (spec 7.3.2.3.2).
-            if transform_skip_enabled_flag {
-                let minus2 = r.read_ue()?;
-                if minus2 > 3 {
-                    return Err(DecodeError::InvalidSyntax(
-                        "log2_max_transform_skip_block_size_minus2 > 3",
-                    ));
+            // pps_range_extension() (spec 7.3.2.3.2). Only used with a
+            // range-extensions SPS profile: FFmpeg ignores it otherwise, so
+            // an error in it is kept and decided at activation
+            // (`resolve_tile_geometry`), when the profile is known.
+            let mut parse_range = || -> Result<(), DecodeError> {
+                // pps_range_extension() (spec 7.3.2.3.2).
+                if transform_skip_enabled_flag {
+                    let minus2 = r.read_ue()?;
+                    if minus2 > 3 {
+                        return Err(DecodeError::InvalidSyntax(
+                            "log2_max_transform_skip_block_size_minus2 > 3",
+                        ));
+                    }
+                    log2_max_transform_skip_block_size = minus2 as u8 + 2;
                 }
-                log2_max_transform_skip_block_size = minus2 as u8 + 2;
-            }
-            cross_component_prediction_enabled_flag = r.read_bit()? == 1;
-            chroma_qp_offset_list_enabled_flag = r.read_bit()? == 1;
-            if chroma_qp_offset_list_enabled_flag {
-                diff_cu_chroma_qp_offset_depth = r.read_ue()?;
-                if diff_cu_chroma_qp_offset_depth > 4 {
-                    return Err(DecodeError::InvalidSyntax(
-                        "diff_cu_chroma_qp_offset_depth out of range",
-                    ));
-                }
-                chroma_qp_offset_list_len_minus1 = r.read_ue()?;
-                if chroma_qp_offset_list_len_minus1 > 5 {
-                    return Err(DecodeError::InvalidSyntax(
-                        "chroma_qp_offset_list_len_minus1 > 5",
-                    ));
-                }
-                for i in 0..=chroma_qp_offset_list_len_minus1 as usize {
-                    cb_qp_offset_list[i] = r.read_se()?;
-                    cr_qp_offset_list[i] = r.read_se()?;
-                    if !(-12..=12).contains(&cb_qp_offset_list[i])
-                        || !(-12..=12).contains(&cr_qp_offset_list[i])
-                    {
-                        return Err(DecodeError::InvalidSyntax("chroma QP offset list entry"));
+                cross_component_prediction_enabled_flag = r.read_bit()? == 1;
+                chroma_qp_offset_list_enabled_flag = r.read_bit()? == 1;
+                if chroma_qp_offset_list_enabled_flag {
+                    diff_cu_chroma_qp_offset_depth = r.read_ue()?;
+                    if diff_cu_chroma_qp_offset_depth > 4 {
+                        return Err(DecodeError::InvalidSyntax(
+                            "diff_cu_chroma_qp_offset_depth out of range",
+                        ));
+                    }
+                    chroma_qp_offset_list_len_minus1 = r.read_ue()?;
+                    if chroma_qp_offset_list_len_minus1 > 5 {
+                        return Err(DecodeError::InvalidSyntax(
+                            "chroma_qp_offset_list_len_minus1 > 5",
+                        ));
+                    }
+                    for i in 0..=chroma_qp_offset_list_len_minus1 as usize {
+                        cb_qp_offset_list[i] = r.read_se()?;
+                        cr_qp_offset_list[i] = r.read_se()?;
+                        if !(-12..=12).contains(&cb_qp_offset_list[i])
+                            || !(-12..=12).contains(&cr_qp_offset_list[i])
+                        {
+                            return Err(DecodeError::InvalidSyntax("chroma QP offset list entry"));
+                        }
                     }
                 }
-            }
-            // Range 0..=Max(0, BitDepth - 10), at most 2 for 12-bit.
-            let (luma, chroma) = (r.read_ue()?, r.read_ue()?);
-            if luma > 2 || chroma > 2 {
-                return Err(DecodeError::InvalidSyntax(
-                    "log2_sao_offset_scale out of range",
-                ));
-            }
-            log2_sao_offset_scale_luma = luma as u8;
-            log2_sao_offset_scale_chroma = chroma as u8;
+                // Range 0..=Max(0, BitDepth - 10), at most 2 for 12-bit.
+                let (luma, chroma) = (r.read_ue()?, r.read_ue()?);
+                if luma > 2 || chroma > 2 {
+                    return Err(DecodeError::InvalidSyntax(
+                        "log2_sao_offset_scale out of range",
+                    ));
+                }
+                log2_sao_offset_scale_luma = luma as u8;
+                log2_sao_offset_scale_chroma = chroma as u8;
+                Ok(())
+            };
+            range_extension_error = parse_range().err();
         }
         if scc {
             return Err(DecodeError::Unsupported("screen content coding extension"));
@@ -461,6 +492,7 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, DecodeError> {
         cross_component_prediction_enabled_flag,
         log2_sao_offset_scale_luma,
         log2_sao_offset_scale_chroma,
+        range_extension_error,
     })
 }
 
@@ -486,8 +518,10 @@ mod tests {
     /// when the PPS is activated with it.
     #[test]
     fn pps_ranges_checked_against_sps() {
-        let (sps, pps) = fixture_sets();
+        let (mut sps, pps) = fixture_sets();
         assert_eq!(sps.ctb_log2_size_y, 4);
+        // A range-extensions profile, so the PPS range fields apply.
+        sps.profile_tier_level.general_profile_idc = 4;
         pps.clone()
             .resolve_tile_geometry(&sps)
             .expect("fixture PPS");
@@ -508,6 +542,29 @@ mod tests {
                 ))
             );
         }
+    }
+
+    /// pps_range_extension() applies only with a range-extensions profile
+    /// (as FFmpeg): with Main its fields are ignored, and so is an error in
+    /// it; with RExt the error is reported at activation.
+    #[test]
+    fn range_extension_needs_rext_profile() {
+        let (mut sps, mut pps) = fixture_sets();
+        assert!(sps.profile_tier_level.general_profile_idc < 4);
+        pps.cross_component_prediction_enabled_flag = true;
+        pps.log2_sao_offset_scale_luma = 1; // out of range for 8-bit
+        pps.range_extension_error = Some(DecodeError::InvalidSyntax("damaged"));
+        let mut main = pps.clone();
+        main.resolve_tile_geometry(&sps)
+            .expect("range extension ignored");
+        assert!(!main.cross_component_prediction_enabled_flag);
+        assert_eq!(main.log2_sao_offset_scale_luma, 0);
+
+        sps.profile_tier_level.general_profile_idc = 4;
+        assert_eq!(
+            pps.resolve_tile_geometry(&sps),
+            Err(DecodeError::InvalidSyntax("damaged"))
+        );
     }
 
     /// Tile column widths each below the picture width (7.4.3.3): a width

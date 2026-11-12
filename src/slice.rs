@@ -1031,6 +1031,7 @@ mod tests {
             cross_component_prediction_enabled_flag: false,
             log2_sao_offset_scale_luma: 0,
             log2_sao_offset_scale_chroma: 0,
+            range_extension_error: None,
         }
     }
 

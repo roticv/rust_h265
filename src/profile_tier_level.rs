@@ -32,10 +32,17 @@ pub fn parse_profile_tier_level(
     // ---- General profile/tier/level (96 bits) ----
     let general_profile_space = reader.read_bits(2)? as u8;
     let general_tier_flag = reader.read_bit()? == 1;
-    let general_profile_idc = reader.read_bits(5)? as u8;
+    let mut general_profile_idc = reader.read_bits(5)? as u8;
 
-    // 32 profile compatibility flags — discard.
-    let _ = reader.read_bits(32)?;
+    // 32 profile compatibility flags. With general_profile_idc 0 the profile
+    // is the first one flagged compatible (other than 0), as FFmpeg takes it.
+    let compatibility = reader.read_bits(32)?;
+    if general_profile_idc == 0 {
+        // Flag j is bit 31 - j of the 32 bits read.
+        if let Some(j) = (1..32).find(|&j| compatibility & (1 << (31 - j)) != 0) {
+            general_profile_idc = j as u8;
+        }
+    }
 
     // 4 source/constraint flags.
     let _general_progressive_source_flag = reader.read_bit()?;
@@ -97,4 +104,25 @@ pub fn parse_profile_tier_level(
         general_profile_idc,
         general_level_idc,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// general_profile_idc 0 takes the first profile flagged compatible
+    /// (FFmpeg `decode_profile_tier_level`); a non-zero one is kept.
+    #[test]
+    fn profile_zero_inferred_from_compatibility_flags() {
+        for (profile, flags, expected) in [(0u8, (1u32 << 29) | (1 << 27), 2u8), (1, 1 << 27, 1)] {
+            // profile_space 0, tier 0, profile_idc; 32 flags (flag j is bit
+            // 31 - j); 48 constraint bits; level 0: 96 bits in all.
+            let mut bytes = vec![profile];
+            bytes.extend_from_slice(&flags.to_be_bytes());
+            bytes.extend_from_slice(&[0; 7]);
+            let mut r = BitstreamReader::new(&bytes);
+            let ptl = parse_profile_tier_level(&mut r, 0).expect("PTL");
+            assert_eq!(ptl.general_profile_idc, expected);
+        }
+    }
 }
